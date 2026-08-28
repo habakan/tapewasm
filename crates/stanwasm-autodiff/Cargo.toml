@@ -1,0 +1,10 @@
+[package]
+name = "stanwasm-autodiff"
+description = "Reverse-mode autodiff tape (struct-of-arrays). Internal to stanwasm; no API stability guarantee."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["autodiff", "gradient", "tape", "stan", "bayesian"]
+categories = ["science", "mathematics"]

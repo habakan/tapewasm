@@ -1,0 +1,21 @@
+[package]
+name = "stanwasm-codegen"
+description = "AOT-compiles a traced Stan model to a standalone wasm module via wasm-encoder. Internal to stanwasm; no API stability guarantee."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["stan", "wasm", "webassembly", "codegen", "compiler"]
+categories = ["wasm", "compilers", "science"]
+
+[dependencies]
+stanwasm-ast.workspace = true
+stanwasm-autodiff.workspace = true
+stanwasm-runtime.workspace = true
+wasm-encoder.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+wasmparser = "0.257"
+wasmi = "0.32"
