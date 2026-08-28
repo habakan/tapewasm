@@ -17,5 +17,5 @@ wasm-encoder.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-wasmparser = "0.257"
+wasmparser = "0.258"
 wasmi = "1.1"
