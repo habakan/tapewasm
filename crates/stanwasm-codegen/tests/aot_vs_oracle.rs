@@ -49,17 +49,15 @@ fn run_aot_log_prob_grad(wasm: &[u8], n_params: usize, params: &[f64]) -> (f64, 
     let mut store = Store::new(&engine, HostState);
 
     // Host-allocated memory shared with the AOT module.
-    let memory = Memory::new(&mut store, MemoryType::new(1, None).unwrap()).unwrap();
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
     install_math(&mut linker, &mut store);
     linker.define("stan", "memory", memory).unwrap();
 
     let instance = linker
-        .instantiate(&mut store, &module)
-        .expect("instantiate")
-        .start(&mut store)
-        .expect("start");
+        .instantiate_and_start(&mut store, &module)
+        .expect("instantiate");
 
     let lpg = instance
         .get_typed_func::<(i32, i32, i32), f64>(&store, "log_prob_grad")

@@ -18,4 +18,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 wasmparser = "0.257"
-wasmi = "0.32"
+wasmi = "1.1"
