@@ -293,7 +293,7 @@ fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> F
     }
 
     // ---- initialize root adjoint = 1.0 ------------------------------------
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalSet(adjoint_base + root));
 
     // ---- backward pass (reverse order) ------------------------------------
@@ -377,7 +377,7 @@ fn emit_forward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex) {
                     memory_index: 0,
                 }));
             } else {
-                f.instruction(&Instruction::F64Const(tape.value(k)));
+                f.instruction(&Instruction::F64Const((tape.value(k)).into()));
             }
         }
         Op::Add => {
@@ -426,7 +426,7 @@ fn emit_forward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex) {
         }
         Op::Pow => {
             f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::Call(m.pow.expect("pow import missing")));
         }
         Op::Abs => {
@@ -439,31 +439,31 @@ fn emit_forward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex) {
         }
         Op::AddC => {
             f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Add);
         }
         Op::SubC => {
             f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Sub);
         }
         Op::RsubC => {
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::LocalGet(p_a1));
             f.instruction(&Instruction::F64Sub);
         }
         Op::MulC => {
             f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Mul);
         }
         Op::DivC => {
             f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Div);
         }
         Op::RdivC => {
-            f.instruction(&Instruction::F64Const(a2f));
+            f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::LocalGet(p_a1));
             f.instruction(&Instruction::F64Div);
         }
@@ -625,7 +625,7 @@ fn adj_decr_mul_div2(f: &mut Function, da: u32, dk: u32, ta: u32, tb: u32) {
 fn adj_incr_div2(f: &mut Function, da: u32, dk: u32, tk: u32) {
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(2.0));
+    f.instruction(&Instruction::F64Const(2.0.into()));
     f.instruction(&Instruction::LocalGet(tk));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
@@ -659,7 +659,7 @@ fn adj_decr_fn1(f: &mut Function, da: u32, dk: u32, tv: u32, fn_idx: u32) {
 fn adj_incr_mulc(f: &mut Function, da: u32, dk: u32, c: f64) {
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(c));
+    f.instruction(&Instruction::F64Const(c.into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::LocalSet(da));
@@ -669,7 +669,7 @@ fn adj_incr_mulc(f: &mut Function, da: u32, dk: u32, c: f64) {
 fn adj_incr_divc(f: &mut Function, da: u32, dk: u32, c: f64) {
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(c));
+    f.instruction(&Instruction::F64Const(c.into()));
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::LocalSet(da));
@@ -679,7 +679,7 @@ fn adj_incr_divc(f: &mut Function, da: u32, dk: u32, c: f64) {
 fn adj_decr_rdivc(f: &mut Function, da: u32, dk: u32, c: f64, ta: u32) {
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(c));
+    f.instruction(&Instruction::F64Const(c.into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::LocalGet(ta));
     f.instruction(&Instruction::LocalGet(ta));
@@ -693,10 +693,10 @@ fn adj_decr_rdivc(f: &mut Function, da: u32, dk: u32, c: f64, ta: u32) {
 fn adj_incr_pow(f: &mut Function, da: u32, dk: u32, tv: u32, exponent: f64, pow_idx: u32) {
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(exponent));
+    f.instruction(&Instruction::F64Const(exponent.into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::LocalGet(tv));
-    f.instruction(&Instruction::F64Const(exponent - 1.0));
+    f.instruction(&Instruction::F64Const((exponent - 1.0).into()));
     f.instruction(&Instruction::Call(pow_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
@@ -707,7 +707,7 @@ fn adj_incr_pow(f: &mut Function, da: u32, dk: u32, tv: u32, exponent: f64, pow_
 fn adj_incr_sign(f: &mut Function, da: u32, dk: u32, ta: u32) {
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalGet(ta));
     f.instruction(&Instruction::F64Copysign);
     f.instruction(&Instruction::F64Mul);
@@ -720,13 +720,13 @@ fn adj_incr_phi(f: &mut Function, da: u32, dk: u32, ta: u32, exp_idx: u32) {
     const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
     f.instruction(&Instruction::LocalGet(da));
     f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::F64Const(-0.5));
+    f.instruction(&Instruction::F64Const((-0.5).into()));
     f.instruction(&Instruction::LocalGet(ta));
     f.instruction(&Instruction::LocalGet(ta));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::Call(exp_idx));
-    f.instruction(&Instruction::F64Const(INV_SQRT_2PI));
+    f.instruction(&Instruction::F64Const(INV_SQRT_2PI.into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
