@@ -113,15 +113,12 @@ impl Tape {
     }
 
     /// Replay the recorded forward pass with new leaf values. The first
-    /// `params.len()` leaf nodes get the supplied values; any further leaves
-    /// (typically constants captured during the original trace) are left
-    /// unchanged. All non-leaf nodes are recomputed in topological order
-    /// from the recorded op/arg arrays.
+    /// `params.len()` leaves take the supplied values, later ones (constants
+    /// captured during the trace) are left alone, and non-leaf nodes are
+    /// recomputed in topological order.
     ///
-    /// Caller must ensure the recorded computation graph is parameter-shape-
-    /// independent — i.e. the model has no parameter-dependent control flow.
-    /// Stan models with `if (param > 0)` style branching do not satisfy this
-    /// (and aren't supported by the AOT codegen path either).
+    /// Only valid if the recorded graph is parameter-independent — the caller
+    /// must have rejected parameter-dependent control flow.
     pub fn forward_replay(&mut self, params: &[f64]) {
         for (i, p) in params.iter().enumerate() {
             self.val[i] = *p;
