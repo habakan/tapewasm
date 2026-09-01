@@ -250,8 +250,7 @@ model { for (n in 1:N) y[n] ~ normal(atan(a), 1.0); }
     let model = Model::parse_and_load(src, data).unwrap();
 
     let err = stanwasm_codegen::compile(&model, &[0.1])
-        .err()
-        .expect("Atan has no AOT emitter")
+        .expect_err("Atan has no AOT emitter")
         .to_string();
     assert!(err.contains("Atan") && err.contains("sample()"), "{err}");
 }
