@@ -234,3 +234,24 @@ fn module_validates_with_wasmparser() {
     let result = wasmparser::Validator::new().validate_all(&compiled.wasm);
     assert!(result.is_ok(), "wasm did not validate: {:?}", result.err());
 }
+
+#[test]
+fn unsupported_op_is_reported_rather_than_trapping() {
+    // The emitters have no arm for Atan, and `unimplemented!` would compile to a
+    // wasm trap that takes down the module instead of reporting anything.
+    let src = r#"
+data { int<lower=0> N; vector[N] y; }
+parameters { real a; }
+model { for (n in 1:N) y[n] ~ normal(atan(a), 1.0); }
+"#;
+    let mut data = Env::new();
+    data.set_scalar("N", 2.0);
+    data.set_vector("y", &[0.1, 0.2]);
+    let model = Model::parse_and_load(src, data).unwrap();
+
+    let err = stanwasm_codegen::compile(&model, &[0.1])
+        .err()
+        .expect("Atan has no AOT emitter")
+        .to_string();
+    assert!(err.contains("Atan") && err.contains("sample()"), "{err}");
+}

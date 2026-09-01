@@ -35,6 +35,12 @@ pub enum CodegenError {
     #[error("internal: {0}")]
     Internal(String),
     #[error(
+        "`{op}` is not supported on the AOT path yet — the emitter has no \
+         instruction sequence for it. Sample this model with `sample()` \
+         (tape replay), which supports every op the runtime produces."
+    )]
+    UnsupportedOp { op: String },
+    #[error(
         "model too large for the AOT path: the forward trace has {tape_len} \
          nodes, which needs {locals} wasm locals — over the {limit} a browser \
          engine accepts per function. Sample this model with `sample()` \
@@ -84,6 +90,19 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
             locals,
             limit: MAX_WASM_LOCALS,
         });
+    }
+    // The emitters have no arm for these, and an `unimplemented!` would compile to a
+    // wasm trap that takes the whole module down rather than reporting anything.
+    for k in 0..tape.len() {
+        let op = tape.op_at(k as u32);
+        if matches!(
+            op,
+            Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma
+        ) {
+            return Err(CodegenError::UnsupportedOp {
+                op: format!("{op:?}"),
+            });
+        }
     }
     let wasm = emit(&tape, dummy_params.len(), root);
     Ok(Compiled {
