@@ -61,11 +61,8 @@ fn pow_rule() {
 
 #[test]
 fn negative_log_likelihood_normal() {
-    // Negative log-likelihood of N(x | mu, sigma) for one observation.
-    // -0.5 * ((x - mu)/sigma)^2 - log(sigma)  (drop constants)
-    // Verify gradient wrt mu and sigma at x=2, mu=0, sigma=1
-    //   d/dmu = (x-mu)/sigma² = 2
-    //   d/dsigma = (x-mu)²/sigma³ - 1/sigma = 4 - 1 = 3
+    // -0.5·((x-mu)/sigma)² - log(sigma), constants dropped. At x=2, mu=0, sigma=1:
+    // d/dmu = (x-mu)/sigma² = 2; d/dsigma = (x-mu)²/sigma³ - 1/sigma = 3.
     let (v, g) = log_prob_grad(&[0.0, 1.0], |t, xs| {
         let mu = xs[0];
         let sigma = xs[1];

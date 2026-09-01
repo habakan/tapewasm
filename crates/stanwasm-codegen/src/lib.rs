@@ -59,9 +59,8 @@ pub struct Compiled {
     pub n_params: usize,
 }
 
-/// Trace `model` on a fresh tape using `dummy_params` (all 0.1 is a reasonable
-/// default — eight_schools needs non-zero seeds), then emit a model-specific
-/// wasm module.
+/// Trace `model` on a fresh tape at `dummy_params` (0.1 throughout; eight_schools
+/// needs non-zero seeds), then emit a model-specific wasm module.
 pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenError> {
     if dummy_params.len() != model.n_params() {
         return Err(CodegenError::Internal(format!(
@@ -76,11 +75,8 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
     if tape.is_empty() {
         return Err(CodegenError::EmptyTape);
     }
-    // `build_log_prob_grad` declares one primal and one adjoint local per tape
-    // node. V8 rejects a function with more than 50,000 locals, so past this
-    // point the emitted module fails to *instantiate* in the browser with an
-    // opaque `CompileError: local count too large`. Fail here, where the
-    // message can say what to do instead.
+    // One primal and one adjoint local per tape node, and V8 rejects a function
+    // with over 50,000 locals — fail here, where the message can say what to do.
     let locals = 2 * tape.len();
     if locals > MAX_WASM_LOCALS {
         return Err(CodegenError::TooManyLocals {
@@ -101,10 +97,8 @@ fn emit(tape: &Tape, n_params: usize, root: u32) -> Vec<u8> {
     let n = tape.len() as u32;
     let needs = scan_imports(tape);
 
-    // ---- type section ------------------------------------------------------
-    // type 0: (i32, i32, i32) -> f64    (log_prob_grad: params_ptr, grads_ptr, n_params)
-    // type 1: (f64) -> f64              (unary math: exp/log/sin/cos/lgamma/digamma/phi)
-    // type 2: (f64, f64) -> f64         (pow)
+    // ---- type section: 0 = (i32,i32,i32)->f64 (log_prob_grad: params_ptr,
+    // grads_ptr, n_params), 1 = (f64)->f64 (unary math), 2 = (f64,f64)->f64 (pow)
     let mut types = TypeSection::new();
     types
         .ty()
@@ -155,9 +149,8 @@ fn emit(tape: &Tape, n_params: usize, root: u32) -> Vec<u8> {
         math_idx.pow = Some(math_idx_add_binary(&mut math_idx, &mut imports, "pow"));
     }
 
-    // Function index space: imported funcs first, then defined funcs. The
-    // memory import does NOT take a function-index slot (it's a separate
-    // import kind), so n_func_imports counts only the math imports.
+    // Imported funcs first, then defined. The memory import takes no function-index
+    // slot, so n_func_imports counts only the math imports.
     let n_func_imports = math_idx.count();
 
     // ---- function section --------------------------------------------------
@@ -257,9 +250,8 @@ fn scan_imports(tape: &Tape) -> ImportNeeds {
                 needs.phi = true;
                 needs.exp = true; // backward uses exp
             }
-            // Tan/Asin/Acos/Atan/Erf/Erfc/Digamma/Sqrt/Abs and arithmetic ops
-            // are handled inline (sqrt/abs as f64 instructions; others not yet
-            // emitted because the runtime currently does not produce them).
+            // Tan/Asin/Acos/Atan/Erf/Erfc/Digamma/Sqrt/Abs and arithmetic are inline;
+            // the rest are not emitted because the runtime does not produce them.
             _ => {}
         }
     }
@@ -275,9 +267,8 @@ fn math_idx_add_binary(m: &mut MathImportIndex, imports: &mut ImportSection, nam
 }
 
 fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> Function {
-    // Function has 3 i32 params (params_ptr, grads_ptr, n_params).
-    // Locals: 2*n f64 (primals at 3..3+n, adjoints at 3+n..3+2n).
-    // Param slots occupy local indices 0..3.
+    // 3 i32 params (params_ptr, grads_ptr, n_params) at local indices 0..3, then
+    // 2*n f64 locals: primals at 3..3+n, adjoints at 3+n..3+2n.
     const PARAMS_PTR: u32 = 0;
     const GRADS_PTR: u32 = 1;
     // n_params (param 2) is unused — the recorded tape already encodes it.
@@ -301,12 +292,8 @@ fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> F
         emit_backward(&mut f, tape, k_rev, PRIMAL_BASE, adjoint_base, m);
     }
 
-    // ---- store gradients to memory at grads_ptr + i*8 --------------------
-    // We don't know n_params here; we use the leaf-prefix convention (the
-    // first leaves in the tape are the params). Gradients for those leaves
-    // live at adjoint_base..adjoint_base+n_params. We loop over the first
-    // n_params primal slots, but n_params is a runtime parameter, so we
-    // unroll based on the leaf-count we observed during tracing.
+    // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter, so
+    // unroll over the leaf-prefix count observed during tracing instead. ----
     let n_params_observed = leaf_count(tape);
     for pi in 0..n_params_observed {
         // grads_ptr + pi * 8
@@ -566,10 +553,8 @@ fn emit_backward(
     }
 }
 
-// ---- adjoint update emitters ----
-// Each takes the local indices for adjoint `da` and source adjoint `dk`, plus
-// (optionally) primal locals `tv`, `ta`, `tb`, and writes the wasm sequence
-// that performs `da += <expression involving dk and primals>`.
+// ---- adjoint update emitters: given adjoint `da`, source adjoint `dk` and any
+// primal locals, emit `da += <expression in dk and primals>`. ----
 
 // d[da] += d[dk]
 fn adj_incr(f: &mut Function, da: u32, dk: u32) {

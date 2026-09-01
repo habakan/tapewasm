@@ -112,13 +112,8 @@ impl Tape {
         }
     }
 
-    /// Replay the recorded forward pass with new leaf values. The first
-    /// `params.len()` leaves take the supplied values, later ones (constants
-    /// captured during the trace) are left alone, and non-leaf nodes are
-    /// recomputed in topological order.
-    ///
-    /// Only valid if the recorded graph is parameter-independent — the caller
-    /// must have rejected parameter-dependent control flow.
+    /// Replay the forward pass with new leaf values: the first `params.len()` leaves
+    /// take them, later ones stay. Valid only if the graph is parameter-independent.
     pub fn forward_replay(&mut self, params: &[f64]) {
         for (i, p) in params.iter().enumerate() {
             self.val[i] = *p;
