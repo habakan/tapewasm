@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+mod reroll;
+
 use stanwasm_autodiff::{Op, Tape};
 use stanwasm_runtime::Model;
 use thiserror::Error;
@@ -57,6 +59,9 @@ pub struct Compiled {
     pub n_params: usize,
     /// f64 slots the caller must pass as the module's scratch buffer.
     pub scratch_len: usize,
+    /// Loop constants the caller stages at slot `scratch_len - const_table.len()`
+    /// before the first call. Empty when nothing was re-rolled.
+    pub const_table: Vec<f64>,
 }
 
 /// Trace `model` on a fresh tape at `dummy_params` (0.1 throughout; eight_schools
@@ -88,17 +93,39 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
             });
         }
     }
-    let wasm = emit(&tape, dummy_params.len(), root);
+    let (wasm, const_table) = emit(&tape, dummy_params.len(), root);
     Ok(Compiled {
         wasm,
         n_params: dummy_params.len(),
-        scratch_len: 2 * tape.len(),
+        scratch_len: 2 * tape.len() + const_table.len(),
+        const_table,
     })
 }
 
 /// Lower the recorded tape to a wasm module.
-fn emit(tape: &Tape, n_params: usize, root: u32) -> Vec<u8> {
+fn emit(tape: &Tape, n_params: usize, root: u32) -> (Vec<u8>, Vec<f64>) {
     let n = tape.len() as u32;
+    // Straight-line code keeps every value in a register-allocated local and
+    // wins while V8 still optimises the function. Past roughly this many nodes
+    // it stops, and the unrolled body collapses to well under tape-replay
+    // speed; a re-rolled loop is flat from there on. Measured on linear
+    // regression: straight-line 7.4 vs looped 16.2 us/gradient at 12k nodes,
+    // 82.0 vs 31.5 at 24k.
+    const RE_ROLL_ABOVE: usize = 12_000;
+    let blocks = if tape.len() > RE_ROLL_ABOVE {
+        reroll::detect(tape)
+    } else {
+        Vec::new()
+    };
+    // Constants that move with the loop index live past the adjoints, in block
+    // then node order; the caller stages them once.
+    let const_base = 2 * n;
+    let mut const_table: Vec<f64> = Vec::new();
+    for b in &blocks {
+        for c in b.consts.iter().flatten() {
+            const_table.extend_from_slice(c);
+        }
+    }
     let needs = scan_imports(tape);
 
     // ---- type section: 0 = (i32,i32,i32,i32)->f64 (log_prob_grad: params_ptr,
@@ -173,7 +200,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32) -> Vec<u8> {
     let mut codes = CodeSection::new();
 
     let _ = n_params;
-    let lpg = build_log_prob_grad(tape, root, n, &math_idx);
+    let lpg = build_log_prob_grad(tape, root, n, &math_idx, &blocks, const_base);
     codes.function(&lpg);
 
     // ---- assemble ----------------------------------------------------------
@@ -183,7 +210,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32) -> Vec<u8> {
     module.section(&functions);
     module.section(&exports);
     module.section(&codes);
-    module.finish()
+    (module.finish(), const_table)
 }
 
 #[derive(Default, Debug)]
@@ -272,16 +299,114 @@ fn math_idx_add_binary(m: &mut MathImportIndex, imports: &mut ImportSection, nam
     m.add_binary(imports, name)
 }
 
-fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> Function {
+/// Per-iteration base pointers for a re-rolled block: one i32 local per
+/// distinct non-zero stride, holding `scratch + i * stride * 8`.
+struct StridePtrs {
+    iv: u32,
+    strides: Vec<u32>,
+    first_local: u32,
+}
+
+impl StridePtrs {
+    fn addr(&self, base_slot: u32, stride: u32) -> Addr {
+        if stride == 0 {
+            return Addr::Mem {
+                ptr: SCRATCH_PTR,
+                slot: base_slot,
+            };
+        }
+        let idx = self
+            .strides
+            .iter()
+            .position(|&t| t == stride)
+            .expect("stride was registered");
+        Addr::Mem {
+            ptr: self.first_local + idx as u32,
+            slot: base_slot,
+        }
+    }
+
+    fn emit_setup(&self, f: &mut Function) {
+        for (idx, &t) in self.strides.iter().enumerate() {
+            f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+            f.instruction(&Instruction::LocalGet(self.iv));
+            f.instruction(&Instruction::I32Const((t * 8) as i32));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(self.first_local + idx as u32));
+        }
+    }
+}
+
+/// Every non-zero stride a block's reads and writes use, deduplicated.
+fn block_strides(tape: &Tape, b: &reroll::Block) -> Vec<u32> {
+    let mut out: Vec<u32> = vec![b.len];
+    for j in 0..b.len {
+        let k0 = b.start + j;
+        let st = b.strides[j as usize];
+        for (used, stride) in [
+            (reroll::uses(tape.op_at(k0)).0, st.arg1),
+            (reroll::uses(tape.op_at(k0)).1, st.arg2i),
+        ] {
+            if used && stride != 0 && !out.contains(&stride) {
+                out.push(stride);
+            }
+        }
+        // A moving constant walks its table one f64 per repeat.
+        if b.consts[j as usize].is_some() && !out.contains(&1) {
+            out.push(1);
+        }
+    }
+    out
+}
+
+/// The f64 argument of block node `j` at the current iteration.
+fn block_cst(tape: &Tape, b: &reroll::Block, j: u32, tbl: &[Option<u32>], sp: &StridePtrs) -> Cst {
+    match tbl[j as usize] {
+        Some(base) => Cst::At(sp.addr(base, 1)),
+        None => {
+            let k0 = b.start + j;
+            Cst::Imm(if tape.op_at(k0) == Op::Leaf {
+                tape.value(k0)
+            } else {
+                tape.arg2f_at(k0)
+            })
+        }
+    }
+}
+
+fn build_log_prob_grad(
+    tape: &Tape,
+    root: u32,
+    n: u32,
+    m: &MathImportIndex,
+    blocks: &[reroll::Block],
+    const_base: u32,
+) -> Function {
     // 4 i32 params at local indices 0..4: params_ptr, grads_ptr, n_params
-    // (unused — the recorded tape already encodes it), scratch_ptr. Primals
-    // occupy scratch slots 0..n and adjoints n..2n; the function needs no
-    // locals of its own.
+    // (unused — the recorded tape already encodes it), scratch_ptr.
     const GRADS_PTR: u32 = 1;
-    const PRIMAL_BASE: u32 = 0;
-    let adjoint_base = n;
-    let lay = Layout::for_tape(2 * n);
-    let mut f = Function::new([(lay.local_count(2 * n), ValType::F64)]);
+    let adj = n; // adjoint slots follow the primals
+    let lay = Layout::for_tape(2 * n, !blocks.is_empty());
+    let f64_locals = lay.local_count(2 * n);
+    let widest = blocks
+        .iter()
+        .map(|b| block_strides(tape, b).len() as u32)
+        .max()
+        .unwrap_or(0);
+    // One induction variable, reused by every block, then the base pointers.
+    let i32_locals = if blocks.is_empty() { 0 } else { 1 + widest };
+    let i32_base = FIRST_SLOT_LOCAL + f64_locals;
+    let iv = i32_base;
+
+    let mut decl: Vec<(u32, ValType)> = Vec::new();
+    if f64_locals > 0 {
+        decl.push((f64_locals, ValType::F64));
+    }
+    if i32_locals > 0 {
+        decl.push((i32_locals, ValType::I32));
+    }
+    let mut f = Function::new(decl);
 
     // ---- zero the adjoint half --------------------------------------------
     // Locals start at zero; a caller-owned scratch buffer is reused across
@@ -296,32 +421,156 @@ fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> F
         f.instruction(&Instruction::MemoryFill(0));
     }
 
+    // Moving-constant table offsets, assigned in block then node order to
+    // match the table the caller stages at `const_base`.
+    let mut tables: Vec<Vec<Option<u32>>> = Vec::with_capacity(blocks.len());
+    let mut next = const_base;
+    for b in blocks {
+        let mut t = Vec::with_capacity(b.len as usize);
+        for j in 0..b.len {
+            match &b.consts[j as usize] {
+                Some(v) => {
+                    t.push(Some(next));
+                    next += v.len() as u32;
+                }
+                None => t.push(None),
+            }
+        }
+        tables.push(t);
+    }
+
+    let straight_fwd = |f: &mut Function, k: u32| {
+        let a1 = lay.at(tape.arg1_at(k));
+        let a2 = lay.at(tape.arg2i_at(k));
+        let cst = Cst::Imm(if tape.op_at(k) == Op::Leaf {
+            tape.value(k)
+        } else {
+            tape.arg2f_at(k)
+        });
+        astore_addr(f, lay.at(k));
+        emit_forward(f, tape, k, m, a1, a2, cst);
+        astore_end(f, lay.at(k));
+    };
+
     // ---- forward pass ------------------------------------------------------
-    for k in 0..n {
-        sstore_addr(&mut f, lay);
-        emit_forward(&mut f, lay, tape, k, m);
-        sstore_end(&mut f, lay, PRIMAL_BASE + k);
+    let mut k = 0u32;
+    let mut bi = 0usize;
+    while k < n {
+        if bi < blocks.len() && blocks[bi].start == k {
+            let b = &blocks[bi];
+            let sp = StridePtrs {
+                iv,
+                strides: block_strides(tape, b),
+                first_local: iv + 1,
+            };
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(iv));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            sp.emit_setup(&mut f);
+            for j in 0..b.len {
+                let k0 = b.start + j;
+                let st = b.strides[j as usize];
+                let a1 = sp.addr(tape.arg1_at(k0), st.arg1);
+                let a2 = sp.addr(tape.arg2i_at(k0), st.arg2i);
+                let cst = block_cst(tape, b, j, &tables[bi], &sp);
+                let w = sp.addr(k0, b.len);
+                astore_addr(&mut f, w);
+                emit_forward(&mut f, tape, k0, m, a1, a2, cst);
+                astore_end(&mut f, w);
+            }
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalTee(iv));
+            f.instruction(&Instruction::I32Const(b.reps as i32));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::BrIf(0));
+            f.instruction(&Instruction::End);
+            k = b.end();
+            bi += 1;
+        } else {
+            straight_fwd(&mut f, k);
+            k += 1;
+        }
     }
 
     // ---- initialize root adjoint = 1.0 ------------------------------------
-    sstore_addr(&mut f, lay);
+    astore_addr(&mut f, lay.at(adj + root));
     f.instruction(&Instruction::F64Const(1.0.into()));
-    sstore_end(&mut f, lay, adjoint_base + root);
+    astore_end(&mut f, lay.at(adj + root));
 
     // ---- backward pass (reverse order) ------------------------------------
-    for k_rev in (0..n).rev() {
-        emit_backward(&mut f, lay, tape, k_rev, PRIMAL_BASE, adjoint_base, m);
+    let mut k = n;
+    let mut bi = blocks.len();
+    while k > 0 {
+        if bi > 0 && blocks[bi - 1].end() == k {
+            bi -= 1;
+            let b = &blocks[bi];
+            let sp = StridePtrs {
+                iv,
+                strides: block_strides(tape, b),
+                first_local: iv + 1,
+            };
+            f.instruction(&Instruction::I32Const((b.reps - 1) as i32));
+            f.instruction(&Instruction::LocalSet(iv));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            sp.emit_setup(&mut f);
+            for j in (0..b.len).rev() {
+                let k0 = b.start + j;
+                let st = b.strides[j as usize];
+                emit_backward(
+                    &mut f,
+                    tape,
+                    k0,
+                    m,
+                    Back {
+                        dk: sp.addr(adj + k0, b.len),
+                        da1: sp.addr(adj + tape.arg1_at(k0), st.arg1),
+                        da2: sp.addr(adj + tape.arg2i_at(k0), st.arg2i),
+                        pa1: sp.addr(tape.arg1_at(k0), st.arg1),
+                        pa2: sp.addr(tape.arg2i_at(k0), st.arg2i),
+                        pk: sp.addr(k0, b.len),
+                        cst: block_cst(tape, b, j, &tables[bi], &sp),
+                    },
+                );
+            }
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalTee(iv));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32GeS);
+            f.instruction(&Instruction::BrIf(0));
+            f.instruction(&Instruction::End);
+            k = b.start;
+        } else {
+            k -= 1;
+            emit_backward(
+                &mut f,
+                tape,
+                k,
+                m,
+                Back {
+                    dk: lay.at(adj + k),
+                    da1: lay.at(adj + tape.arg1_at(k)),
+                    da2: lay.at(adj + tape.arg2i_at(k)),
+                    pa1: lay.at(tape.arg1_at(k)),
+                    pa2: lay.at(tape.arg2i_at(k)),
+                    pk: lay.at(k),
+                    cst: Cst::Imm(tape.arg2f_at(k)),
+                },
+            );
+        }
     }
 
-    // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter, so
-    // unroll over the leaf-prefix count observed during tracing instead. ----
+    // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter,
+    // so unroll over the leaf-prefix count observed during tracing instead. ---
     let n_params_observed = leaf_count(tape);
     for pi in 0..n_params_observed {
-        // grads_ptr + pi * 8
         f.instruction(&Instruction::LocalGet(GRADS_PTR));
         f.instruction(&Instruction::I32Const((pi * 8) as i32));
         f.instruction(&Instruction::I32Add);
-        sload(&mut f, lay, adjoint_base + pi);
+        aload(&mut f, lay.at(adj + pi));
         f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
             offset: 0,
             align: 3,
@@ -330,7 +579,7 @@ fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> F
     }
 
     // ---- return log_prob ---------------------------------------------------
-    sload(&mut f, lay, PRIMAL_BASE + root);
+    aload(&mut f, lay.at(root));
     f.instruction(&Instruction::End);
     f
 }
@@ -361,16 +610,17 @@ fn is_param_leaf(tape: &Tape, k: u32) -> bool {
     true
 }
 
-fn emit_forward(f: &mut Function, lay: Layout, tape: &Tape, k: u32, m: &MathImportIndex) {
+fn emit_forward(
+    f: &mut Function,
+    tape: &Tape,
+    k: u32,
+    m: &MathImportIndex,
+    a1: Addr,
+    a2: Addr,
+    cst: Cst,
+) {
     let op = tape.op_at(k);
-    let a1 = tape.arg1_at(k);
-    let a2i = tape.arg2i_at(k);
-    let a2f = tape.arg2f_at(k);
-    // Scratch slots: primals = 0..n, adjoints = n..2n.
     const PARAMS_PTR: u32 = 0;
-    let pb = 0u32; // primal_base
-    let p_a1 = pb + a1;
-    let p_a2 = pb + a2i;
     match op {
         Op::Leaf => {
             if is_param_leaf(tape, k) {
@@ -387,94 +637,94 @@ fn emit_forward(f: &mut Function, lay: Layout, tape: &Tape, k: u32, m: &MathImpo
             }
         }
         Op::Add => {
-            sload(f, lay, p_a1);
-            sload(f, lay, p_a2);
+            aload(f, a1);
+            aload(f, a2);
             f.instruction(&Instruction::F64Add);
         }
         Op::Sub => {
-            sload(f, lay, p_a1);
-            sload(f, lay, p_a2);
+            aload(f, a1);
+            aload(f, a2);
             f.instruction(&Instruction::F64Sub);
         }
         Op::Mul => {
-            sload(f, lay, p_a1);
-            sload(f, lay, p_a2);
+            aload(f, a1);
+            aload(f, a2);
             f.instruction(&Instruction::F64Mul);
         }
         Op::Div => {
-            sload(f, lay, p_a1);
-            sload(f, lay, p_a2);
+            aload(f, a1);
+            aload(f, a2);
             f.instruction(&Instruction::F64Div);
         }
         Op::Neg => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::F64Neg);
         }
         Op::Exp => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::Call(m.exp.expect("exp import missing")));
         }
         Op::Log => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::Call(m.log.expect("log import missing")));
         }
         Op::Sin => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::Call(m.sin.expect("sin import missing")));
         }
         Op::Cos => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::Call(m.cos.expect("cos import missing")));
         }
         Op::Sqrt => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::F64Sqrt);
         }
         Op::Pow => {
-            sload(f, lay, p_a1);
-            f.instruction(&Instruction::F64Const(a2f.into()));
+            aload(f, a1);
+            cload(f, cst);
             f.instruction(&Instruction::Call(m.pow.expect("pow import missing")));
         }
         Op::Abs => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::F64Abs);
         }
         Op::Lgamma => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::Call(m.lgamma.expect("lgamma import missing")));
         }
         Op::AddC => {
-            sload(f, lay, p_a1);
-            f.instruction(&Instruction::F64Const(a2f.into()));
+            aload(f, a1);
+            cload(f, cst);
             f.instruction(&Instruction::F64Add);
         }
         Op::SubC => {
-            sload(f, lay, p_a1);
-            f.instruction(&Instruction::F64Const(a2f.into()));
+            aload(f, a1);
+            cload(f, cst);
             f.instruction(&Instruction::F64Sub);
         }
         Op::RsubC => {
-            f.instruction(&Instruction::F64Const(a2f.into()));
-            sload(f, lay, p_a1);
+            cload(f, cst);
+            aload(f, a1);
             f.instruction(&Instruction::F64Sub);
         }
         Op::MulC => {
-            sload(f, lay, p_a1);
-            f.instruction(&Instruction::F64Const(a2f.into()));
+            aload(f, a1);
+            cload(f, cst);
             f.instruction(&Instruction::F64Mul);
         }
         Op::DivC => {
-            sload(f, lay, p_a1);
-            f.instruction(&Instruction::F64Const(a2f.into()));
+            aload(f, a1);
+            cload(f, cst);
             f.instruction(&Instruction::F64Div);
         }
         Op::RdivC => {
-            f.instruction(&Instruction::F64Const(a2f.into()));
-            sload(f, lay, p_a1);
+            cload(f, cst);
+            aload(f, a1);
             f.instruction(&Instruction::F64Div);
         }
         Op::Phi => {
-            sload(f, lay, p_a1);
+            aload(f, a1);
             f.instruction(&Instruction::Call(m.phi.expect("phi import missing")));
         }
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
@@ -483,89 +733,100 @@ fn emit_forward(f: &mut Function, lay: Layout, tape: &Tape, k: u32, m: &MathImpo
     }
 }
 
-fn emit_backward(
-    f: &mut Function,
-    lay: Layout,
-    tape: &Tape,
-    k: u32,
-    primal_base: u32,
-    adjoint_base: u32,
-    m: &MathImportIndex,
-) {
+/// The six values one backward step touches, plus its f64 argument.
+#[derive(Clone, Copy)]
+struct Back {
+    dk: Addr,
+    da1: Addr,
+    da2: Addr,
+    pa1: Addr,
+    pa2: Addr,
+    pk: Addr,
+    cst: Cst,
+}
+
+fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: Back) {
     let op = tape.op_at(k);
-    let a1 = tape.arg1_at(k);
-    let a2i = tape.arg2i_at(k);
-    let a2f = tape.arg2f_at(k);
-    let dk = adjoint_base + k;
-    let da1 = adjoint_base + a1;
-    let da2 = adjoint_base + a2i;
-    let pa1 = primal_base + a1;
-    let pa2 = primal_base + a2i;
-    let pk = primal_base + k;
+    let Back {
+        dk,
+        da1,
+        da2,
+        pa1,
+        pa2,
+        pk,
+        cst,
+    } = b;
 
     match op {
         Op::Leaf => {} // adjoint already accumulated by callers
         Op::Add => {
-            adj_incr(f, lay, da1, dk);
-            adj_incr(f, lay, da2, dk);
+            adj_incr(f, da1, dk);
+            adj_incr(f, da2, dk);
         }
         Op::Sub => {
-            adj_incr(f, lay, da1, dk);
-            adj_decr(f, lay, da2, dk);
+            adj_incr(f, da1, dk);
+            adj_decr(f, da2, dk);
         }
         Op::Mul => {
-            adj_incr_mul(f, lay, da1, dk, pa2);
-            adj_incr_mul(f, lay, da2, dk, pa1);
+            adj_incr_mul(f, da1, dk, pa2);
+            adj_incr_mul(f, da2, dk, pa1);
         }
         Op::Div => {
-            adj_incr_div(f, lay, da1, dk, pa2);
-            adj_decr_mul_div2(f, lay, da2, dk, pa1, pa2);
+            adj_incr_div(f, da1, dk, pa2);
+            adj_decr_mul_div2(f, da2, dk, pa1, pa2);
         }
         Op::Neg => {
-            adj_decr(f, lay, da1, dk);
+            adj_decr(f, da1, dk);
         }
         Op::Exp => {
             // d/dx exp(x) = exp(x) = primal[k]
-            adj_incr_mul(f, lay, da1, dk, pk);
+            adj_incr_mul(f, da1, dk, pk);
         }
         Op::Log => {
-            adj_incr_div(f, lay, da1, dk, pa1);
+            adj_incr_div(f, da1, dk, pa1);
         }
         Op::Sin => {
-            adj_incr_fn1(f, lay, da1, dk, pa1, m.cos.unwrap());
+            adj_incr_fn1(f, da1, dk, pa1, m.cos.unwrap());
         }
         Op::Cos => {
-            adj_decr_fn1(f, lay, da1, dk, pa1, m.sin.unwrap());
+            adj_decr_fn1(f, da1, dk, pa1, m.sin.unwrap());
         }
         Op::Sqrt => {
-            adj_incr_div2(f, lay, da1, dk, pk);
+            adj_incr_div2(f, da1, dk, pk);
         }
         Op::Pow => {
-            adj_incr_pow(f, lay, da1, dk, pa1, a2f, m.pow.unwrap());
+            {
+                // `reroll` rejects a block whose Pow exponent moves, so this
+                // is always an immediate.
+                let Cst::Imm(e) = cst else {
+                    unreachable!("Pow exponent is never table-backed")
+                };
+                adj_incr_pow(f, da1, dk, pa1, e, m.pow.unwrap());
+            }
         }
         Op::Abs => {
-            adj_incr_sign(f, lay, da1, dk, pa1);
+            adj_incr_sign(f, da1, dk, pa1);
         }
         Op::Lgamma => {
-            adj_incr_fn1(f, lay, da1, dk, pa1, m.digamma.unwrap());
+            adj_incr_fn1(f, da1, dk, pa1, m.digamma.unwrap());
         }
         Op::AddC | Op::SubC => {
-            adj_incr(f, lay, da1, dk);
+            adj_incr(f, da1, dk);
         }
         Op::RsubC => {
-            adj_decr(f, lay, da1, dk);
+            adj_decr(f, da1, dk);
         }
         Op::MulC => {
-            adj_incr_mulc(f, lay, da1, dk, a2f);
+            adj_incr_mulc(f, da1, dk, cst);
         }
         Op::DivC => {
-            adj_incr_divc(f, lay, da1, dk, a2f);
+            adj_incr_divc(f, da1, dk, cst);
         }
         Op::RdivC => {
-            adj_decr_rdivc(f, lay, da1, dk, a2f, pa1);
+            adj_decr_rdivc(f, da1, dk, cst, pa1);
         }
         Op::Phi => {
-            adj_incr_phi(f, lay, da1, dk, pa1, m.exp.unwrap());
+            adj_incr_phi(f, da1, dk, pa1, m.exp.unwrap());
         }
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
             unimplemented!("backward for op {op:?}");
@@ -580,28 +841,36 @@ fn emit_backward(
 // ---- value storage -------------------------------------------------------
 //
 // A tape node's primal and adjoint each occupy one "slot": primals are slots
-// 0..n, adjoints n..2n. Where a slot physically lives is a layout decision.
+// 0..n, adjoints n..2n, and a re-rolled loop's moving constants follow at 2n.
 // Locals are register-allocated and much faster, but a function is capped at
-// 50,000 of them, and a re-rolled loop cannot hold a whole vector in locals
-// anyway. Memory slots live in a caller-owned scratch buffer at a constant
-// offset, so the byte offset folds into the load/store immediate.
+// 50,000 of them and a loop body cannot hold a whole vector in locals, so
+// slots otherwise live in a caller-owned scratch buffer.
 
 /// Wasm locals cost nothing to address but are capped per function. V8's limit
 /// is the binding one; other engines allow more.
 const MAX_WASM_LOCALS: u32 = 50_000;
 
-/// Where each slot lives. Uniform for now: loops will make this per-slot.
+/// Where one value lives. Inside a loop body the slot index moves with the
+/// iteration, so the varying part sits in `ptr` and only the constant part
+/// folds into the load/store immediate.
+#[derive(Clone, Copy)]
+enum Addr {
+    Local(u32),
+    /// `ptr` is an i32 local holding a byte address; `slot` is added as an
+    /// f64-indexed immediate offset.
+    Mem { ptr: u32, slot: u32 },
+}
+
+/// How the straight-line emitter turns a slot number into an [`Addr`].
 #[derive(Clone, Copy)]
 enum Layout {
-    /// Slot `i` is local `first_local + i`.
     Locals { first_local: u32 },
-    /// Slot `i` is at `scratch_ptr + i * 8`.
     Memory,
 }
 
 impl Layout {
-    fn for_tape(n_slots: u32) -> Self {
-        if n_slots <= MAX_WASM_LOCALS {
+    fn for_tape(n_slots: u32, has_loops: bool) -> Self {
+        if !has_loops && n_slots <= MAX_WASM_LOCALS {
             Layout::Locals {
                 first_local: FIRST_SLOT_LOCAL,
             }
@@ -616,212 +885,239 @@ impl Layout {
             Layout::Memory => 0,
         }
     }
-}
 
-fn sload(f: &mut Function, lay: Layout, slot: u32) {
-    match lay {
-        Layout::Locals { first_local } => {
-            f.instruction(&Instruction::LocalGet(first_local + slot));
-        }
-        Layout::Memory => {
-            f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
-            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                offset: slot as u64 * 8,
-                align: 3,
-                memory_index: 0,
-            }));
+    fn at(&self, slot: u32) -> Addr {
+        match *self {
+            Layout::Locals { first_local } => Addr::Local(first_local + slot),
+            Layout::Memory => Addr::Mem {
+                ptr: SCRATCH_PTR,
+                slot,
+            },
         }
     }
 }
 
-/// Push whatever the matching [`sstore_end`] needs underneath the value.
-fn sstore_addr(f: &mut Function, lay: Layout) {
-    if let Layout::Memory = lay {
-        f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+fn memarg(slot: u32) -> wasm_encoder::MemArg {
+    wasm_encoder::MemArg {
+        offset: slot as u64 * 8,
+        align: 3,
+        memory_index: 0,
     }
 }
 
-fn sstore_end(f: &mut Function, lay: Layout, slot: u32) {
-    match lay {
-        Layout::Locals { first_local } => {
-            f.instruction(&Instruction::LocalSet(first_local + slot));
+/// A node's f64 argument. Inside a re-rolled loop it moves with the iteration
+/// and has to be read from the table the caller stages in scratch.
+#[derive(Clone, Copy)]
+enum Cst {
+    Imm(f64),
+    At(Addr),
+}
+
+fn cload(f: &mut Function, c: Cst) {
+    match c {
+        Cst::Imm(v) => {
+            f.instruction(&Instruction::F64Const(v.into()));
         }
-        Layout::Memory => {
-            f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
-                offset: slot as u64 * 8,
-                align: 3,
-                memory_index: 0,
-            }));
+        Cst::At(a) => aload(f, a),
+    }
+}
+
+fn aload(f: &mut Function, a: Addr) {
+    match a {
+        Addr::Local(i) => {
+            f.instruction(&Instruction::LocalGet(i));
+        }
+        Addr::Mem { ptr, slot } => {
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::F64Load(memarg(slot)));
+        }
+    }
+}
+
+/// Push whatever the matching [`astore_end`] needs underneath the value.
+fn astore_addr(f: &mut Function, a: Addr) {
+    if let Addr::Mem { ptr, .. } = a {
+        f.instruction(&Instruction::LocalGet(ptr));
+    }
+}
+
+fn astore_end(f: &mut Function, a: Addr) {
+    match a {
+        Addr::Local(i) => {
+            f.instruction(&Instruction::LocalSet(i));
+        }
+        Addr::Mem { slot, .. } => {
+            f.instruction(&Instruction::F64Store(memarg(slot)));
         }
     }
 }
 
 // d[da] += d[dk]
-fn adj_incr(f: &mut Function, lay: Layout, da: u32, dk: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
+fn adj_incr(f: &mut Function, da: Addr, dk: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] -= d[dk]
-fn adj_decr(f: &mut Function, lay: Layout, da: u32, dk: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
+fn adj_decr(f: &mut Function, da: Addr, dk: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
     f.instruction(&Instruction::F64Sub);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] * t[tv]
-fn adj_incr_mul(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    sload(f, lay, tv);
+fn adj_incr_mul(f: &mut Function, da: Addr, dk: Addr, tv: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    aload(f, tv);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] / t[tv]
-fn adj_incr_div(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    sload(f, lay, tv);
+fn adj_incr_div(f: &mut Function, da: Addr, dk: Addr, tv: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    aload(f, tv);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] -= d[dk] * t[ta] / (t[tb] * t[tb])
-fn adj_decr_mul_div2(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32, tb: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    sload(f, lay, ta);
+fn adj_decr_mul_div2(f: &mut Function, da: Addr, dk: Addr, ta: Addr, tb: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    aload(f, ta);
     f.instruction(&Instruction::F64Mul);
-    sload(f, lay, tb);
-    sload(f, lay, tb);
+    aload(f, tb);
+    aload(f, tb);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Sub);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] / (2 * t[tk])
-fn adj_incr_div2(f: &mut Function, lay: Layout, da: u32, dk: u32, tk: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
+fn adj_incr_div2(f: &mut Function, da: Addr, dk: Addr, tk: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
     f.instruction(&Instruction::F64Const(2.0.into()));
-    sload(f, lay, tk);
+    aload(f, tk);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] * fn(t[tv])
-fn adj_incr_fn1(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32, fn_idx: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    sload(f, lay, tv);
+fn adj_incr_fn1(f: &mut Function, da: Addr, dk: Addr, tv: Addr, fn_idx: u32) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    aload(f, tv);
     f.instruction(&Instruction::Call(fn_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] -= d[dk] * fn(t[tv])
-fn adj_decr_fn1(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32, fn_idx: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    sload(f, lay, tv);
+fn adj_decr_fn1(f: &mut Function, da: Addr, dk: Addr, tv: Addr, fn_idx: u32) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    aload(f, tv);
     f.instruction(&Instruction::Call(fn_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Sub);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] * c
-fn adj_incr_mulc(f: &mut Function, lay: Layout, da: u32, dk: u32, c: f64) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    f.instruction(&Instruction::F64Const(c.into()));
+fn adj_incr_mulc(f: &mut Function, da: Addr, dk: Addr, c: Cst) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    cload(f, c);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] / c
-fn adj_incr_divc(f: &mut Function, lay: Layout, da: u32, dk: u32, c: f64) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    f.instruction(&Instruction::F64Const(c.into()));
+fn adj_incr_divc(f: &mut Function, da: Addr, dk: Addr, c: Cst) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    cload(f, c);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] -= d[dk] * c / (t[ta] * t[ta])
-fn adj_decr_rdivc(f: &mut Function, lay: Layout, da: u32, dk: u32, c: f64, ta: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
-    f.instruction(&Instruction::F64Const(c.into()));
+fn adj_decr_rdivc(f: &mut Function, da: Addr, dk: Addr, c: Cst, ta: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    cload(f, c);
     f.instruction(&Instruction::F64Mul);
-    sload(f, lay, ta);
-    sload(f, lay, ta);
+    aload(f, ta);
+    aload(f, ta);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Sub);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] * exp * pow(t[tv], exp - 1)
-fn adj_incr_pow(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32, exponent: f64, pow_idx: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
+fn adj_incr_pow(f: &mut Function, da: Addr, dk: Addr, tv: Addr, exponent: f64, pow_idx: u32) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
     f.instruction(&Instruction::F64Const(exponent.into()));
     f.instruction(&Instruction::F64Mul);
-    sload(f, lay, tv);
+    aload(f, tv);
     f.instruction(&Instruction::F64Const((exponent - 1.0).into()));
     f.instruction(&Instruction::Call(pow_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] * copysign(1.0, t[ta])  (ABS backward)
-fn adj_incr_sign(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32) {
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
+fn adj_incr_sign(f: &mut Function, da: Addr, dk: Addr, ta: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
     f.instruction(&Instruction::F64Const(1.0.into()));
-    sload(f, lay, ta);
+    aload(f, ta);
     f.instruction(&Instruction::F64Copysign);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }
 
 // d[da] += d[dk] * (1/sqrt(2π)) * exp(-0.5 * t[ta]²)  (Phi backward)
-fn adj_incr_phi(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32, exp_idx: u32) {
+fn adj_incr_phi(f: &mut Function, da: Addr, dk: Addr, ta: Addr, exp_idx: u32) {
     const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    sstore_addr(f, lay);
-    sload(f, lay, da);
-    sload(f, lay, dk);
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
     f.instruction(&Instruction::F64Const((-0.5).into()));
-    sload(f, lay, ta);
-    sload(f, lay, ta);
+    aload(f, ta);
+    aload(f, ta);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::Call(exp_idx));
@@ -829,5 +1125,5 @@ fn adj_incr_phi(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32, exp_id
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    sstore_end(f, lay, da);
+    astore_end(f, da);
 }

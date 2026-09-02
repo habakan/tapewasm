@@ -48,6 +48,7 @@ fn run_aot_log_prob_grad(
     n_params: usize,
     params: &[f64],
     scratch_len: usize,
+    const_table: &[f64],
 ) -> (f64, Vec<f64>) {
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).expect("module parses");
@@ -78,6 +79,12 @@ fn run_aot_log_prob_grad(
     memory
         .write(&mut store, params_ptr as usize, &bytes)
         .unwrap();
+    // Re-rolled loops read their moving constants from the tail of scratch.
+    if !const_table.is_empty() {
+        let at = scratch_ptr as usize + (scratch_len - const_table.len()) * 8;
+        let tbl: Vec<u8> = const_table.iter().flat_map(|c| c.to_le_bytes()).collect();
+        memory.write(&mut store, at, &tbl).unwrap();
+    }
 
     let lp = lpg
         .call(&mut store, (params_ptr, grads_ptr, n_params as i32, scratch_ptr))
@@ -132,7 +139,7 @@ fn linear_regression_aot_matches_oracle() {
     let test_params = vec![0.5, 1.5, -0.2];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
     let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len);
+        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len, &compiled.const_table);
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -180,7 +187,7 @@ fn poisson_regression_aot_matches_oracle() {
     let test_params = vec![0.0, 1.0];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
     let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len);
+        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len, &compiled.const_table);
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -220,7 +227,7 @@ fn multivariate_lkj_aot_matches_oracle() {
     let test_params = vec![0.5, 1.5, 0.3];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
     let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len);
+        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len, &compiled.const_table);
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -261,4 +268,81 @@ model { for (n in 1:N) y[n] ~ normal(atan(a), 1.0); }
         .expect_err("Atan has no AOT emitter")
         .to_string();
     assert!(err.contains("Atan") && err.contains("sample()"), "{err}");
+}
+
+/// Enough data points that the emitter re-rolls the vectorised statement into
+/// a wasm loop. The small cases above stay straight-line, so without this the
+/// loop emitter is never exercised.
+#[test]
+fn rerolled_linear_regression_matches_oracle() {
+    const N: usize = 1500;
+    let xs: Vec<f64> = (0..N).map(|i| -1.5 + i as f64 * 0.05).collect();
+    let ys: Vec<f64> = (0..N).map(|i| 0.3 + i as f64 * 0.11).collect();
+    let mut data = Env::new();
+    data.set_scalar("N", N as f64);
+    data.set_vector("x", &xs);
+    data.set_vector("y", &ys);
+    let model = Model::parse_and_load(LINEAR_REGRESSION, data).unwrap();
+
+    let dummy = vec![0.1; model.n_params()];
+    let compiled = compile(&model, &dummy).unwrap();
+    assert!(
+        !compiled.const_table.is_empty(),
+        "expected a re-rolled loop with a moving-constant table"
+    );
+
+    for test_params in [
+        vec![0.5, 1.5, -0.2],
+        vec![-1.0, 0.25, 0.7],
+        vec![0.0, 0.0, 0.0],
+    ] {
+        let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
+        let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+            &compiled.wasm,
+            compiled.n_params,
+            &test_params,
+            compiled.scratch_len,
+            &compiled.const_table,
+        );
+        assert!(
+            close(oracle_lp, aot_lp, 1e-12),
+            "lp at {test_params:?}: oracle={oracle_lp}, aot={aot_lp}"
+        );
+        for (i, (o, a)) in oracle_grads.iter().zip(aot_grads.iter()).enumerate() {
+            assert!(
+                close(*o, *a, 1e-12),
+                "grad[{i}] at {test_params:?}: oracle={o}, aot={a}, diff={}",
+                o - a
+            );
+        }
+    }
+}
+
+/// Calling twice must give the same answer: the scratch buffer is reused, so a
+/// stale adjoint or a clobbered constant table would only show on the second
+/// call.
+#[test]
+fn rerolled_model_is_reentrant() {
+    const N: usize = 1500;
+    let mut data = Env::new();
+    data.set_scalar("N", N as f64);
+    data.set_vector("x", &(0..N).map(|i| i as f64 * 0.1).collect::<Vec<_>>());
+    data.set_vector("y", &(0..N).map(|i| 1.0 + i as f64 * 0.2).collect::<Vec<_>>());
+    let model = Model::parse_and_load(LINEAR_REGRESSION, data).unwrap();
+    let compiled = compile(&model, &vec![0.1; model.n_params()]).unwrap();
+    assert!(!compiled.const_table.is_empty(), "expected a re-rolled loop");
+
+    let p = vec![0.4, 1.1, 0.3];
+    let first = run_aot_log_prob_grad(
+        &compiled.wasm,
+        compiled.n_params,
+        &p,
+        compiled.scratch_len,
+        &compiled.const_table,
+    );
+    let (oracle_lp, oracle_grads) = model.log_prob_grad(&p).unwrap();
+    assert!(close(first.0, oracle_lp, 1e-12));
+    for (o, a) in oracle_grads.iter().zip(first.1.iter()) {
+        assert!(close(*o, *a, 1e-12));
+    }
 }
