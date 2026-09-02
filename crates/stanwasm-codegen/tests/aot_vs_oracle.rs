@@ -43,13 +43,20 @@ fn install_math(linker: &mut Linker<HostState>, store: &mut Store<HostState>) {
     linker.define("Math", "pow", pow).unwrap();
 }
 
-fn run_aot_log_prob_grad(wasm: &[u8], n_params: usize, params: &[f64]) -> (f64, Vec<f64>) {
+fn run_aot_log_prob_grad(
+    wasm: &[u8],
+    n_params: usize,
+    params: &[f64],
+    scratch_len: usize,
+) -> (f64, Vec<f64>) {
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).expect("module parses");
     let mut store = Store::new(&engine, HostState);
 
-    // Host-allocated memory shared with the AOT module.
-    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    // Host-allocated memory shared with the AOT module: params, grads, then the
+    // module's primal/adjoint scratch.
+    let pages = ((n_params * 2 + scratch_len) * 8).div_ceil(65536).max(1) as u32;
+    let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
     install_math(&mut linker, &mut store);
@@ -60,19 +67,20 @@ fn run_aot_log_prob_grad(wasm: &[u8], n_params: usize, params: &[f64]) -> (f64, 
         .expect("instantiate");
 
     let lpg = instance
-        .get_typed_func::<(i32, i32, i32), f64>(&store, "log_prob_grad")
+        .get_typed_func::<(i32, i32, i32, i32), f64>(&store, "log_prob_grad")
         .unwrap();
 
     // Layout: params at offset 0, grads at offset n_params*8.
     let params_ptr: i32 = 0;
     let grads_ptr: i32 = (n_params * 8) as i32;
+    let scratch_ptr: i32 = (n_params * 16) as i32;
     let bytes: Vec<u8> = params.iter().flat_map(|p| p.to_le_bytes()).collect();
     memory
         .write(&mut store, params_ptr as usize, &bytes)
         .unwrap();
 
     let lp = lpg
-        .call(&mut store, (params_ptr, grads_ptr, n_params as i32))
+        .call(&mut store, (params_ptr, grads_ptr, n_params as i32, scratch_ptr))
         .unwrap();
 
     let mut grad_bytes = vec![0u8; n_params * 8];
@@ -124,7 +132,7 @@ fn linear_regression_aot_matches_oracle() {
     let test_params = vec![0.5, 1.5, -0.2];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
     let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params);
+        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len);
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -172,7 +180,7 @@ fn poisson_regression_aot_matches_oracle() {
     let test_params = vec![0.0, 1.0];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
     let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params);
+        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len);
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -212,7 +220,7 @@ fn multivariate_lkj_aot_matches_oracle() {
     let test_params = vec![0.5, 1.5, 0.3];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
     let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params);
+        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len);
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),

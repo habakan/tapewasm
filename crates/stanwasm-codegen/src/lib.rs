@@ -40,29 +40,23 @@ pub enum CodegenError {
          (tape replay), which supports every op the runtime produces."
     )]
     UnsupportedOp { op: String },
-    #[error(
-        "model too large for the AOT path: the forward trace has {tape_len} \
-         nodes, which needs {locals} wasm locals — over the {limit} a browser \
-         engine accepts per function. Sample this model with `sample()` \
-         (tape replay), which has no such limit, or reduce N"
-    )]
-    TooManyLocals {
-        tape_len: usize,
-        locals: usize,
-        limit: usize,
-    },
     #[error(transparent)]
     Eval(#[from] stanwasm_runtime::EvalError),
 }
 
-/// V8's per-function local limit. Other engines allow more, but the browser is
-/// the target, so this is the binding constraint.
-pub const MAX_WASM_LOCALS: usize = 50_000;
+/// Function parameter holding the scratch base address, used only by
+/// [`Layout::Memory`]. Primals and adjoints live there, two f64 per tape node.
+const SCRATCH_PTR: u32 = 3;
+
+/// First local index available for slots: the four i32 parameters come first.
+const FIRST_SLOT_LOCAL: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Compiled {
     pub wasm: Vec<u8>,
     pub n_params: usize,
+    /// f64 slots the caller must pass as the module's scratch buffer.
+    pub scratch_len: usize,
 }
 
 /// Trace `model` on a fresh tape at `dummy_params` (0.1 throughout; eight_schools
@@ -81,16 +75,6 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
     if tape.is_empty() {
         return Err(CodegenError::EmptyTape);
     }
-    // One primal and one adjoint local per tape node, and V8 rejects a function
-    // with over 50,000 locals — fail here, where the message can say what to do.
-    let locals = 2 * tape.len();
-    if locals > MAX_WASM_LOCALS {
-        return Err(CodegenError::TooManyLocals {
-            tape_len: tape.len(),
-            locals,
-            limit: MAX_WASM_LOCALS,
-        });
-    }
     // The emitters have no arm for these, and an `unimplemented!` would compile to a
     // wasm trap that takes the whole module down rather than reporting anything.
     for k in 0..tape.len() {
@@ -108,6 +92,7 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
     Ok(Compiled {
         wasm,
         n_params: dummy_params.len(),
+        scratch_len: 2 * tape.len(),
     })
 }
 
@@ -116,12 +101,14 @@ fn emit(tape: &Tape, n_params: usize, root: u32) -> Vec<u8> {
     let n = tape.len() as u32;
     let needs = scan_imports(tape);
 
-    // ---- type section: 0 = (i32,i32,i32)->f64 (log_prob_grad: params_ptr,
-    // grads_ptr, n_params), 1 = (f64)->f64 (unary math), 2 = (f64,f64)->f64 (pow)
+    // ---- type section: 0 = (i32,i32,i32,i32)->f64 (log_prob_grad: params_ptr,
+    // grads_ptr, n_params, scratch_ptr), 1 = (f64)->f64 (unary math),
+    // 2 = (f64,f64)->f64 (pow)
     let mut types = TypeSection::new();
-    types
-        .ty()
-        .function([ValType::I32, ValType::I32, ValType::I32], [ValType::F64]);
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::F64],
+    );
     types.ty().function([ValType::F64], [ValType::F64]);
     types
         .ty()
@@ -286,29 +273,44 @@ fn math_idx_add_binary(m: &mut MathImportIndex, imports: &mut ImportSection, nam
 }
 
 fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> Function {
-    // 3 i32 params (params_ptr, grads_ptr, n_params) at local indices 0..3, then
-    // 2*n f64 locals: primals at 3..3+n, adjoints at 3+n..3+2n.
-    const PARAMS_PTR: u32 = 0;
+    // 4 i32 params at local indices 0..4: params_ptr, grads_ptr, n_params
+    // (unused — the recorded tape already encodes it), scratch_ptr. Primals
+    // occupy scratch slots 0..n and adjoints n..2n; the function needs no
+    // locals of its own.
     const GRADS_PTR: u32 = 1;
-    // n_params (param 2) is unused — the recorded tape already encodes it.
-    const PRIMAL_BASE: u32 = 3;
-    let adjoint_base = PRIMAL_BASE + n;
-    let total_locals = 2 * n;
-    let mut f = Function::new([(total_locals, ValType::F64)]);
+    const PRIMAL_BASE: u32 = 0;
+    let adjoint_base = n;
+    let lay = Layout::for_tape(2 * n);
+    let mut f = Function::new([(lay.local_count(2 * n), ValType::F64)]);
+
+    // ---- zero the adjoint half --------------------------------------------
+    // Locals start at zero; a caller-owned scratch buffer is reused across
+    // calls, so its adjoint half has to be cleared. Primals are all written
+    // before they are read either way.
+    if let Layout::Memory = lay {
+        f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+        f.instruction(&Instruction::I32Const((n * 8) as i32));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const((n * 8) as i32));
+        f.instruction(&Instruction::MemoryFill(0));
+    }
 
     // ---- forward pass ------------------------------------------------------
     for k in 0..n {
-        emit_forward(&mut f, tape, k, m);
-        f.instruction(&Instruction::LocalSet(PRIMAL_BASE + k));
+        sstore_addr(&mut f, lay);
+        emit_forward(&mut f, lay, tape, k, m);
+        sstore_end(&mut f, lay, PRIMAL_BASE + k);
     }
 
     // ---- initialize root adjoint = 1.0 ------------------------------------
+    sstore_addr(&mut f, lay);
     f.instruction(&Instruction::F64Const(1.0.into()));
-    f.instruction(&Instruction::LocalSet(adjoint_base + root));
+    sstore_end(&mut f, lay, adjoint_base + root);
 
     // ---- backward pass (reverse order) ------------------------------------
     for k_rev in (0..n).rev() {
-        emit_backward(&mut f, tape, k_rev, PRIMAL_BASE, adjoint_base, m);
+        emit_backward(&mut f, lay, tape, k_rev, PRIMAL_BASE, adjoint_base, m);
     }
 
     // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter, so
@@ -319,17 +321,16 @@ fn build_log_prob_grad(tape: &Tape, root: u32, n: u32, m: &MathImportIndex) -> F
         f.instruction(&Instruction::LocalGet(GRADS_PTR));
         f.instruction(&Instruction::I32Const((pi * 8) as i32));
         f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::LocalGet(adjoint_base + pi));
+        sload(&mut f, lay, adjoint_base + pi);
         f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
             offset: 0,
             align: 3,
             memory_index: 0,
         }));
     }
-    let _ = PARAMS_PTR; // referenced by emit_forward
 
     // ---- return log_prob ---------------------------------------------------
-    f.instruction(&Instruction::LocalGet(PRIMAL_BASE + root));
+    sload(&mut f, lay, PRIMAL_BASE + root);
     f.instruction(&Instruction::End);
     f
 }
@@ -360,15 +361,14 @@ fn is_param_leaf(tape: &Tape, k: u32) -> bool {
     true
 }
 
-fn emit_forward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex) {
+fn emit_forward(f: &mut Function, lay: Layout, tape: &Tape, k: u32, m: &MathImportIndex) {
     let op = tape.op_at(k);
     let a1 = tape.arg1_at(k);
     let a2i = tape.arg2i_at(k);
     let a2f = tape.arg2f_at(k);
-    // Local indices: params_ptr=0, grads_ptr=1, n_params(unused)=2,
-    // primals = 3..3+n, adjoints = 3+n..3+2n
+    // Scratch slots: primals = 0..n, adjoints = n..2n.
     const PARAMS_PTR: u32 = 0;
-    let pb = 3u32; // primal_base
+    let pb = 0u32; // primal_base
     let p_a1 = pb + a1;
     let p_a2 = pb + a2i;
     match op {
@@ -387,94 +387,94 @@ fn emit_forward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex) {
             }
         }
         Op::Add => {
-            f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::LocalGet(p_a2));
+            sload(f, lay, p_a1);
+            sload(f, lay, p_a2);
             f.instruction(&Instruction::F64Add);
         }
         Op::Sub => {
-            f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::LocalGet(p_a2));
+            sload(f, lay, p_a1);
+            sload(f, lay, p_a2);
             f.instruction(&Instruction::F64Sub);
         }
         Op::Mul => {
-            f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::LocalGet(p_a2));
+            sload(f, lay, p_a1);
+            sload(f, lay, p_a2);
             f.instruction(&Instruction::F64Mul);
         }
         Op::Div => {
-            f.instruction(&Instruction::LocalGet(p_a1));
-            f.instruction(&Instruction::LocalGet(p_a2));
+            sload(f, lay, p_a1);
+            sload(f, lay, p_a2);
             f.instruction(&Instruction::F64Div);
         }
         Op::Neg => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Neg);
         }
         Op::Exp => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::Call(m.exp.expect("exp import missing")));
         }
         Op::Log => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::Call(m.log.expect("log import missing")));
         }
         Op::Sin => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::Call(m.sin.expect("sin import missing")));
         }
         Op::Cos => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::Call(m.cos.expect("cos import missing")));
         }
         Op::Sqrt => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Sqrt);
         }
         Op::Pow => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::Call(m.pow.expect("pow import missing")));
         }
         Op::Abs => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Abs);
         }
         Op::Lgamma => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::Call(m.lgamma.expect("lgamma import missing")));
         }
         Op::AddC => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Add);
         }
         Op::SubC => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Sub);
         }
         Op::RsubC => {
             f.instruction(&Instruction::F64Const(a2f.into()));
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Sub);
         }
         Op::MulC => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Mul);
         }
         Op::DivC => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Const(a2f.into()));
             f.instruction(&Instruction::F64Div);
         }
         Op::RdivC => {
             f.instruction(&Instruction::F64Const(a2f.into()));
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::F64Div);
         }
         Op::Phi => {
-            f.instruction(&Instruction::LocalGet(p_a1));
+            sload(f, lay, p_a1);
             f.instruction(&Instruction::Call(m.phi.expect("phi import missing")));
         }
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
@@ -485,6 +485,7 @@ fn emit_forward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex) {
 
 fn emit_backward(
     f: &mut Function,
+    lay: Layout,
     tape: &Tape,
     k: u32,
     primal_base: u32,
@@ -505,66 +506,66 @@ fn emit_backward(
     match op {
         Op::Leaf => {} // adjoint already accumulated by callers
         Op::Add => {
-            adj_incr(f, da1, dk);
-            adj_incr(f, da2, dk);
+            adj_incr(f, lay, da1, dk);
+            adj_incr(f, lay, da2, dk);
         }
         Op::Sub => {
-            adj_incr(f, da1, dk);
-            adj_decr(f, da2, dk);
+            adj_incr(f, lay, da1, dk);
+            adj_decr(f, lay, da2, dk);
         }
         Op::Mul => {
-            adj_incr_mul(f, da1, dk, pa2);
-            adj_incr_mul(f, da2, dk, pa1);
+            adj_incr_mul(f, lay, da1, dk, pa2);
+            adj_incr_mul(f, lay, da2, dk, pa1);
         }
         Op::Div => {
-            adj_incr_div(f, da1, dk, pa2);
-            adj_decr_mul_div2(f, da2, dk, pa1, pa2);
+            adj_incr_div(f, lay, da1, dk, pa2);
+            adj_decr_mul_div2(f, lay, da2, dk, pa1, pa2);
         }
         Op::Neg => {
-            adj_decr(f, da1, dk);
+            adj_decr(f, lay, da1, dk);
         }
         Op::Exp => {
             // d/dx exp(x) = exp(x) = primal[k]
-            adj_incr_mul(f, da1, dk, pk);
+            adj_incr_mul(f, lay, da1, dk, pk);
         }
         Op::Log => {
-            adj_incr_div(f, da1, dk, pa1);
+            adj_incr_div(f, lay, da1, dk, pa1);
         }
         Op::Sin => {
-            adj_incr_fn1(f, da1, dk, pa1, m.cos.unwrap());
+            adj_incr_fn1(f, lay, da1, dk, pa1, m.cos.unwrap());
         }
         Op::Cos => {
-            adj_decr_fn1(f, da1, dk, pa1, m.sin.unwrap());
+            adj_decr_fn1(f, lay, da1, dk, pa1, m.sin.unwrap());
         }
         Op::Sqrt => {
-            adj_incr_div2(f, da1, dk, pk);
+            adj_incr_div2(f, lay, da1, dk, pk);
         }
         Op::Pow => {
-            adj_incr_pow(f, da1, dk, pa1, a2f, m.pow.unwrap());
+            adj_incr_pow(f, lay, da1, dk, pa1, a2f, m.pow.unwrap());
         }
         Op::Abs => {
-            adj_incr_sign(f, da1, dk, pa1);
+            adj_incr_sign(f, lay, da1, dk, pa1);
         }
         Op::Lgamma => {
-            adj_incr_fn1(f, da1, dk, pa1, m.digamma.unwrap());
+            adj_incr_fn1(f, lay, da1, dk, pa1, m.digamma.unwrap());
         }
         Op::AddC | Op::SubC => {
-            adj_incr(f, da1, dk);
+            adj_incr(f, lay, da1, dk);
         }
         Op::RsubC => {
-            adj_decr(f, da1, dk);
+            adj_decr(f, lay, da1, dk);
         }
         Op::MulC => {
-            adj_incr_mulc(f, da1, dk, a2f);
+            adj_incr_mulc(f, lay, da1, dk, a2f);
         }
         Op::DivC => {
-            adj_incr_divc(f, da1, dk, a2f);
+            adj_incr_divc(f, lay, da1, dk, a2f);
         }
         Op::RdivC => {
-            adj_decr_rdivc(f, da1, dk, a2f, pa1);
+            adj_decr_rdivc(f, lay, da1, dk, a2f, pa1);
         }
         Op::Phi => {
-            adj_incr_phi(f, da1, dk, pa1, m.exp.unwrap());
+            adj_incr_phi(f, lay, da1, dk, pa1, m.exp.unwrap());
         }
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
             unimplemented!("backward for op {op:?}");
@@ -575,158 +576,252 @@ fn emit_backward(
 // ---- adjoint update emitters: given adjoint `da`, source adjoint `dk` and any
 // primal locals, emit `da += <expression in dk and primals>`. ----
 
+
+// ---- value storage -------------------------------------------------------
+//
+// A tape node's primal and adjoint each occupy one "slot": primals are slots
+// 0..n, adjoints n..2n. Where a slot physically lives is a layout decision.
+// Locals are register-allocated and much faster, but a function is capped at
+// 50,000 of them, and a re-rolled loop cannot hold a whole vector in locals
+// anyway. Memory slots live in a caller-owned scratch buffer at a constant
+// offset, so the byte offset folds into the load/store immediate.
+
+/// Wasm locals cost nothing to address but are capped per function. V8's limit
+/// is the binding one; other engines allow more.
+const MAX_WASM_LOCALS: u32 = 50_000;
+
+/// Where each slot lives. Uniform for now: loops will make this per-slot.
+#[derive(Clone, Copy)]
+enum Layout {
+    /// Slot `i` is local `first_local + i`.
+    Locals { first_local: u32 },
+    /// Slot `i` is at `scratch_ptr + i * 8`.
+    Memory,
+}
+
+impl Layout {
+    fn for_tape(n_slots: u32) -> Self {
+        if n_slots <= MAX_WASM_LOCALS {
+            Layout::Locals {
+                first_local: FIRST_SLOT_LOCAL,
+            }
+        } else {
+            Layout::Memory
+        }
+    }
+
+    fn local_count(&self, n_slots: u32) -> u32 {
+        match self {
+            Layout::Locals { .. } => n_slots,
+            Layout::Memory => 0,
+        }
+    }
+}
+
+fn sload(f: &mut Function, lay: Layout, slot: u32) {
+    match lay {
+        Layout::Locals { first_local } => {
+            f.instruction(&Instruction::LocalGet(first_local + slot));
+        }
+        Layout::Memory => {
+            f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                offset: slot as u64 * 8,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+    }
+}
+
+/// Push whatever the matching [`sstore_end`] needs underneath the value.
+fn sstore_addr(f: &mut Function, lay: Layout) {
+    if let Layout::Memory = lay {
+        f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+    }
+}
+
+fn sstore_end(f: &mut Function, lay: Layout, slot: u32) {
+    match lay {
+        Layout::Locals { first_local } => {
+            f.instruction(&Instruction::LocalSet(first_local + slot));
+        }
+        Layout::Memory => {
+            f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                offset: slot as u64 * 8,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+    }
+}
+
 // d[da] += d[dk]
-fn adj_incr(f: &mut Function, da: u32, dk: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_incr(f: &mut Function, lay: Layout, da: u32, dk: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] -= d[dk]
-fn adj_decr(f: &mut Function, da: u32, dk: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_decr(f: &mut Function, lay: Layout, da: u32, dk: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Sub);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] * t[tv]
-fn adj_incr_mul(f: &mut Function, da: u32, dk: u32, tv: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::LocalGet(tv));
+fn adj_incr_mul(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
+    sload(f, lay, tv);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] / t[tv]
-fn adj_incr_div(f: &mut Function, da: u32, dk: u32, tv: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::LocalGet(tv));
+fn adj_incr_div(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
+    sload(f, lay, tv);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] -= d[dk] * t[ta] / (t[tb] * t[tb])
-fn adj_decr_mul_div2(f: &mut Function, da: u32, dk: u32, ta: u32, tb: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::LocalGet(ta));
+fn adj_decr_mul_div2(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32, tb: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
+    sload(f, lay, ta);
     f.instruction(&Instruction::F64Mul);
-    f.instruction(&Instruction::LocalGet(tb));
-    f.instruction(&Instruction::LocalGet(tb));
+    sload(f, lay, tb);
+    sload(f, lay, tb);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Sub);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] / (2 * t[tk])
-fn adj_incr_div2(f: &mut Function, da: u32, dk: u32, tk: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_incr_div2(f: &mut Function, lay: Layout, da: u32, dk: u32, tk: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const(2.0.into()));
-    f.instruction(&Instruction::LocalGet(tk));
+    sload(f, lay, tk);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] * fn(t[tv])
-fn adj_incr_fn1(f: &mut Function, da: u32, dk: u32, tv: u32, fn_idx: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::LocalGet(tv));
+fn adj_incr_fn1(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32, fn_idx: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
+    sload(f, lay, tv);
     f.instruction(&Instruction::Call(fn_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] -= d[dk] * fn(t[tv])
-fn adj_decr_fn1(f: &mut Function, da: u32, dk: u32, tv: u32, fn_idx: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
-    f.instruction(&Instruction::LocalGet(tv));
+fn adj_decr_fn1(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32, fn_idx: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
+    sload(f, lay, tv);
     f.instruction(&Instruction::Call(fn_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Sub);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] * c
-fn adj_incr_mulc(f: &mut Function, da: u32, dk: u32, c: f64) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_incr_mulc(f: &mut Function, lay: Layout, da: u32, dk: u32, c: f64) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const(c.into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] / c
-fn adj_incr_divc(f: &mut Function, da: u32, dk: u32, c: f64) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_incr_divc(f: &mut Function, lay: Layout, da: u32, dk: u32, c: f64) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const(c.into()));
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] -= d[dk] * c / (t[ta] * t[ta])
-fn adj_decr_rdivc(f: &mut Function, da: u32, dk: u32, c: f64, ta: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_decr_rdivc(f: &mut Function, lay: Layout, da: u32, dk: u32, c: f64, ta: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const(c.into()));
     f.instruction(&Instruction::F64Mul);
-    f.instruction(&Instruction::LocalGet(ta));
-    f.instruction(&Instruction::LocalGet(ta));
+    sload(f, lay, ta);
+    sload(f, lay, ta);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Sub);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] * exp * pow(t[tv], exp - 1)
-fn adj_incr_pow(f: &mut Function, da: u32, dk: u32, tv: u32, exponent: f64, pow_idx: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_incr_pow(f: &mut Function, lay: Layout, da: u32, dk: u32, tv: u32, exponent: f64, pow_idx: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const(exponent.into()));
     f.instruction(&Instruction::F64Mul);
-    f.instruction(&Instruction::LocalGet(tv));
+    sload(f, lay, tv);
     f.instruction(&Instruction::F64Const((exponent - 1.0).into()));
     f.instruction(&Instruction::Call(pow_idx));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] * copysign(1.0, t[ta])  (ABS backward)
-fn adj_incr_sign(f: &mut Function, da: u32, dk: u32, ta: u32) {
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+fn adj_incr_sign(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32) {
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const(1.0.into()));
-    f.instruction(&Instruction::LocalGet(ta));
+    sload(f, lay, ta);
     f.instruction(&Instruction::F64Copysign);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
 
 // d[da] += d[dk] * (1/sqrt(2π)) * exp(-0.5 * t[ta]²)  (Phi backward)
-fn adj_incr_phi(f: &mut Function, da: u32, dk: u32, ta: u32, exp_idx: u32) {
+fn adj_incr_phi(f: &mut Function, lay: Layout, da: u32, dk: u32, ta: u32, exp_idx: u32) {
     const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    f.instruction(&Instruction::LocalGet(da));
-    f.instruction(&Instruction::LocalGet(dk));
+    sstore_addr(f, lay);
+    sload(f, lay, da);
+    sload(f, lay, dk);
     f.instruction(&Instruction::F64Const((-0.5).into()));
-    f.instruction(&Instruction::LocalGet(ta));
-    f.instruction(&Instruction::LocalGet(ta));
+    sload(f, lay, ta);
+    sload(f, lay, ta);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::Call(exp_idx));
@@ -734,5 +829,5 @@ fn adj_incr_phi(f: &mut Function, da: u32, dk: u32, ta: u32, exp_idx: u32) {
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(da));
+    sstore_end(f, lay, da);
 }
