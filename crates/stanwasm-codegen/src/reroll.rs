@@ -366,6 +366,47 @@ mod tests {
         check_args_reproduce_tape(&tape, &detect(&tape));
     }
 
+    /// The density block of a vectorised statement is a chain of temporaries
+    /// with one accumulator: everything but the accumulator should be local.
+    #[test]
+    fn most_of_a_density_block_is_iteration_local() {
+        let (tape, root) = linreg_tape(64);
+        let blocks = detect(&tape);
+        let flags = local_positions(&tape, &blocks, root);
+        let biggest = blocks
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, b)| b.len)
+            .map(|(i, _)| i)
+            .unwrap();
+        let n_local = flags[biggest].iter().filter(|f| **f).count();
+        let len = blocks[biggest].len as usize;
+        assert!(
+            n_local >= len - 1,
+            "only {n_local}/{len} positions are iteration-local"
+        );
+    }
+
+    /// Whatever a gather can reach has to keep an address.
+    #[test]
+    fn gather_targets_are_not_local() {
+        let (tape, root) = gather_tape(200);
+        let blocks = detect(&tape);
+        let flags = local_positions(&tape, &blocks, root);
+        for (bi, b) in blocks.iter().enumerate() {
+            for j in 0..b.len as usize {
+                if let ArgRel::Tabled(ix) = &b.args[j].arg1 {
+                    for &t in ix {
+                        if t >= b.start && t < b.end() {
+                            let pos = ((t - b.start) % b.len) as usize;
+                            assert!(!flags[bi][pos], "a gather target stayed local");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A gather (`mu[g[i]]` with irregular groups) is the case no stride
     /// describes. It must still be found, with the gather tabled.
     #[test]
@@ -405,3 +446,66 @@ mod tests {
     }
 }
 
+
+/// Which positions in each block can live in a wasm local rather than in the
+/// scratch buffer: written and read inside one iteration, and invisible from
+/// anywhere else on the tape.
+///
+/// Everything else — an accumulator carrying across iterations, a vector some
+/// later statement reads back, whatever a gather points at — has to stay
+/// addressable, and a local is not.
+pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool>> {
+    let n = tape.len() as u32;
+    let mut out: Vec<Vec<bool>> = blocks.iter().map(|b| vec![true; b.len as usize]).collect();
+
+    // Which block, if any, owns a tape index, and at which position.
+    let owner = |k: u32| -> Option<(usize, u32, u32)> {
+        blocks.iter().enumerate().find_map(|(bi, b)| {
+            (k >= b.start && k < b.end()).then(|| {
+                let off = k - b.start;
+                (bi, off / b.len, off % b.len)
+            })
+        })
+    };
+
+    let demote = |k: u32, out: &mut Vec<Vec<bool>>| {
+        if let Some((bi, _, j)) = owner(k) {
+            out[bi][j as usize] = false;
+        }
+    };
+
+    for k in 0..n {
+        let (u1, u2, _) = uses(tape.op_at(k));
+        for target in [(u1, tape.arg1_at(k)), (u2, tape.arg2i_at(k))] {
+            let (used, t) = target;
+            if !used {
+                continue;
+            }
+            let Some((tb, ti, tj)) = owner(t) else { continue };
+            // A reference from outside the block, or from another iteration of
+            // it, needs an address.
+            match owner(k) {
+                Some((kb, ki, _)) if kb == tb && ki == ti => {}
+                _ => out[tb][tj as usize] = false,
+            }
+        }
+    }
+
+    // A gather reads wherever its table says, so anything it can reach stays
+    // addressable.
+    for b in blocks {
+        for rels in &b.args {
+            for rel in [&rels.arg1, &rels.arg2i] {
+                if let ArgRel::Tabled(ix) = rel {
+                    for &t in ix {
+                        demote(t, &mut out);
+                    }
+                }
+            }
+        }
+    }
+
+    // The log density is read after the loops have run.
+    demote(root, &mut out);
+    out
+}

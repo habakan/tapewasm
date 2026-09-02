@@ -294,6 +294,54 @@ fn math_idx_add_binary(m: &mut MathImportIndex, imports: &mut ImportSection, nam
     m.add_binary(imports, name)
 }
 
+/// Number the positions a block keeps in locals, densely, so every block can
+/// reuse the same pool.
+fn block_locals_of(flags: &[bool], len: u32, base: u32, stride: u32) -> BlockLocals {
+    let mut idx = Vec::with_capacity(len as usize);
+    let mut next = 0;
+    for &keep in flags.iter().take(len as usize) {
+        if keep {
+            idx.push(Some(next));
+            next += 1;
+        } else {
+            idx.push(None);
+        }
+    }
+    BlockLocals { idx, base, stride }
+}
+
+/// Which of a block's positions are kept in wasm locals, and where.
+struct BlockLocals {
+    /// Position -> dense local index, `None` when the value needs an address.
+    idx: Vec<Option<u32>>,
+    /// First f64 local; the adjoint half starts `stride` above it.
+    base: u32,
+    stride: u32,
+}
+
+impl BlockLocals {
+    fn prim(&self, j: u32) -> Option<Addr> {
+        self.idx[j as usize].map(|i| Addr::Local(self.base + i))
+    }
+
+    fn adj(&self, j: u32) -> Option<Addr> {
+        self.idx[j as usize].map(|i| Addr::Local(self.base + self.stride + i))
+    }
+
+    /// A same-iteration read of a position this block keeps in a local.
+    fn arg(&self, b: &reroll::Block, rel: &reroll::ArgRel, arg0: u32) -> Option<u32> {
+        match rel {
+            reroll::ArgRel::Affine(t)
+                if *t == b.len && arg0 >= b.start && arg0 < b.start + b.len =>
+            {
+                let j = arg0 - b.start;
+                self.idx[j as usize].map(|_| j)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Where a block node's per-iteration tables start, in scratch slots.
 #[derive(Clone, Copy, Default)]
 struct NodeTables {
@@ -439,6 +487,57 @@ fn block_arg(
     }
 }
 
+/// The adjoint address matching a primal one. A gather's adjoint sits `adj`
+/// slots above its primal, which is an immediate on the same base pointer.
+fn adj_of(rel: &reroll::ArgRel, pa: Addr, adj: u32, arg0: u32, sp: &StridePtrs) -> Addr {
+    match (rel, pa) {
+        (reroll::ArgRel::Tabled(_), Addr::Mem { ptr, .. }) => Addr::Mem { ptr, slot: adj },
+        (reroll::ArgRel::Affine(t), _) => sp.addr(adj + arg0, *t),
+        _ => unreachable!("a tabled argument resolves to a memory address"),
+    }
+}
+
+/// One forward pass over a block body. `locals_only` limits it to the
+/// positions kept in locals: the backward loop reconstructs those, because a
+/// local cannot carry a value from the forward loop to here.
+#[allow(clippy::too_many_arguments)]
+fn emit_block_forward(
+    f: &mut Function,
+    tape: &Tape,
+    m: &MathImportIndex,
+    b: &reroll::Block,
+    sp: &StridePtrs,
+    bl: &BlockLocals,
+    tbl: &[NodeTables],
+    tmp1: u32,
+    tmp2: u32,
+    locals_only: bool,
+) {
+    for j in 0..b.len {
+        if locals_only && bl.prim(j).is_none() {
+            continue;
+        }
+        let k0 = b.start + j;
+        let nt = tbl[j as usize];
+        let ar = &b.args[j as usize];
+        // Gather addresses are computed before the value is pushed: the store
+        // address has to stay on top of the stack.
+        let a1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
+            Some(t) => bl.prim(t).expect("checked local"),
+            None => block_arg(f, sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1),
+        };
+        let a2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
+            Some(t) => bl.prim(t).expect("checked local"),
+            None => block_arg(f, sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2),
+        };
+        let cst = block_cst(tape, b, j, tbl, sp);
+        let w = bl.prim(j).unwrap_or_else(|| sp.addr(k0, b.len));
+        astore_addr(f, w);
+        emit_forward(f, tape, k0, m, a1, a2, cst);
+        astore_end(f, w);
+    }
+}
+
 fn build_log_prob_grad(
     tape: &Tape,
     root: u32,
@@ -452,7 +551,18 @@ fn build_log_prob_grad(
     const GRADS_PTR: u32 = 1;
     let adj = n; // adjoint slots follow the primals
     let lay = Layout::for_tape(2 * n, !blocks.is_empty());
-    let f64_locals = lay.local_count(2 * n);
+    // Positions written and read inside one iteration go in locals instead of
+    // scratch; the widest block sizes the pool, and every block reuses it.
+    let block_local = reroll::local_positions(tape, blocks, root);
+    let widest_locals = block_local
+        .iter()
+        .map(|f| f.iter().filter(|x| **x).count() as u32)
+        .max()
+        .unwrap_or(0);
+    let f64_locals = match lay {
+        Layout::Locals { .. } => lay.local_count(2 * n),
+        Layout::Memory => 2 * widest_locals,
+    };
     let widest = blocks
         .iter()
         .map(|b| block_strides(b).len() as u32)
@@ -465,6 +575,7 @@ fn build_log_prob_grad(
     } else {
         1 + widest + reroll::MAX_TABLED as u32
     };
+    let locals_base = FIRST_SLOT_LOCAL;
     let i32_base = FIRST_SLOT_LOCAL + f64_locals;
     let iv = i32_base;
     let tmp1 = iv + 1 + widest;
@@ -518,24 +629,12 @@ fn build_log_prob_grad(
                 strides: block_strides(b),
                 first_local: iv + 1,
             };
+            let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
             f.instruction(&Instruction::I32Const(0));
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
-            for j in 0..b.len {
-                let k0 = b.start + j;
-                let nt = tables[bi][j as usize];
-                let ar = &b.args[j as usize];
-                // Gather addresses are computed before the value is pushed:
-                // the store address has to stay on top of the stack.
-                let a1 = block_arg(&mut f, &sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1);
-                let a2 = block_arg(&mut f, &sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2);
-                let cst = block_cst(tape, b, j, &tables[bi], &sp);
-                let w = sp.addr(k0, b.len);
-                astore_addr(&mut f, w);
-                emit_forward(&mut f, tape, k0, m, a1, a2, cst);
-                astore_end(&mut f, w);
-            }
+            emit_block_forward(&mut f, tape, m, b, &sp, &bl, &tables[bi], tmp1, tmp2, false);
             f.instruction(&Instruction::LocalGet(iv));
             f.instruction(&Instruction::I32Const(1));
             f.instruction(&Instruction::I32Add);
@@ -569,31 +668,41 @@ fn build_log_prob_grad(
                 strides: block_strides(b),
                 first_local: iv + 1,
             };
+            let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
             f.instruction(&Instruction::I32Const((b.reps - 1) as i32));
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
+            // Forward left iteration-local values in locals, which do not
+            // survive to here: recompute this iteration's, then clear the
+            // adjoints they accumulate into.
+            emit_block_forward(&mut f, tape, m, b, &sp, &bl, &tables[bi], tmp1, tmp2, true);
+            for j in 0..b.len {
+                if let Some(a) = bl.adj(j) {
+                    astore_addr(&mut f, a);
+                    f.instruction(&Instruction::F64Const(0.0.into()));
+                    astore_end(&mut f, a);
+                }
+            }
             for j in (0..b.len).rev() {
                 let k0 = b.start + j;
                 let nt = tables[bi][j as usize];
                 let ar = &b.args[j as usize];
-                // One gather address serves both halves: the adjoint of slot
-                // `idx` sits `n` slots above its primal, which is an immediate.
-                let pa1 = block_arg(&mut f, &sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1);
-                let pa2 = block_arg(&mut f, &sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2);
-                let da1 = match (&ar.arg1, pa1) {
-                    (reroll::ArgRel::Tabled(_), Addr::Mem { ptr, .. }) => {
-                        Addr::Mem { ptr, slot: adj }
-                    }
-                    (reroll::ArgRel::Affine(t), _) => sp.addr(adj + tape.arg1_at(k0), *t),
-                    _ => unreachable!("a tabled argument resolves to a memory address"),
+                let pa1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
+                    Some(t) => bl.prim(t).expect("checked local"),
+                    None => block_arg(&mut f, &sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1),
                 };
-                let da2 = match (&ar.arg2i, pa2) {
-                    (reroll::ArgRel::Tabled(_), Addr::Mem { ptr, .. }) => {
-                        Addr::Mem { ptr, slot: adj }
-                    }
-                    (reroll::ArgRel::Affine(t), _) => sp.addr(adj + tape.arg2i_at(k0), *t),
-                    _ => unreachable!("a tabled argument resolves to a memory address"),
+                let pa2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
+                    Some(t) => bl.prim(t).expect("checked local"),
+                    None => block_arg(&mut f, &sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2),
+                };
+                let da1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
+                    Some(t) => bl.adj(t).expect("checked local"),
+                    None => adj_of(&ar.arg1, pa1, adj, tape.arg1_at(k0), &sp),
+                };
+                let da2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
+                    Some(t) => bl.adj(t).expect("checked local"),
+                    None => adj_of(&ar.arg2i, pa2, adj, tape.arg2i_at(k0), &sp),
                 };
                 emit_backward(
                     &mut f,
@@ -601,12 +710,12 @@ fn build_log_prob_grad(
                     k0,
                     m,
                     Back {
-                        dk: sp.addr(adj + k0, b.len),
+                        dk: bl.adj(j).unwrap_or_else(|| sp.addr(adj + k0, b.len)),
                         da1,
                         da2,
                         pa1,
                         pa2,
-                        pk: sp.addr(k0, b.len),
+                        pk: bl.prim(j).unwrap_or_else(|| sp.addr(k0, b.len)),
                         cst: block_cst(tape, b, j, &tables[bi], &sp),
                     },
                 );
