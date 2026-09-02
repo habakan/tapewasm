@@ -43,7 +43,41 @@ pub enum Op {
     Digamma = 27,
 }
 
-const CSE_SIZE: usize = 512;
+
+/// Value numbering key: opcode plus both arguments. Two nodes with the same
+/// key compute the same number on a tape that never mutates a value, so the
+/// second can reuse the first.
+type Vn = (u8, u32, u32, u64);
+
+/// A cheap, deterministic hasher. The default one pulls SipHash into the wasm
+/// bundle for no benefit here, and the table must be exact rather than
+/// direct-mapped: a loop-invariant subexpression shared by only some elements
+/// of a vectorised statement would leave the recorded blocks unequal, and the
+/// AOT emitter could no longer re-roll them.
+#[derive(Default)]
+pub struct VnHasher(u64);
+
+impl std::hash::Hasher for VnHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (self.0 ^ v as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0 ^ v).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.write_u32(v as u32);
+    }
+}
+
+type VnMap = std::collections::HashMap<Vn, u32, std::hash::BuildHasherDefault<VnHasher>>;
 const TAPE_DEFAULT_CAP: usize = 65536;
 
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
@@ -57,15 +91,10 @@ pub struct Tape {
     arg2i: Vec<u32>,
     arg2f: Vec<f64>,
 
-    // Direct-mapped CSE caches for log/exp.
-    // gen counter tracks tape resets so we don't need to clear cache slots.
-    cse_log_key: [i32; CSE_SIZE],
-    cse_log_val: [i32; CSE_SIZE],
-    cse_log_gen: [i32; CSE_SIZE],
-    cse_exp_key: [i32; CSE_SIZE],
-    cse_exp_val: [i32; CSE_SIZE],
-    cse_exp_gen: [i32; CSE_SIZE],
-    cse_gen: i32,
+    /// Common-subexpression table. A vectorised statement re-records every
+    /// loop-invariant term once per element without it — `student_t` over
+    /// `vector[N]` recorded `lgamma(nu/2)` N times.
+    vn: VnMap,
 }
 
 impl Default for Tape {
@@ -83,13 +112,7 @@ impl Tape {
             arg1: Vec::with_capacity(TAPE_DEFAULT_CAP),
             arg2i: Vec::with_capacity(TAPE_DEFAULT_CAP),
             arg2f: Vec::with_capacity(TAPE_DEFAULT_CAP),
-            cse_log_key: [-1; CSE_SIZE],
-            cse_log_val: [-1; CSE_SIZE],
-            cse_log_gen: [-1; CSE_SIZE],
-            cse_exp_key: [-1; CSE_SIZE],
-            cse_exp_val: [-1; CSE_SIZE],
-            cse_exp_gen: [-1; CSE_SIZE],
-            cse_gen: 0,
+            vn: VnMap::default(),
         }
     }
 
@@ -100,8 +123,7 @@ impl Tape {
         self.arg1.clear();
         self.arg2i.clear();
         self.arg2f.clear();
-        // O(1) cache invalidation: bump generation
-        self.cse_gen = self.cse_gen.wrapping_add(1);
+        self.vn.clear();
     }
 
     /// Reset every gradient to zero. Used between consecutive `backward()`
@@ -165,6 +187,21 @@ impl Tape {
     }
 
     fn push(&mut self, v: f64, op: Op, a1: u32, a2i: u32, a2f: f64) -> u32 {
+        // A leaf is a fresh input even when it repeats a value, so it is the
+        // one thing never shared.
+        if op != Op::Leaf {
+            let key: Vn = (op as u8, a1, a2i, a2f.to_bits());
+            if let Some(&i) = self.vn.get(&key) {
+                return i;
+            }
+            let idx = self.push_raw(v, op, a1, a2i, a2f);
+            self.vn.insert(key, idx);
+            return idx;
+        }
+        self.push_raw(v, op, a1, a2i, a2f)
+    }
+
+    fn push_raw(&mut self, v: f64, op: Op, a1: u32, a2i: u32, a2f: f64) -> u32 {
         let idx = self.val.len() as u32;
         self.val.push(v);
         self.grad.push(0.0);
@@ -215,31 +252,13 @@ impl Tape {
     }
 
     pub fn exp(&mut self, a: u32) -> u32 {
-        let h = (a as usize) & (CSE_SIZE - 1);
-        let g = self.cse_gen;
-        if self.cse_exp_gen[h] == g && self.cse_exp_key[h] == a as i32 {
-            return self.cse_exp_val[h] as u32;
-        }
         let v = self.val[a as usize].exp();
-        let idx = self.push(v, Op::Exp, a, 0, 0.0);
-        self.cse_exp_key[h] = a as i32;
-        self.cse_exp_val[h] = idx as i32;
-        self.cse_exp_gen[h] = g;
-        idx
+        self.push(v, Op::Exp, a, 0, 0.0)
     }
 
     pub fn log(&mut self, a: u32) -> u32 {
-        let h = (a as usize) & (CSE_SIZE - 1);
-        let g = self.cse_gen;
-        if self.cse_log_gen[h] == g && self.cse_log_key[h] == a as i32 {
-            return self.cse_log_val[h] as u32;
-        }
         let v = self.val[a as usize].ln();
-        let idx = self.push(v, Op::Log, a, 0, 0.0);
-        self.cse_log_key[h] = a as i32;
-        self.cse_log_val[h] = idx as i32;
-        self.cse_log_gen[h] = g;
-        idx
+        self.push(v, Op::Log, a, 0, 0.0)
     }
 
     pub fn sin(&mut self, a: u32) -> u32 {

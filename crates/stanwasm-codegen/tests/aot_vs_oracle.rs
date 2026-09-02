@@ -352,7 +352,7 @@ fn rerolled_model_is_reentrant() {
 /// a table — the one loop shape whose addresses are computed at run time.
 #[test]
 fn rerolled_gather_matches_oracle() {
-    const N: usize = 1500;
+    const N: usize = 3000;
     const G: usize = 8;
     let src = r#"data { int<lower=0> N; int<lower=1> G; array[N] int<lower=1> g; vector[N] y; }
 parameters { vector[G] mu; real<lower=0> sigma; }
