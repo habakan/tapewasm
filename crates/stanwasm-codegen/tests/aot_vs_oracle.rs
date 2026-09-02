@@ -406,3 +406,37 @@ model {
         }
     }
 }
+
+/// Every re-roll mode has to compute the same gradient. `Always` and `Never`
+/// exercise the loop and straight-line emitters on the same trace, which is
+/// the only place their outputs can be compared directly.
+#[test]
+fn reroll_modes_agree() {
+    use stanwasm_codegen::{compile_with, Reroll};
+    const N: usize = 400;
+    let xs: Vec<f64> = (0..N).map(|i| -1.5 + i as f64 * 0.007).collect();
+    let ys: Vec<f64> = (0..N).map(|i| 0.3 + i as f64 * 0.011).collect();
+    let mut data = Env::new();
+    data.set_scalar("N", N as f64);
+    data.set_vector("x", &xs);
+    data.set_vector("y", &ys);
+    let model = Model::parse_and_load(LINEAR_REGRESSION, data).unwrap();
+    let dummy = vec![0.1; model.n_params()];
+    let test_params = vec![0.4, 1.3, -0.15];
+    let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
+
+    for mode in [Reroll::Auto, Reroll::Always, Reroll::Never] {
+        let c = compile_with(&model, &dummy, mode).unwrap();
+        let (lp, grads) = run_aot_log_prob_grad(
+            &c.wasm,
+            c.n_params,
+            &test_params,
+            c.scratch_len,
+            &c.const_table,
+        );
+        assert!(close(oracle_lp, lp, 1e-12), "{mode:?}: lp {oracle_lp} vs {lp}");
+        for (i, (o, a)) in oracle_grads.iter().zip(grads.iter()).enumerate() {
+            assert!(close(*o, *a, 1e-12), "{mode:?}: grad[{i}] {o} vs {a}");
+        }
+    }
+}

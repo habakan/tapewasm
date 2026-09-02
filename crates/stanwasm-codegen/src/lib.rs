@@ -46,6 +46,32 @@ pub enum CodegenError {
     Eval(#[from] stanwasm_runtime::EvalError),
 }
 
+/// When to re-roll a vectorised statement into a wasm loop.
+///
+/// Which is faster is an engine preference, not a property of the model.
+/// Measured per gradient at N=200 (linear regression, then the same for
+/// logistic and student_t): V8 2.20 straight-line vs 2.63 looped, SpiderMonkey
+/// 14.0 vs 20.3, JavaScriptCore 4.33 vs 2.33. The first two keep optimising a
+/// large straight-line function; the third gives up on it. Past a few tens of
+/// thousands of nodes every engine prefers the loop, which is what `Auto`
+/// falls back on.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Reroll {
+    /// Straight-line until the trace is large enough that no engine keeps
+    /// optimising it.
+    #[default]
+    Auto,
+    /// Always loop: smallest module, and what JavaScriptCore prefers.
+    Always,
+    /// Never loop. Diagnostic only — a large model exceeds what an engine will
+    /// optimise, and eventually what it will hold in locals.
+    Never,
+}
+
+/// Node count past which `Auto` re-rolls. Straight-line wins below it on V8 and
+/// SpiderMonkey by keeping every value in a register-allocated local.
+const RE_ROLL_ABOVE: usize = 12_000;
+
 /// Function parameter holding the scratch base address, used only by
 /// [`Layout::Memory`]. Primals and adjoints live there, two f64 per tape node.
 const SCRATCH_PTR: u32 = 3;
@@ -67,6 +93,15 @@ pub struct Compiled {
 /// Trace `model` on a fresh tape at `dummy_params` (0.1 throughout; eight_schools
 /// needs non-zero seeds), then emit a model-specific wasm module.
 pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenError> {
+    compile_with(model, dummy_params, Reroll::default())
+}
+
+/// [`compile`], choosing when to re-roll vectorised statements.
+pub fn compile_with(
+    model: &Model,
+    dummy_params: &[f64],
+    reroll: Reroll,
+) -> Result<Compiled, CodegenError> {
     if dummy_params.len() != model.n_params() {
         return Err(CodegenError::Internal(format!(
             "dummy_params len {} != model n_params {}",
@@ -93,7 +128,7 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
             });
         }
     }
-    let (wasm, const_table) = emit(&tape, dummy_params.len(), root);
+    let (wasm, const_table) = emit(&tape, dummy_params.len(), root, reroll);
     Ok(Compiled {
         wasm,
         n_params: dummy_params.len(),
@@ -103,19 +138,13 @@ pub fn compile(model: &Model, dummy_params: &[f64]) -> Result<Compiled, CodegenE
 }
 
 /// Lower the recorded tape to a wasm module.
-fn emit(tape: &Tape, n_params: usize, root: u32) -> (Vec<u8>, Vec<f64>) {
+fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Vec<f64>) {
     let n = tape.len() as u32;
-    // Straight-line code keeps every value in a register-allocated local and
-    // wins while V8 still optimises the function. Past roughly this many nodes
-    // it stops, and the unrolled body collapses to well under tape-replay
-    // speed; a re-rolled loop is flat from there on. Measured on linear
-    // regression: straight-line 7.4 vs looped 16.2 us/gradient at 12k nodes,
-    // 82.0 vs 31.5 at 24k.
-    const RE_ROLL_ABOVE: usize = 12_000;
-    let blocks = if tape.len() > RE_ROLL_ABOVE {
-        reroll::detect(tape)
-    } else {
-        Vec::new()
+    let blocks = match reroll {
+        Reroll::Never => Vec::new(),
+        Reroll::Always => reroll::detect(tape),
+        Reroll::Auto if tape.len() > RE_ROLL_ABOVE => reroll::detect(tape),
+        Reroll::Auto => Vec::new(),
     };
     // Constants that move with the loop index live past the adjoints, in block
     // then node order; the caller stages them once.
