@@ -346,3 +346,63 @@ fn rerolled_model_is_reentrant() {
         assert!(close(*o, *a, 1e-12));
     }
 }
+
+/// A hierarchical model whose group index is irregular. `mu[g[i]]` is the
+/// gather no stride describes, so the emitter has to read its slot index from
+/// a table — the one loop shape whose addresses are computed at run time.
+#[test]
+fn rerolled_gather_matches_oracle() {
+    const N: usize = 1500;
+    const G: usize = 8;
+    let src = r#"data { int<lower=0> N; int<lower=1> G; array[N] int<lower=1> g; vector[N] y; }
+parameters { vector[G] mu; real<lower=0> sigma; }
+model {
+  mu ~ normal(0, 5); sigma ~ exponential(1);
+  for (i in 1:N) y[i] ~ normal(mu[g[i]], sigma);
+}"#;
+    let mut seed: u64 = 12345;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
+        seed as f64 / 4294967296.0
+    };
+    let gs: Vec<String> = (0..N).map(|_| format!("{}", 1 + (rnd() * 8.0) as u32)).collect();
+    let ys: Vec<String> = (0..N).map(|i| format!("{}", (i as f64).sin() * 2.0)).collect();
+    let data_json = format!(
+        "{{\"N\": {N}, \"G\": {G}, \"g\": [{}], \"y\": [{}]}}",
+        gs.join(","),
+        ys.join(",")
+    );
+    let model =
+        Model::parse_and_load(src, stanwasm_runtime::data_from_json(&data_json).unwrap()).unwrap();
+
+    let compiled = compile(&model, &vec![0.1; model.n_params()]).unwrap();
+    assert!(
+        !compiled.const_table.is_empty(),
+        "expected re-rolled loops with staged tables"
+    );
+
+    for test_params in [
+        vec![0.1, 0.2, 0.3, 0.4, -0.1, -0.2, -0.3, 0.05, 0.5],
+        vec![-0.7, 0.9, 0.0, 1.2, 0.3, -1.1, 0.6, -0.4, -0.2],
+    ] {
+        let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
+        let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+            &compiled.wasm,
+            compiled.n_params,
+            &test_params,
+            compiled.scratch_len,
+            &compiled.const_table,
+        );
+        assert!(
+            close(oracle_lp, aot_lp, 1e-10),
+            "lp: oracle={oracle_lp}, aot={aot_lp}"
+        );
+        for (i, (o, a)) in oracle_grads.iter().zip(aot_grads.iter()).enumerate() {
+            assert!(
+                close(*o, *a, 1e-10),
+                "grad[{i}]: oracle={o}, aot={a}, diff={}",
+                o - a
+            );
+        }
+    }
+}

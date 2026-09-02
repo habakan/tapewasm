@@ -120,12 +120,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32) -> (Vec<u8>, Vec<f64>) {
     // Constants that move with the loop index live past the adjoints, in block
     // then node order; the caller stages them once.
     let const_base = 2 * n;
-    let mut const_table: Vec<f64> = Vec::new();
-    for b in &blocks {
-        for c in b.consts.iter().flatten() {
-            const_table.extend_from_slice(c);
-        }
-    }
+    let (const_table, _) = stage_tables(&blocks, const_base);
     let needs = scan_imports(tape);
 
     // ---- type section: 0 = (i32,i32,i32,i32)->f64 (log_prob_grad: params_ptr,
@@ -299,6 +294,47 @@ fn math_idx_add_binary(m: &mut MathImportIndex, imports: &mut ImportSection, nam
     m.add_binary(imports, name)
 }
 
+/// Where a block node's per-iteration tables start, in scratch slots.
+#[derive(Clone, Copy, Default)]
+struct NodeTables {
+    cst: Option<u32>,
+    arg1: Option<u32>,
+    arg2i: Option<u32>,
+}
+
+/// Lay out every re-rolled block's tables in one buffer the caller stages at
+/// `const_base`. Emission and staging must agree on the order, so both come
+/// from here.
+fn stage_tables(blocks: &[reroll::Block], const_base: u32) -> (Vec<f64>, Vec<Vec<NodeTables>>) {
+    let mut buf: Vec<f64> = Vec::new();
+    let mut maps = Vec::with_capacity(blocks.len());
+    let push = |buf: &mut Vec<f64>, vals: &[f64]| {
+        let at = const_base + buf.len() as u32;
+        buf.extend_from_slice(vals);
+        at
+    };
+    for b in blocks {
+        let mut m = Vec::with_capacity(b.len as usize);
+        for j in 0..b.len as usize {
+            let mut t = NodeTables::default();
+            if let Some(v) = &b.consts[j] {
+                t.cst = Some(push(&mut buf, v));
+            }
+            if let reroll::ArgRel::Tabled(ix) = &b.args[j].arg1 {
+                let f: Vec<f64> = ix.iter().map(|&i| i as f64).collect();
+                t.arg1 = Some(push(&mut buf, &f));
+            }
+            if let reroll::ArgRel::Tabled(ix) = &b.args[j].arg2i {
+                let f: Vec<f64> = ix.iter().map(|&i| i as f64).collect();
+                t.arg2i = Some(push(&mut buf, &f));
+            }
+            m.push(t);
+        }
+        maps.push(m);
+    }
+    (buf, maps)
+}
+
 /// Per-iteration base pointers for a re-rolled block: one i32 local per
 /// distinct non-zero stride, holding `scratch + i * stride * 8`.
 struct StridePtrs {
@@ -338,31 +374,32 @@ impl StridePtrs {
     }
 }
 
-/// Every non-zero stride a block's reads and writes use, deduplicated.
-fn block_strides(tape: &Tape, b: &reroll::Block) -> Vec<u32> {
+/// Every non-zero stride a block's reads and writes use, deduplicated. Any
+/// table walks one f64 per repeat, so reading one needs stride 1.
+fn block_strides(b: &reroll::Block) -> Vec<u32> {
     let mut out: Vec<u32> = vec![b.len];
-    for j in 0..b.len {
-        let k0 = b.start + j;
-        let st = b.strides[j as usize];
-        for (used, stride) in [
-            (reroll::uses(tape.op_at(k0)).0, st.arg1),
-            (reroll::uses(tape.op_at(k0)).1, st.arg2i),
-        ] {
-            if used && stride != 0 && !out.contains(&stride) {
-                out.push(stride);
+    let want = |t: u32, out: &mut Vec<u32>| {
+        if t != 0 && !out.contains(&t) {
+            out.push(t);
+        }
+    };
+    for j in 0..b.len as usize {
+        for rel in [&b.args[j].arg1, &b.args[j].arg2i] {
+            match rel {
+                reroll::ArgRel::Affine(t) => want(*t, &mut out),
+                reroll::ArgRel::Tabled(_) => want(1, &mut out),
             }
         }
-        // A moving constant walks its table one f64 per repeat.
-        if b.consts[j as usize].is_some() && !out.contains(&1) {
-            out.push(1);
+        if b.consts[j].is_some() {
+            want(1, &mut out);
         }
     }
     out
 }
 
 /// The f64 argument of block node `j` at the current iteration.
-fn block_cst(tape: &Tape, b: &reroll::Block, j: u32, tbl: &[Option<u32>], sp: &StridePtrs) -> Cst {
-    match tbl[j as usize] {
+fn block_cst(tape: &Tape, b: &reroll::Block, j: u32, tbl: &[NodeTables], sp: &StridePtrs) -> Cst {
+    match tbl[j as usize].cst {
         Some(base) => Cst::At(sp.addr(base, 1)),
         None => {
             let k0 = b.start + j;
@@ -371,6 +408,33 @@ fn block_cst(tape: &Tape, b: &reroll::Block, j: u32, tbl: &[Option<u32>], sp: &S
             } else {
                 tape.arg2f_at(k0)
             })
+        }
+    }
+}
+
+/// Resolve block node `j`'s argument to a primal address, emitting the index
+/// arithmetic first when the argument is a gather.
+fn block_arg(
+    f: &mut Function,
+    sp: &StridePtrs,
+    rel: &reroll::ArgRel,
+    base_slot: u32,
+    tbl: Option<u32>,
+    tmp: u32,
+) -> Addr {
+    match rel {
+        reroll::ArgRel::Affine(stride) => sp.addr(base_slot, *stride),
+        reroll::ArgRel::Tabled(_) => {
+            let at = tbl.expect("a tabled argument has a table");
+            // tmp = scratch + table[at + i] * 8
+            f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+            aload(f, sp.addr(at, 1));
+            f.instruction(&Instruction::I32TruncF64U);
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(tmp));
+            Addr::Mem { ptr: tmp, slot: 0 }
         }
     }
 }
@@ -391,13 +455,20 @@ fn build_log_prob_grad(
     let f64_locals = lay.local_count(2 * n);
     let widest = blocks
         .iter()
-        .map(|b| block_strides(tape, b).len() as u32)
+        .map(|b| block_strides(b).len() as u32)
         .max()
         .unwrap_or(0);
-    // One induction variable, reused by every block, then the base pointers.
-    let i32_locals = if blocks.is_empty() { 0 } else { 1 + widest };
+    // One induction variable, reused by every block, then the base pointers,
+    // then a scratch address per possible gather.
+    let i32_locals = if blocks.is_empty() {
+        0
+    } else {
+        1 + widest + reroll::MAX_TABLED as u32
+    };
     let i32_base = FIRST_SLOT_LOCAL + f64_locals;
     let iv = i32_base;
+    let tmp1 = iv + 1 + widest;
+    let tmp2 = tmp1 + 1;
 
     let mut decl: Vec<(u32, ValType)> = Vec::new();
     if f64_locals > 0 {
@@ -421,23 +492,7 @@ fn build_log_prob_grad(
         f.instruction(&Instruction::MemoryFill(0));
     }
 
-    // Moving-constant table offsets, assigned in block then node order to
-    // match the table the caller stages at `const_base`.
-    let mut tables: Vec<Vec<Option<u32>>> = Vec::with_capacity(blocks.len());
-    let mut next = const_base;
-    for b in blocks {
-        let mut t = Vec::with_capacity(b.len as usize);
-        for j in 0..b.len {
-            match &b.consts[j as usize] {
-                Some(v) => {
-                    t.push(Some(next));
-                    next += v.len() as u32;
-                }
-                None => t.push(None),
-            }
-        }
-        tables.push(t);
-    }
+    let (_, tables) = stage_tables(blocks, const_base);
 
     let straight_fwd = |f: &mut Function, k: u32| {
         let a1 = lay.at(tape.arg1_at(k));
@@ -460,7 +515,7 @@ fn build_log_prob_grad(
             let b = &blocks[bi];
             let sp = StridePtrs {
                 iv,
-                strides: block_strides(tape, b),
+                strides: block_strides(b),
                 first_local: iv + 1,
             };
             f.instruction(&Instruction::I32Const(0));
@@ -469,9 +524,12 @@ fn build_log_prob_grad(
             sp.emit_setup(&mut f);
             for j in 0..b.len {
                 let k0 = b.start + j;
-                let st = b.strides[j as usize];
-                let a1 = sp.addr(tape.arg1_at(k0), st.arg1);
-                let a2 = sp.addr(tape.arg2i_at(k0), st.arg2i);
+                let nt = tables[bi][j as usize];
+                let ar = &b.args[j as usize];
+                // Gather addresses are computed before the value is pushed:
+                // the store address has to stay on top of the stack.
+                let a1 = block_arg(&mut f, &sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1);
+                let a2 = block_arg(&mut f, &sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2);
                 let cst = block_cst(tape, b, j, &tables[bi], &sp);
                 let w = sp.addr(k0, b.len);
                 astore_addr(&mut f, w);
@@ -508,7 +566,7 @@ fn build_log_prob_grad(
             let b = &blocks[bi];
             let sp = StridePtrs {
                 iv,
-                strides: block_strides(tape, b),
+                strides: block_strides(b),
                 first_local: iv + 1,
             };
             f.instruction(&Instruction::I32Const((b.reps - 1) as i32));
@@ -517,7 +575,26 @@ fn build_log_prob_grad(
             sp.emit_setup(&mut f);
             for j in (0..b.len).rev() {
                 let k0 = b.start + j;
-                let st = b.strides[j as usize];
+                let nt = tables[bi][j as usize];
+                let ar = &b.args[j as usize];
+                // One gather address serves both halves: the adjoint of slot
+                // `idx` sits `n` slots above its primal, which is an immediate.
+                let pa1 = block_arg(&mut f, &sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1);
+                let pa2 = block_arg(&mut f, &sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2);
+                let da1 = match (&ar.arg1, pa1) {
+                    (reroll::ArgRel::Tabled(_), Addr::Mem { ptr, .. }) => {
+                        Addr::Mem { ptr, slot: adj }
+                    }
+                    (reroll::ArgRel::Affine(t), _) => sp.addr(adj + tape.arg1_at(k0), *t),
+                    _ => unreachable!("a tabled argument resolves to a memory address"),
+                };
+                let da2 = match (&ar.arg2i, pa2) {
+                    (reroll::ArgRel::Tabled(_), Addr::Mem { ptr, .. }) => {
+                        Addr::Mem { ptr, slot: adj }
+                    }
+                    (reroll::ArgRel::Affine(t), _) => sp.addr(adj + tape.arg2i_at(k0), *t),
+                    _ => unreachable!("a tabled argument resolves to a memory address"),
+                };
                 emit_backward(
                     &mut f,
                     tape,
@@ -525,10 +602,10 @@ fn build_log_prob_grad(
                     m,
                     Back {
                         dk: sp.addr(adj + k0, b.len),
-                        da1: sp.addr(adj + tape.arg1_at(k0), st.arg1),
-                        da2: sp.addr(adj + tape.arg2i_at(k0), st.arg2i),
-                        pa1: sp.addr(tape.arg1_at(k0), st.arg1),
-                        pa2: sp.addr(tape.arg2i_at(k0), st.arg2i),
+                        da1,
+                        da2,
+                        pa1,
+                        pa2,
                         pk: sp.addr(k0, b.len),
                         cst: block_cst(tape, b, j, &tables[bi], &sp),
                     },

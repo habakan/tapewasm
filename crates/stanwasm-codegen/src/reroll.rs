@@ -5,12 +5,17 @@
 //! function that grows with the data. Past a few thousand nodes V8 stops
 //! optimising it and the AOT path loses to plain tape replay.
 //!
-//! The recorded shape is very regular: every integer argument of the k-th copy
-//! is `arg0 + k * stride` for a stride fixed per argument. Intra-block
+//! The recorded shape is mostly regular: an integer argument of the k-th copy
+//! is usually `arg0 + k * stride` for a stride fixed per argument. Intra-block
 //! references have stride `len`, a strided read into a vector produced earlier
 //! has stride 1, and anything loop-invariant (a shared `sigma`, a CSE'd
-//! `log(sigma)`) has stride 0. Detection is therefore just: same opcodes, and
-//! every integer argument affine in the repeat index.
+//! `log(sigma)`) has stride 0.
+//!
+//! One argument commonly breaks that: a gather like `mu[g[i]]` in a
+//! hierarchical model reads wherever the data says, and no stride describes it.
+//! Rejecting those blocks would leave exactly the models people write most
+//! unrolled, so a bounded number of arguments may instead be *tabled*: the
+//! emitter stages their slot indices and reads one per iteration.
 
 use stanwasm_autodiff::{Op, Tape};
 
@@ -28,8 +33,8 @@ pub struct Block {
     pub start: u32,
     pub len: u32,
     pub reps: u32,
-    /// Per-node argument strides, `len` entries in block order.
-    pub strides: Vec<ArgStrides>,
+    /// Per-node argument relations, `len` entries in block order.
+    pub args: Vec<ArgRels>,
     /// Per-node f64 argument: `None` if constant across repeats, else the
     /// `reps` values in order.
     pub consts: Vec<Option<Vec<f64>>>,
@@ -42,11 +47,30 @@ impl Block {
     }
 }
 
+/// At most this many arguments per block may need an index table. A gather
+/// costs one; a block wanting more is not a loop worth rolling.
+pub(crate) const MAX_TABLED: usize = 2;
+
+/// How one integer argument moves from one repeat to the next.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArgRel {
+    /// `tape.argN_at(start + j) + i * stride`.
+    Affine(u32),
+    /// One absolute slot index per repeat.
+    Tabled(Vec<u32>),
+}
+
+impl ArgRel {
+    pub fn is_tabled(&self) -> bool {
+        matches!(self, ArgRel::Tabled(_))
+    }
+}
+
 /// How a node's integer arguments move from one repeat to the next.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ArgStrides {
-    pub arg1: u32,
-    pub arg2i: u32,
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArgRels {
+    pub arg1: ArgRel,
+    pub arg2i: ArgRel,
 }
 
 /// Which arguments an opcode actually reads. Unused slots hold stale values on
@@ -66,62 +90,67 @@ pub(crate) fn uses(op: Op) -> (bool, bool, bool) {
     }
 }
 
-/// The stride between `a` and `b` if one exists. Arguments only ever move
-/// forward, and a repeat cannot reference a node it has not reached yet.
-fn stride_of(a: u32, b: u32) -> Option<u32> {
-    b.checked_sub(a)
-}
+/// Repeat count, per-node argument relations, and per-node moving constants.
+type Probe = (u32, Vec<ArgRels>, Vec<Option<Vec<f64>>>);
 
-/// Repeat count, per-node strides, and per-node moving constants.
-type Probe = (u32, Vec<ArgStrides>, Vec<Option<Vec<f64>>>);
-
-/// Check that `len`-node blocks at `start` repeat, and collect the strides.
-/// Returns the largest repeat count of at least two, or `None`.
+/// Check that `len`-node blocks at `start` repeat, and describe how their
+/// arguments move. Returns `None` if the opcodes do not repeat, or if too many
+/// arguments would need an index table.
 fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
     let n = tape.len() as u32;
     if start + 2 * len > n {
         return None;
     }
-    // Strides come from the first two copies, then every later copy is checked
-    // against them: two copies can agree by accident, a hundred cannot.
-    let mut strides = Vec::with_capacity(len as usize);
-    for j in 0..len {
-        let (k0, k1) = (start + j, start + len + j);
-        if tape.op_at(k0) != tape.op_at(k1) {
-            return None;
-        }
-        let (u1, u2, _) = uses(tape.op_at(k0));
-        let arg1 = if u1 {
-            stride_of(tape.arg1_at(k0), tape.arg1_at(k1))?
-        } else {
-            0
-        };
-        let arg2i = if u2 {
-            stride_of(tape.arg2i_at(k0), tape.arg2i_at(k1))?
-        } else {
-            0
-        };
-        strides.push(ArgStrides { arg1, arg2i });
-    }
 
-    let mut reps = 2;
+    // How far the opcode pattern repeats. Arguments cannot bound this any more:
+    // a tabled one is allowed to be arbitrary.
+    let mut reps = 1;
     'outer: while start + (reps + 1) * len <= n {
         for j in 0..len {
-            let k0 = start + j;
-            let k = start + reps * len + j;
-            if tape.op_at(k) != tape.op_at(k0) {
-                break 'outer;
-            }
-            let (u1, u2, _) = uses(tape.op_at(k0));
-            let s = strides[j as usize];
-            if u1 && tape.arg1_at(k) != tape.arg1_at(k0) + reps * s.arg1 {
-                break 'outer;
-            }
-            if u2 && tape.arg2i_at(k) != tape.arg2i_at(k0) + reps * s.arg2i {
+            if tape.op_at(start + reps * len + j) != tape.op_at(start + j) {
                 break 'outer;
             }
         }
         reps += 1;
+    }
+    if reps < 2 {
+        return None;
+    }
+
+    // An argument is affine when one stride explains every repeat, and tabled
+    // otherwise. The write target is structural and always affine, so a block
+    // is describable as long as few enough reads need a table.
+    let classify = |read: &dyn Fn(u32) -> u32| -> ArgRel {
+        let v0 = read(start);
+        let v1 = read(start + len);
+        if let Some(stride) = v1.checked_sub(v0) {
+            if (2..reps).all(|i| read(start + i * len) == v0 + i * stride) {
+                return ArgRel::Affine(stride);
+            }
+        }
+        ArgRel::Tabled((0..reps).map(|i| read(start + i * len)).collect())
+    };
+
+    let mut args = Vec::with_capacity(len as usize);
+    let mut tabled = 0usize;
+    for j in 0..len {
+        let k0 = start + j;
+        let (u1, u2, _) = uses(tape.op_at(k0));
+        let arg1 = if u1 {
+            classify(&|base| tape.arg1_at(base + j))
+        } else {
+            ArgRel::Affine(0)
+        };
+        let arg2i = if u2 {
+            classify(&|base| tape.arg2i_at(base + j))
+        } else {
+            ArgRel::Affine(0)
+        };
+        tabled += arg1.is_tabled() as usize + arg2i.is_tabled() as usize;
+        if tabled > MAX_TABLED {
+            return None;
+        }
+        args.push(ArgRels { arg1, arg2i });
     }
 
     // A constant that moves needs a table; one that does not folds into the
@@ -150,9 +179,9 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
         });
     }
 
-    // Two shapes the emitter has no form for: a leaf reads the parameter
-    // buffer by absolute index, and `Pow` folds `exponent - 1` into an
-    // immediate for its backward step.
+    // Two shapes the emitter has no form for: a leaf reads the parameter buffer
+    // by absolute index, and `Pow` folds `exponent - 1` into an immediate for
+    // its backward step.
     for j in 0..len {
         let op = tape.op_at(start + j);
         if op == Op::Leaf {
@@ -163,7 +192,7 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
         }
     }
 
-    Some((reps, strides, consts))
+    Some((reps, args, consts))
 }
 
 /// Partition the tape into re-rollable runs, in tape order and non-overlapping.
@@ -175,7 +204,7 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
     while k < n {
         let mut best: Option<Block> = None;
         for len in 1..=MAX_BLOCK.min(n - k) {
-            let Some((reps, strides, consts)) = probe(tape, k, len) else {
+            let Some((reps, args, consts)) = probe(tape, k, len) else {
                 continue;
             };
             if reps < MIN_REPS {
@@ -185,7 +214,7 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
                 start: k,
                 len,
                 reps,
-                strides,
+                args,
                 consts,
             };
             // Cover as much tape as possible; on a tie the shorter block wins,
@@ -236,10 +265,41 @@ model {
         let root = model.trace_forward(&mut tape, &leaves, true).unwrap();
         (tape, root)
     }
+
+    /// A hierarchical model whose group index is irregular, the way real data
+    /// is: `mu[g[i]]` cannot be described by a stride.
+    pub fn gather_tape(n: usize) -> (Tape, u32) {
+        use stanwasm_runtime::{data_from_json, Model};
+        let src = r#"data { int<lower=0> N; int<lower=1> G; array[N] int<lower=1> g; vector[N] y; }
+parameters { vector[G] mu; real<lower=0> sigma; }
+model {
+  mu ~ normal(0, 5); sigma ~ exponential(1);
+  for (i in 1:N) y[i] ~ normal(mu[g[i]], sigma);
+}"#;
+        let mut seed: u64 = 12345;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
+            seed as f64 / 4294967296.0
+        };
+        let gs: Vec<String> = (0..n).map(|_| format!("{}", 1 + (rnd() * 8.0) as u32)).collect();
+        let ys: Vec<String> = (0..n).map(|i| format!("{}", (i as f64).sin() * 2.0)).collect();
+        let data = format!(
+            "{{\"N\": {n}, \"G\": 8, \"g\": [{}], \"y\": [{}]}}",
+            gs.join(","),
+            ys.join(",")
+        );
+        let model = Model::parse_and_load(src, data_from_json(&data).unwrap()).unwrap();
+        let mut tape = Tape::new();
+        let init = [0.1, 0.2, 0.3, 0.4, -0.1, -0.2, -0.3, 0.05, 0.5];
+        let leaves: Vec<u32> = init.iter().map(|p| tape.new_var(*p)).collect();
+        let root = model.trace_forward(&mut tape, &leaves, true).unwrap();
+        (tape, root)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::tests_support::gather_tape;
     use super::tests_support::linreg_tape;
     use super::*;
 
@@ -264,32 +324,67 @@ mod tests {
         for b in detect(&tape) {
             assert!(b.start >= prev_end, "overlapping blocks");
             assert!(b.end() <= tape.len() as u32, "block runs past the tape");
-            assert_eq!(b.strides.len(), b.len as usize);
+            assert_eq!(b.args.len(), b.len as usize);
             assert_eq!(b.consts.len(), b.len as usize);
             prev_end = b.end();
         }
     }
 
-    #[test]
-    fn strides_predict_every_repeat() {
-        let (tape, _) = linreg_tape(64);
-        for b in detect(&tape) {
+    /// Whatever `detect` claims about an argument has to reproduce the tape:
+    /// an affine one from its stride, a tabled one from its recorded indices.
+    fn check_args_reproduce_tape(tape: &Tape, blocks: &[Block]) {
+        for b in blocks {
             for i in 0..b.reps {
                 for j in 0..b.len {
                     let k0 = b.start + j;
                     let k = b.start + i * b.len + j;
                     assert_eq!(tape.op_at(k), tape.op_at(k0));
                     let (u1, u2, _) = uses(tape.op_at(k0));
-                    let s = b.strides[j as usize];
+                    let rels = &b.args[j as usize];
                     if u1 {
-                        assert_eq!(tape.arg1_at(k), tape.arg1_at(k0) + i * s.arg1);
+                        let want = match &rels.arg1 {
+                            ArgRel::Affine(t) => tape.arg1_at(k0) + i * t,
+                            ArgRel::Tabled(ix) => ix[i as usize],
+                        };
+                        assert_eq!(tape.arg1_at(k), want, "arg1 at block {}, i={i}, j={j}", b.start);
                     }
                     if u2 {
-                        assert_eq!(tape.arg2i_at(k), tape.arg2i_at(k0) + i * s.arg2i);
+                        let want = match &rels.arg2i {
+                            ArgRel::Affine(t) => tape.arg2i_at(k0) + i * t,
+                            ArgRel::Tabled(ix) => ix[i as usize],
+                        };
+                        assert_eq!(tape.arg2i_at(k), want, "arg2i at block {}, i={i}, j={j}", b.start);
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn args_predict_every_repeat() {
+        let (tape, _) = linreg_tape(64);
+        check_args_reproduce_tape(&tape, &detect(&tape));
+    }
+
+    /// A gather (`mu[g[i]]` with irregular groups) is the case no stride
+    /// describes. It must still be found, with the gather tabled.
+    #[test]
+    fn finds_a_gather_and_tables_it() {
+        let (tape, _) = gather_tape(200);
+        let blocks = detect(&tape);
+        check_args_reproduce_tape(&tape, &blocks);
+        let covered: u32 = blocks.iter().map(|b| b.len * b.reps).sum();
+        assert!(
+            covered * 100 / tape.len() as u32 > 80,
+            "only {covered}/{} nodes covered",
+            tape.len()
+        );
+        let tabled: usize = blocks
+            .iter()
+            .flat_map(|b| b.args.iter())
+            .filter(|a| a.arg1.is_tabled() || a.arg2i.is_tabled())
+            .count();
+        assert!(tabled > 0, "the gather was not tabled");
     }
 
     #[test]
