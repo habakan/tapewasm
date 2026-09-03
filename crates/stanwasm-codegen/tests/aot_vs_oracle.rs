@@ -50,7 +50,11 @@ fn run_aot_log_prob_grad(
     scratch_len: usize,
     const_table: &[f64],
 ) -> (f64, Vec<f64>) {
-    let engine = Engine::default();
+    // The emitter widens a re-rolled loop to `f64x2` where it can, which wasmi
+    // parses only with the proposal enabled.
+    let mut config = wasmi::Config::default();
+    config.wasm_simd(true);
+    let engine = Engine::new(&config);
     let module = Module::new(&engine, wasm).expect("module parses");
     let mut store = Store::new(&engine, HostState);
 

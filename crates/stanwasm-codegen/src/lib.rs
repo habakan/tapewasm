@@ -13,6 +13,11 @@
 //!     reads params_ptr..params_ptr+n_params*8 and writes
 //!     grads_ptr..grads_ptr+n_params*8 in shared memory; returns log_prob.
 //!
+//! The module uses the fixed-width SIMD proposal: a re-rolled loop whose every
+//! slot moves by one or not at all runs two repeats at a time. Every engine
+//! that ships wasm today has it (Safari since 16.4), but an embedder that
+//! disables the proposal will reject the module.
+//!
 //! Required imports (host-provided):
 //!   ("stan","memory")  — shared memory
 //!   ("Math","exp"|"log"|"sin"|"cos"|"pow"|"lgamma"|"digamma"|"phi")
@@ -763,6 +768,277 @@ fn straight_dot_ops(tape: &Tape, k: u32, slots: &Slots, lay: Layout, off: u32) -
         .collect()
 }
 
+/// Opcodes with a lane-wise `f64x2` form. The host math imports have none —
+/// `exp` and `log` are calls — so a density that uses one stays scalar.
+fn lane_wise(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Neg
+            | Op::AddC
+            | Op::SubC
+            | Op::RsubC
+            | Op::MulC
+            | Op::DivC
+            | Op::RdivC
+            | Op::DotC
+    )
+}
+
+/// Whether a block's loop can run two repeats at once.
+///
+/// Two lanes have to be one `v128` apart, which means every slot a repeat
+/// touches moves by one or not at all; a value carried from the previous
+/// repeat would need the lanes to run in sequence, and a gather would need
+/// each lane addressed separately. Positions kept in wasm locals are excluded
+/// for now — widening those needs a second local pool.
+fn widenable(tape: &Tape, b: &reroll::Block, rels: &[PosRel], flags: &[bool]) -> bool {
+    if !b.reps.is_multiple_of(2) || flags.iter().any(|keep| *keep) {
+        return false;
+    }
+    (0..b.len).all(|j| {
+        let k0 = b.start + j;
+        let r = &rels[j as usize];
+        let carried = [&b.args[j as usize].arg1, &b.args[j as usize].arg2i]
+            .into_iter()
+            .zip([tape.arg1_at(k0), tape.arg2i_at(k0)])
+            .any(|(rel, arg0)| matches!(rel, reroll::ArgRel::Affine(t) if *t == b.len && arg0 < b.start));
+        lane_wise(tape.op_at(k0))
+            && !carried
+            && r.out.stride == 1
+            && r.arg1.is_some_and(|sr| sr.stride <= 1)
+            && r.arg2i.is_some_and(|sr| sr.stride <= 1)
+            && r.elems.iter().all(|sr| sr.stride <= 1)
+    })
+}
+
+/// Where a widened body reads one of its operands: a slot pair, or a
+/// loop-invariant scalar broadcast to both lanes.
+fn wide_addr(sr: SlotRel, sp: &StridePtrs, off: u32) -> Addr {
+    match sp.addr(off + sr.base, sr.stride) {
+        Addr::Mem { ptr, slot } if sr.stride == 0 => Addr::Splat { ptr, slot },
+        a => a,
+    }
+}
+
+/// The adjoint a widened body accumulates into. A loop-invariant target is the
+/// same slot for both lanes, so it cannot be read-modify-written in the loop;
+/// it gets a lane pair of its own, summed into the slot afterwards.
+fn wide_adj(sr: SlotRel, sp: &StridePtrs, adj: u32, priv_of: &[(u32, u32)]) -> Addr {
+    if sr.stride == 0 {
+        let slot = adj + sr.base;
+        let (_, local) = priv_of
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .expect("every loop-invariant adjoint target was given a lane pair");
+        return Addr::Local(*local);
+    }
+    sp.addr(adj + sr.base, sr.stride)
+}
+
+/// Every loop-invariant adjoint slot a widened block accumulates into.
+fn priv_targets(tape: &Tape, b: &reroll::Block, rels: &[PosRel], adj: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let want = |sr: &SlotRel, out: &mut Vec<u32>| {
+        if sr.stride == 0 && !out.contains(&(adj + sr.base)) {
+            out.push(adj + sr.base);
+        }
+    };
+    for (j, r) in rels.iter().enumerate() {
+        let (u1, u2, _) = reroll::uses(tape.op_at(b.start + j as u32));
+        if u1 {
+            if let Some(sr) = &r.arg1 {
+                want(sr, &mut out);
+            }
+        }
+        if u2 {
+            if let Some(sr) = &r.arg2i {
+                want(sr, &mut out);
+            }
+        }
+        for sr in &r.elems {
+            want(sr, &mut out);
+        }
+    }
+    out
+}
+
+/// One widened pass over a block body, forward or backward: two repeats per
+/// iteration, every value a lane pair.
+#[allow(clippy::too_many_arguments)]
+fn emit_wide_body(
+    f: &mut Function,
+    tape: &Tape,
+    b: &reroll::Block,
+    sp: &StridePtrs,
+    tbl: &[NodeTables],
+    rels: &[PosRel],
+    adj: u32,
+    privs: &[(u32, u32)],
+    forward: bool,
+) {
+    let order: Vec<u32> = if forward {
+        (0..b.len).collect()
+    } else {
+        (0..b.len).rev().collect()
+    };
+    for j in order {
+        let k0 = b.start + j;
+        let r = &rels[j as usize];
+        let out = wide_addr(r.out, sp, 0);
+        let dout = wide_addr(r.out, sp, adj);
+        let cst = block_cst(tape, b, j, tbl, sp);
+
+        if tape.op_at(k0) == Op::DotC {
+            let at = tbl[j as usize].dot.expect("staged");
+            let col = |c: usize| sp.addr(at + c as u32 * b.reps, 1);
+            let e = tape.extent_at(k0);
+            if forward {
+                wstore_addr(f, out);
+                for c in 0..e.len as usize {
+                    wload(f, wide_addr(r.elems[c], sp, 0));
+                    wload(f, col(c));
+                    f.instruction(&Instruction::F64x2Mul);
+                    if c > 0 {
+                        f.instruction(&Instruction::F64x2Add);
+                    }
+                }
+                wstore_end(f, out);
+            } else {
+                for c in 0..e.len as usize {
+                    let da = wide_adj(r.elems[c], sp, adj, privs);
+                    wadj(f, da, false, |f| {
+                        wload(f, dout);
+                        wload(f, col(c));
+                        f.instruction(&Instruction::F64x2Mul);
+                    });
+                }
+            }
+            continue;
+        }
+
+        let (s1, s2) = (r.arg1.expect("checked"), r.arg2i.expect("checked"));
+        let (pa1, pa2) = (wide_addr(s1, sp, 0), wide_addr(s2, sp, 0));
+        let op = tape.op_at(k0);
+        if forward {
+            wstore_addr(f, out);
+            match op {
+                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                    wload(f, pa1);
+                    wload(f, pa2);
+                }
+                Op::RsubC | Op::RdivC => {
+                    wcload(f, cst);
+                    wload(f, pa1);
+                }
+                Op::Neg => wload(f, pa1),
+                _ => {
+                    wload(f, pa1);
+                    wcload(f, cst);
+                }
+            }
+            f.instruction(&match op {
+                Op::Add | Op::AddC => Instruction::F64x2Add,
+                Op::Sub | Op::SubC | Op::RsubC => Instruction::F64x2Sub,
+                Op::Mul | Op::MulC => Instruction::F64x2Mul,
+                Op::Div | Op::DivC | Op::RdivC => Instruction::F64x2Div,
+                Op::Neg => Instruction::F64x2Neg,
+                _ => unreachable!("checked by `lane_wise`"),
+            });
+            wstore_end(f, out);
+            continue;
+        }
+
+        // Only the arguments the opcode actually reads get resolved: an unused
+        // `arg2i` holds a stale index, and a lane pair was never set aside for
+        // whatever slot that lands on.
+        let da1 = wide_adj(s1, sp, adj, privs);
+        let pass = |f: &mut Function| wload(f, dout);
+        match op {
+            Op::Add => {
+                let da2 = wide_adj(s2, sp, adj, privs);
+                wadj(f, da1, false, pass);
+                wadj(f, da2, false, pass);
+            }
+            Op::Sub => {
+                let da2 = wide_adj(s2, sp, adj, privs);
+                wadj(f, da1, false, pass);
+                wadj(f, da2, true, pass);
+            }
+            Op::Mul => {
+                let da2 = wide_adj(s2, sp, adj, privs);
+                wadj(f, da1, false, |f| {
+                    wload(f, dout);
+                    wload(f, pa2);
+                    f.instruction(&Instruction::F64x2Mul);
+                });
+                wadj(f, da2, false, |f| {
+                    wload(f, dout);
+                    wload(f, pa1);
+                    f.instruction(&Instruction::F64x2Mul);
+                });
+            }
+            Op::Div => {
+                let da2 = wide_adj(s2, sp, adj, privs);
+                wadj(f, da1, false, |f| {
+                    wload(f, dout);
+                    wload(f, pa2);
+                    f.instruction(&Instruction::F64x2Div);
+                });
+                wadj(f, da2, true, |f| {
+                    wload(f, dout);
+                    wload(f, pa1);
+                    f.instruction(&Instruction::F64x2Mul);
+                    wload(f, pa2);
+                    wload(f, pa2);
+                    f.instruction(&Instruction::F64x2Mul);
+                    f.instruction(&Instruction::F64x2Div);
+                });
+            }
+            Op::Neg | Op::RsubC => wadj(f, da1, true, pass),
+            Op::AddC | Op::SubC => wadj(f, da1, false, pass),
+            Op::MulC => wadj(f, da1, false, |f| {
+                wload(f, dout);
+                wcload(f, cst);
+                f.instruction(&Instruction::F64x2Mul);
+            }),
+            Op::DivC => wadj(f, da1, false, |f| {
+                wload(f, dout);
+                wcload(f, cst);
+                f.instruction(&Instruction::F64x2Div);
+            }),
+            Op::RdivC => wadj(f, da1, true, |f| {
+                wload(f, dout);
+                wcload(f, cst);
+                f.instruction(&Instruction::F64x2Mul);
+                wload(f, pa1);
+                wload(f, pa1);
+                f.instruction(&Instruction::F64x2Mul);
+                f.instruction(&Instruction::F64x2Div);
+            }),
+            _ => unreachable!("checked by `lane_wise`"),
+        }
+    }
+}
+
+/// Sum a widened block's lane pairs back into the slots they stand for.
+fn emit_priv_reduce(f: &mut Function, privs: &[(u32, u32)]) {
+    for (slot, local) in privs {
+        f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+        f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+        f.instruction(&Instruction::F64Load(memarg(*slot)));
+        for lane in 0..2 {
+            f.instruction(&Instruction::LocalGet(*local));
+            f.instruction(&Instruction::F64x2ExtractLane(lane));
+            f.instruction(&Instruction::F64Add);
+        }
+        f.instruction(&Instruction::F64Store(memarg(*slot)));
+    }
+}
+
 /// One forward pass over a block body. `locals_only` limits it to the
 /// positions kept in locals: the backward loop reconstructs those, because a
 /// local cannot carry a value from the forward loop to here.
@@ -863,12 +1139,39 @@ fn build_log_prob_grad(
     let tmp1 = iv + 1 + widest;
     let tmp2 = tmp1 + 1;
 
+    // Which blocks run two repeats at a time, and where each one's
+    // loop-invariant adjoints accumulate while they do.
+    let wide: Vec<bool> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| widenable(tape, b, &block_rels[i], &block_local[i]))
+        .collect();
+    let v128_base = i32_base + i32_locals;
+    let privs: Vec<Vec<(u32, u32)>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if !wide[i] {
+                return Vec::new();
+            }
+            priv_targets(tape, b, &block_rels[i], adj)
+                .into_iter()
+                .enumerate()
+                .map(|(n, slot)| (slot, v128_base + n as u32))
+                .collect()
+        })
+        .collect();
+    let v128_locals = privs.iter().map(|p| p.len() as u32).max().unwrap_or(0);
+
     let mut decl: Vec<(u32, ValType)> = Vec::new();
     if f64_locals > 0 {
         decl.push((f64_locals, ValType::F64));
     }
     if i32_locals > 0 {
         decl.push((i32_locals, ValType::I32));
+    }
+    if v128_locals > 0 {
+        decl.push((v128_locals, ValType::V128));
     }
     let mut f = Function::new(decl);
 
@@ -919,25 +1222,40 @@ fn build_log_prob_grad(
                 first_local: iv + 1,
             };
             let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
+            let step = if wide[bi] { 2 } else { 1 };
             f.instruction(&Instruction::I32Const(0));
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
-            emit_block_forward(
-                &mut f,
-                tape,
-                m,
-                b,
-                &sp,
-                &bl,
-                &tables[bi],
-                &block_rels[bi],
-                tmp1,
-                tmp2,
-                false,
-            );
+            if wide[bi] {
+                emit_wide_body(
+                    &mut f,
+                    tape,
+                    b,
+                    &sp,
+                    &tables[bi],
+                    &block_rels[bi],
+                    adj,
+                    &privs[bi],
+                    true,
+                );
+            } else {
+                emit_block_forward(
+                    &mut f,
+                    tape,
+                    m,
+                    b,
+                    &sp,
+                    &bl,
+                    &tables[bi],
+                    &block_rels[bi],
+                    tmp1,
+                    tmp2,
+                    false,
+                );
+            }
             f.instruction(&Instruction::LocalGet(iv));
-            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Const(step));
             f.instruction(&Instruction::I32Add);
             f.instruction(&Instruction::LocalTee(iv));
             f.instruction(&Instruction::I32Const(b.reps as i32));
@@ -970,10 +1288,41 @@ fn build_log_prob_grad(
                 first_local: iv + 1,
             };
             let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
-            f.instruction(&Instruction::I32Const((b.reps - 1) as i32));
+            let step: i32 = if wide[bi] { 2 } else { 1 };
+            if wide[bi] {
+                for (_, local) in &privs[bi] {
+                    f.instruction(&Instruction::V128Const(0));
+                    f.instruction(&Instruction::LocalSet(*local));
+                }
+            }
+            f.instruction(&Instruction::I32Const(b.reps as i32 - step));
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
+            if wide[bi] {
+                emit_wide_body(
+                    &mut f,
+                    tape,
+                    b,
+                    &sp,
+                    &tables[bi],
+                    &block_rels[bi],
+                    adj,
+                    &privs[bi],
+                    false,
+                );
+                f.instruction(&Instruction::LocalGet(iv));
+                f.instruction(&Instruction::I32Const(step));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::LocalTee(iv));
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::I32GeS);
+                f.instruction(&Instruction::BrIf(0));
+                f.instruction(&Instruction::End);
+                emit_priv_reduce(&mut f, &privs[bi]);
+                k = b.start;
+                continue;
+            }
             // Forward left iteration-local values in locals, which do not
             // survive to here: recompute this iteration's, then clear the
             // adjoints they accumulate into.
@@ -1375,6 +1724,9 @@ enum Addr {
     /// `ptr` is an i32 local holding a byte address; `slot` is added as an
     /// f64-indexed immediate offset.
     Mem { ptr: u32, slot: u32 },
+    /// In a widened body: one scalar read, broadcast to both lanes. What a
+    /// loop-invariant operand becomes when two repeats run at once.
+    Splat { ptr: u32, slot: u32 },
 }
 
 /// How the straight-line emitter turns a slot number into an [`Addr`].
@@ -1447,6 +1799,7 @@ fn aload(f: &mut Function, a: Addr) {
             f.instruction(&Instruction::LocalGet(ptr));
             f.instruction(&Instruction::F64Load(memarg(slot)));
         }
+        Addr::Splat { .. } => unreachable!("a broadcast is read by the widened emitter"),
     }
 }
 
@@ -1465,7 +1818,83 @@ fn astore_end(f: &mut Function, a: Addr) {
         Addr::Mem { slot, .. } => {
             f.instruction(&Instruction::F64Store(memarg(slot)));
         }
+        Addr::Splat { .. } => unreachable!("a broadcast is never written"),
     }
+}
+
+// ---- widened access ------------------------------------------------------
+//
+// Two lanes at a time. A `v128` here is always two consecutive repeats of one
+// value, so the only alignment a slot pair can promise is the 8 bytes a slot
+// has: `iv` steps by two but the slot itself may sit at either parity.
+
+fn wmemarg(slot: u32) -> wasm_encoder::MemArg {
+    wasm_encoder::MemArg {
+        offset: slot as u64 * 8,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+fn wload(f: &mut Function, a: Addr) {
+    match a {
+        Addr::Local(i) => {
+            f.instruction(&Instruction::LocalGet(i));
+        }
+        Addr::Mem { ptr, slot } => {
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::V128Load(wmemarg(slot)));
+        }
+        Addr::Splat { ptr, slot } => {
+            f.instruction(&Instruction::LocalGet(ptr));
+            f.instruction(&Instruction::F64Load(memarg(slot)));
+            f.instruction(&Instruction::F64x2Splat);
+        }
+    }
+}
+
+fn wstore_addr(f: &mut Function, a: Addr) {
+    if let Addr::Mem { ptr, .. } = a {
+        f.instruction(&Instruction::LocalGet(ptr));
+    }
+}
+
+fn wstore_end(f: &mut Function, a: Addr) {
+    match a {
+        Addr::Local(i) => {
+            f.instruction(&Instruction::LocalSet(i));
+        }
+        Addr::Mem { slot, .. } => {
+            f.instruction(&Instruction::V128Store(wmemarg(slot)));
+        }
+        Addr::Splat { .. } => unreachable!("a broadcast is never written"),
+    }
+}
+
+/// A node's f64 argument in a widened body: a moving constant is a slot pair
+/// like any other value, a fixed one is the same in both lanes.
+fn wcload(f: &mut Function, c: Cst) {
+    match c {
+        Cst::Imm(v) => {
+            let bits = v.to_bits() as u128;
+            f.instruction(&Instruction::V128Const(((bits << 64) | bits) as i128));
+        }
+        Cst::At(a) => wload(f, a),
+    }
+}
+
+/// `d[da] += <two lanes on the stack>`, for whichever accumulation the caller
+/// pushed. Splitting it this way keeps one shape for every backward step.
+fn wadj(f: &mut Function, da: Addr, sub: bool, push: impl FnOnce(&mut Function)) {
+    wstore_addr(f, da);
+    wload(f, da);
+    push(f);
+    f.instruction(if sub {
+        &Instruction::F64x2Sub
+    } else {
+        &Instruction::F64x2Add
+    });
+    wstore_end(f, da);
 }
 
 // d[da] += d[dk]

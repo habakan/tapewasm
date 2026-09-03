@@ -18,4 +18,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 wasmparser = "0.258"
-wasmi = "1.1"
+wasmi = { version = "1.1", features = ["simd"] }
