@@ -279,7 +279,7 @@ model { for (n in 1:N) y[n] ~ normal(atan(a), 1.0); }
 /// loop emitter is never exercised.
 #[test]
 fn rerolled_linear_regression_matches_oracle() {
-    const N: usize = 1500;
+    const N: usize = 2000;
     let xs: Vec<f64> = (0..N).map(|i| -1.5 + i as f64 * 0.05).collect();
     let ys: Vec<f64> = (0..N).map(|i| 0.3 + i as f64 * 0.11).collect();
     let mut data = Env::new();
@@ -327,7 +327,7 @@ fn rerolled_linear_regression_matches_oracle() {
 /// call.
 #[test]
 fn rerolled_model_is_reentrant() {
-    const N: usize = 1500;
+    const N: usize = 2000;
     let mut data = Env::new();
     data.set_scalar("N", N as f64);
     data.set_vector("x", &(0..N).map(|i| i as f64 * 0.1).collect::<Vec<_>>());

@@ -45,6 +45,11 @@ pub enum Op {
     /// node for a whole dot product, rather than `2K` for the chain of
     /// multiplies and adds that would otherwise record it.
     DotC = 28,
+    /// Sum of a run of tape values, added to the value `arg1` names. One node
+    /// for a vectorised statement's total, rather than a chain of `Add`s that
+    /// carries a value from each element to the next — which is the one shape
+    /// a re-rolled loop cannot run two repeats of at a time.
+    Sum = 29,
 }
 
 /// The shape of a contraction, held beside the node rather than in it: the
@@ -53,11 +58,14 @@ pub enum Op {
 /// model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
-    /// Distance on the tape between consecutive elements of the operand whose
-    /// first element is the node's `arg1`.
+    /// First element of the run, on the tape. Same as the node's `arg1` for a
+    /// contraction, whose `arg1` is the operand the re-roller has to classify;
+    /// a sum's `arg1` is the value the run is added to instead.
+    pub base: u32,
+    /// Distance on the tape between consecutive elements of the run.
     pub stride: u32,
     pub len: u32,
-    /// Where the constants start in the tape's coefficient arena.
+    /// Where the coefficients start in the tape's arena. A sum has none.
     pub at: u32,
 }
 
@@ -205,6 +213,14 @@ impl Tape {
                     for c in 0..e.len as usize {
                         acc +=
                             self.val[a1 + c * e.stride as usize] * self.coeffs[e.at as usize + c];
+                    }
+                    acc
+                }
+                Op::Sum => {
+                    let e = self.extents[a2i];
+                    let mut acc = self.val[a1];
+                    for c in 0..e.len as usize {
+                        acc += self.val[e.base as usize + c * e.stride as usize];
                     }
                     acc
                 }
@@ -365,12 +381,29 @@ impl Tape {
         self.push(v, Op::Digamma, a, 0, 0.0)
     }
 
+    /// `val[seed] + ∑ val[base + c * stride]`, as one node, summed in the same
+    /// order the chain of adds it replaces would have.
+    pub fn sum_run(&mut self, seed: u32, base: u32, stride: u32, len: u32) -> u32 {
+        let handle = self.extents.len() as u32;
+        self.extents.push(Extent {
+            base,
+            stride,
+            len,
+            at: 0,
+        });
+        let v = (0..len as usize).fold(self.val[seed as usize], |acc, c| {
+            acc + self.val[base as usize + c * stride as usize]
+        });
+        self.push_raw(v, Op::Sum, seed, handle, 0.0)
+    }
+
     /// `∑ val[base + c * stride] * coeffs[c]`, as one node.
     pub fn dot_c(&mut self, base: u32, stride: u32, coeffs: &[f64]) -> u32 {
         let at = self.coeffs.len() as u32;
         self.coeffs.extend_from_slice(coeffs);
         let handle = self.extents.len() as u32;
         self.extents.push(Extent {
+            base,
             stride,
             len: coeffs.len() as u32,
             at,
@@ -383,7 +416,7 @@ impl Tape {
         self.push_raw(v, Op::DotC, base, handle, 0.0)
     }
 
-    /// The contraction shape of a [`Op::DotC`] node.
+    /// The run a [`Op::DotC`] or [`Op::Sum`] node walks.
     pub fn extent_at(&self, k: u32) -> Extent {
         self.extents[self.arg2i[k as usize] as usize]
     }
@@ -541,6 +574,13 @@ impl Tape {
                     let e = self.extents[a2i];
                     for c in 0..e.len as usize {
                         self.grad[a1 + c * e.stride as usize] += g * self.coeffs[e.at as usize + c];
+                    }
+                }
+                Op::Sum => {
+                    let e = self.extents[a2i];
+                    self.grad[a1] += g;
+                    for c in 0..e.len as usize {
+                        self.grad[e.base as usize + c * e.stride as usize] += g;
                     }
                 }
             }

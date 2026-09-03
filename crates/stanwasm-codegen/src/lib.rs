@@ -768,6 +768,122 @@ fn straight_dot_ops(tape: &Tape, k: u32, slots: &Slots, lay: Layout, off: u32) -
         .collect()
 }
 
+/// `p = scratch + (off + base) * 8`, then `end` one past the run's last element.
+fn emit_run_ptrs(f: &mut Function, sr: SlotRel, len: u32, off: u32, p: u32, end: u32) {
+    f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+    f.instruction(&Instruction::I32Const(((off + sr.base) * 8) as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(p));
+    f.instruction(&Instruction::I32Const((len * sr.stride * 8) as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(end));
+}
+
+/// `p += stride * 8`, and go round again until it reaches `end`.
+fn emit_run_step(f: &mut Function, sr: SlotRel, p: u32, end: u32) {
+    f.instruction(&Instruction::LocalGet(p));
+    f.instruction(&Instruction::I32Const((sr.stride * 8) as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(p));
+    f.instruction(&Instruction::LocalGet(end));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::BrIf(0));
+}
+
+/// Where a reduction's run sits in slots, when a loop can walk it. Unrolling a
+/// vectorised statement's total would put a node per element back in the
+/// module, which is what re-rolling exists to avoid — but the addresses have to
+/// be in memory and evenly spaced for a pointer to reach them.
+fn sum_run_slots(tape: &Tape, k: u32, slots: &Slots, lay: Layout) -> Option<SlotRel> {
+    if !matches!(lay, Layout::Memory) {
+        return None;
+    }
+    let e = tape.extent_at(k);
+    slots
+        .rel(e.base, e.stride, e.len)
+        .filter(|sr| sr.stride > 0)
+}
+
+/// `out = seed + ∑ run`.
+#[allow(clippy::too_many_arguments)]
+fn emit_sum_forward(
+    f: &mut Function,
+    tape: &Tape,
+    k: u32,
+    slots: &Slots,
+    lay: Layout,
+    run: Option<SlotRel>,
+    acc: u32,
+    p: u32,
+    end: u32,
+) {
+    let e = tape.extent_at(k);
+    let out = lay.at(slots.at(k));
+    let seed = lay.at(slots.at(tape.arg1_at(k)));
+    let Some(sr) = run else {
+        astore_addr(f, out);
+        aload(f, seed);
+        for c in 0..e.len {
+            aload(f, lay.at(slots.at(e.base + c * e.stride)));
+            f.instruction(&Instruction::F64Add);
+        }
+        astore_end(f, out);
+        return;
+    };
+    aload(f, seed);
+    f.instruction(&Instruction::LocalSet(acc));
+    emit_run_ptrs(f, sr, e.len, 0, p, end);
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(acc));
+    f.instruction(&Instruction::LocalGet(p));
+    f.instruction(&Instruction::F64Load(memarg(0)));
+    f.instruction(&Instruction::F64Add);
+    f.instruction(&Instruction::LocalSet(acc));
+    emit_run_step(f, sr, p, end);
+    f.instruction(&Instruction::End);
+    astore_addr(f, out);
+    f.instruction(&Instruction::LocalGet(acc));
+    astore_end(f, out);
+}
+
+/// Its backward step: the seed and every element of the run take the same
+/// adjoint, since each entered the total once.
+#[allow(clippy::too_many_arguments)]
+fn emit_sum_backward(
+    f: &mut Function,
+    tape: &Tape,
+    k: u32,
+    slots: &Slots,
+    lay: Layout,
+    run: Option<SlotRel>,
+    adj: u32,
+    acc: u32,
+    p: u32,
+    end: u32,
+) {
+    let e = tape.extent_at(k);
+    aload(f, lay.at(adj + slots.at(k)));
+    f.instruction(&Instruction::LocalSet(acc));
+    let dk = Addr::Local(acc);
+    adj_incr(f, lay.at(adj + slots.at(tape.arg1_at(k))), dk);
+    let Some(sr) = run else {
+        for c in 0..e.len {
+            adj_incr(f, lay.at(adj + slots.at(e.base + c * e.stride)), dk);
+        }
+        return;
+    };
+    emit_run_ptrs(f, sr, e.len, adj, p, end);
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(p));
+    f.instruction(&Instruction::LocalGet(p));
+    f.instruction(&Instruction::F64Load(memarg(0)));
+    f.instruction(&Instruction::LocalGet(acc));
+    f.instruction(&Instruction::F64Add);
+    f.instruction(&Instruction::F64Store(memarg(0)));
+    emit_run_step(f, sr, p, end);
+    f.instruction(&Instruction::End);
+}
+
 /// Opcodes with a lane-wise `f64x2` form. The host math imports have none —
 /// `exp` and `log` are calls — so a density that uses one stays scalar.
 fn lane_wise(op: Op) -> bool {
@@ -1188,10 +1304,20 @@ fn build_log_prob_grad(
         .map(|f| f.iter().filter(|x| **x).count() as u32)
         .max()
         .unwrap_or(0);
+    // A reduction walked by a loop needs somewhere to keep its running total.
+    let sum_runs: Vec<Option<SlotRel>> = (0..n)
+        .map(|k| {
+            (tape.op_at(k) == Op::Sum)
+                .then(|| sum_run_slots(tape, k, slots, lay))
+                .flatten()
+        })
+        .collect();
+    let has_sum_loop = sum_runs.iter().any(|r| r.is_some());
     let f64_locals = match lay {
         Layout::Locals { .. } => lay.local_count(2 * n),
-        Layout::Memory => 2 * widest_locals,
+        Layout::Memory => 2 * widest_locals + has_sum_loop as u32,
     };
+    let sum_acc = FIRST_SLOT_LOCAL + f64_locals - 1;
     let block_rels: Vec<Vec<PosRel>> = blocks
         .iter()
         .map(|b| slots.rels(tape, b).expect("checked by the plan"))
@@ -1204,7 +1330,7 @@ fn build_log_prob_grad(
         .unwrap_or(0);
     // One induction variable, reused by every block, then the base pointers,
     // then a scratch address per possible gather.
-    let i32_locals = if blocks.is_empty() {
+    let i32_locals = if blocks.is_empty() && !has_sum_loop {
         0
     } else {
         1 + widest + reroll::MAX_TABLED as u32
@@ -1267,6 +1393,11 @@ fn build_log_prob_grad(
     let (_, tables) = stage_tables(tape, blocks, const_base, slots);
 
     let straight_fwd = |f: &mut Function, k: u32| {
+        if tape.op_at(k) == Op::Sum {
+            let run = sum_runs[k as usize];
+            emit_sum_forward(f, tape, k, slots, lay, run, sum_acc, iv, tmp1);
+            return;
+        }
         let w = lay.at(slots.at(k));
         if tape.op_at(k) == Op::DotC {
             astore_addr(f, w);
@@ -1426,6 +1557,11 @@ fn build_log_prob_grad(
             if tape.op_at(k) == Op::DotC {
                 let ops = straight_dot_ops(tape, k, slots, lay, adj);
                 emit_dot_backward(&mut f, lay.at(adj + slots.at(k)), &ops);
+                continue;
+            }
+            if tape.op_at(k) == Op::Sum {
+                let run = sum_runs[k as usize];
+                emit_sum_backward(&mut f, tape, k, slots, lay, run, adj, sum_acc, iv, tmp1);
                 continue;
             }
             emit_backward(
@@ -1613,7 +1749,7 @@ fn emit_forward(
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
             unimplemented!("codegen for op {op:?}");
         }
-        Op::DotC => unreachable!("a contraction is emitted from its own path"),
+        Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
     }
 }
 
@@ -1715,7 +1851,7 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
             unimplemented!("backward for op {op:?}");
         }
-        Op::DotC => unreachable!("a contraction is emitted from its own path"),
+        Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
     }
 }
 

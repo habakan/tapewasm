@@ -78,9 +78,9 @@ pub struct ArgRels {
 pub(crate) fn uses(op: Op) -> (bool, bool, bool) {
     match op {
         Op::Leaf => (false, false, true),
-        // `arg2i` is a handle into the tape's extent table, not a slot, and the
-        // coefficients are a run rather than one immediate.
-        Op::DotC => (true, false, false),
+        // `arg2i` is a handle into the tape's extent table, not a slot, and a
+        // run of coefficients is not one immediate.
+        Op::DotC | Op::Sum => (true, false, false),
         Op::Add | Op::Sub | Op::Mul | Op::Div => (true, true, false),
         Op::AddC
         | Op::SubC
@@ -189,7 +189,10 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
     // apart.
     for j in 0..len {
         let op = tape.op_at(start + j);
-        if op == Op::Leaf {
+        // A leaf reads the parameter buffer by absolute index, and a reduction
+        // walks a run the loop emitter has no form for — it is one node for a
+        // whole vectorised statement, so it never wants re-rolling anyway.
+        if op == Op::Leaf || op == Op::Sum {
             return None;
         }
         if op == Op::Pow && consts[j as usize].is_some() {
@@ -559,15 +562,15 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
         }
     };
 
-    // A contraction reads a whole run, not one node, and the emitter addresses
-    // every element of it.
+    // A contraction or a reduction reads a whole run, not one node, and the
+    // emitter addresses every element of it.
     for k in 0..n {
-        if tape.op_at(k) != Op::DotC {
+        if !matches!(tape.op_at(k), Op::DotC | Op::Sum) {
             continue;
         }
         let e = tape.extent_at(k);
         for c in 0..e.len {
-            demote(tape.arg1_at(k) + c * e.stride, &mut out);
+            demote(e.base + c * e.stride, &mut out);
         }
     }
 

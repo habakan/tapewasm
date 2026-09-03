@@ -205,3 +205,30 @@ fn contraction_survives_a_forward_replay() {
     tape.forward_replay(&[1.0, 10.0, 100.0]);
     assert!(close(tape.value(root), 2.0 + 30.0 + 400.0, 1e-12));
 }
+
+#[test]
+fn a_sum_matches_the_chain_it_replaces() {
+    let params = [0.5, -0.3, 0.8, 0.1, 2.0];
+
+    // seed + x1 + x2 + x3, the run starting one past the seed.
+    let (fused_v, fused_g) = log_prob_grad(&params, |t, xs| t.sum_run(xs[0], xs[1], 1, 3));
+    let (chain_v, chain_g) = log_prob_grad(&params, |t, xs| {
+        let mut acc = xs[0];
+        for x in &xs[1..4] {
+            acc = t.add(acc, *x);
+        }
+        acc
+    });
+    assert!(close(fused_v, chain_v, 1e-12), "{fused_v} vs {chain_v}");
+    assert_eq!(fused_g, chain_g);
+    assert_eq!(fused_g, vec![1.0, 1.0, 1.0, 1.0, 0.0]);
+}
+
+#[test]
+fn a_sum_survives_a_forward_replay() {
+    let mut tape = Tape::new();
+    let xs: Vec<u32> = [0.0; 4].iter().map(|v| tape.new_var(*v)).collect();
+    let root = tape.sum_run(xs[0], xs[1], 1, 3);
+    tape.forward_replay(&[1.0, 10.0, 100.0, 1000.0]);
+    assert!(close(tape.value(root), 1111.0, 1e-12));
+}
