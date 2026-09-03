@@ -41,8 +41,25 @@ pub enum Op {
     Acos = 25,
     Atan = 26,
     Digamma = 27,
+    /// Contraction of a run of tape values against a run of constants: one
+    /// node for a whole dot product, rather than `2K` for the chain of
+    /// multiplies and adds that would otherwise record it.
+    DotC = 28,
 }
 
+/// The shape of a contraction, held beside the node rather than in it: the
+/// tape row has room for the first operand's index and a handle, and nothing
+/// else. Widening the row would cost bytes on every scalar node in every
+/// model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    /// Distance on the tape between consecutive elements of the operand whose
+    /// first element is the node's `arg1`.
+    pub stride: u32,
+    pub len: u32,
+    /// Where the constants start in the tape's coefficient arena.
+    pub at: u32,
+}
 
 /// Value numbering key: opcode plus both arguments. Two nodes with the same
 /// key compute the same number on a tape that never mutates a value, so the
@@ -91,6 +108,10 @@ pub struct Tape {
     arg2i: Vec<u32>,
     arg2f: Vec<f64>,
 
+    /// Contraction shapes and their coefficients, indexed by a node's `arg2i`.
+    extents: Vec<Extent>,
+    coeffs: Vec<f64>,
+
     /// Common-subexpression table. A vectorised statement re-records every
     /// loop-invariant term once per element without it — `student_t` over
     /// `vector[N]` recorded `lgamma(nu/2)` N times.
@@ -112,6 +133,8 @@ impl Tape {
             arg1: Vec::with_capacity(TAPE_DEFAULT_CAP),
             arg2i: Vec::with_capacity(TAPE_DEFAULT_CAP),
             arg2f: Vec::with_capacity(TAPE_DEFAULT_CAP),
+            extents: Vec::new(),
+            coeffs: Vec::new(),
             vn: VnMap::default(),
         }
     }
@@ -123,6 +146,8 @@ impl Tape {
         self.arg1.clear();
         self.arg2i.clear();
         self.arg2f.clear();
+        self.extents.clear();
+        self.coeffs.clear();
         self.vn.clear();
     }
 
@@ -174,6 +199,15 @@ impl Tape {
                 Op::Acos => self.val[a1].acos(),
                 Op::Atan => self.val[a1].atan(),
                 Op::Digamma => digamma(self.val[a1]),
+                Op::DotC => {
+                    let e = self.extents[a2i];
+                    let mut acc = 0.0;
+                    for c in 0..e.len as usize {
+                        acc +=
+                            self.val[a1 + c * e.stride as usize] * self.coeffs[e.at as usize + c];
+                    }
+                    acc
+                }
             };
         }
     }
@@ -331,6 +365,34 @@ impl Tape {
         self.push(v, Op::Digamma, a, 0, 0.0)
     }
 
+    /// `∑ val[base + c * stride] * coeffs[c]`, as one node.
+    pub fn dot_c(&mut self, base: u32, stride: u32, coeffs: &[f64]) -> u32 {
+        let at = self.coeffs.len() as u32;
+        self.coeffs.extend_from_slice(coeffs);
+        let handle = self.extents.len() as u32;
+        self.extents.push(Extent {
+            stride,
+            len: coeffs.len() as u32,
+            at,
+        });
+        let v = (0..coeffs.len())
+            .map(|c| self.val[base as usize + c * stride as usize] * coeffs[c])
+            .sum();
+        // Every contraction gets its own coefficients, so there is nothing for
+        // the value-numbering table to match and no reason to consult it.
+        self.push_raw(v, Op::DotC, base, handle, 0.0)
+    }
+
+    /// The contraction shape of a [`Op::DotC`] node.
+    pub fn extent_at(&self, k: u32) -> Extent {
+        self.extents[self.arg2i[k as usize] as usize]
+    }
+
+    /// The coefficients an extent names.
+    pub fn coeffs(&self, e: Extent) -> &[f64] {
+        &self.coeffs[e.at as usize..e.at as usize + e.len as usize]
+    }
+
     // ---- scalar-constant variants (avoid creating leaf nodes for constants) ----
 
     pub fn add_c(&mut self, a: u32, c: f64) -> u32 {
@@ -474,6 +536,12 @@ impl Tape {
                 }
                 Op::Digamma => {
                     self.grad[a1] += g * trigamma(self.val[a1]);
+                }
+                Op::DotC => {
+                    let e = self.extents[a2i];
+                    for c in 0..e.len as usize {
+                        self.grad[a1 + c * e.stride as usize] += g * self.coeffs[e.at as usize + c];
+                    }
                 }
             }
         }

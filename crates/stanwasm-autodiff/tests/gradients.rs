@@ -166,3 +166,42 @@ fn special_functions_known_points() {
     // Phi(1.96) ≈ 0.975
     assert!(close(phi_cdf(1.96), 0.975, 5e-4));
 }
+
+#[test]
+fn contraction_matches_the_chain_it_replaces() {
+    let params = [0.5, -0.3, 0.8, 0.1];
+    let coeffs = [1.5, -2.0, 0.25, 3.0];
+
+    let (fused_v, fused_g) = log_prob_grad(&params, |t, xs| t.dot_c(xs[0], 1, &coeffs));
+    let (chain_v, chain_g) = log_prob_grad(&params, |t, xs| {
+        let mut acc = t.mul_c(xs[0], coeffs[0]);
+        for (x, c) in xs.iter().zip(&coeffs).skip(1) {
+            let p = t.mul_c(*x, *c);
+            acc = t.add(acc, p);
+        }
+        acc
+    });
+    assert!(close(fused_v, chain_v, 1e-12), "{fused_v} vs {chain_v}");
+    assert_eq!(fused_g, chain_g);
+    assert_eq!(fused_g, coeffs.to_vec());
+}
+
+/// A strided operand: the elements of the contracted run need not be adjacent.
+#[test]
+fn contraction_walks_its_operand_by_stride() {
+    let params = [1.0, 9.0, 2.0, 9.0, 3.0];
+    let (v, g) = log_prob_grad(&params, |t, xs| t.dot_c(xs[0], 2, &[10.0, 100.0, 1000.0]));
+    assert!(close(v, 10.0 + 200.0 + 3000.0, 1e-12));
+    assert_eq!(g, vec![10.0, 0.0, 100.0, 0.0, 1000.0]);
+}
+
+/// Replay has to recompute a contraction the same way the forward pass did:
+/// the tape is traced once and replayed per draw.
+#[test]
+fn contraction_survives_a_forward_replay() {
+    let mut tape = Tape::new();
+    let xs: Vec<u32> = [0.0, 0.0, 0.0].iter().map(|v| tape.new_var(*v)).collect();
+    let root = tape.dot_c(xs[0], 1, &[2.0, 3.0, 4.0]);
+    tape.forward_replay(&[1.0, 10.0, 100.0]);
+    assert!(close(tape.value(root), 2.0 + 30.0 + 400.0, 1e-12));
+}

@@ -150,7 +150,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     // then node order; the caller stages them once.
     let const_base = 2 * n;
     let slots = Slots::plan(tape, &blocks);
-    let (const_table, _) = stage_tables(&blocks, const_base, &slots);
+    let (const_table, _) = stage_tables(tape, &blocks, const_base, &slots);
     let needs = scan_imports(tape);
 
     // ---- type section: 0 = (i32,i32,i32,i32)->f64 (log_prob_grad: params_ptr,
@@ -378,12 +378,15 @@ struct NodeTables {
     cst: Option<u32>,
     arg1: Option<u32>,
     arg2i: Option<u32>,
+    /// A contraction's coefficients, one column of `reps` per element.
+    dot: Option<u32>,
 }
 
 /// Lay out every re-rolled block's tables in one buffer the caller stages at
 /// `const_base`. Emission and staging must agree on the order, so both come
 /// from here.
 fn stage_tables(
+    tape: &Tape,
     blocks: &[reroll::Block],
     const_base: u32,
     slots: &Slots,
@@ -412,6 +415,18 @@ fn stage_tables(
                 let f: Vec<f64> = ix.iter().map(|&i| slots.at(i) as f64).collect();
                 t.arg2i = Some(push(&mut buf, &f));
             }
+            let k0 = b.start + j as u32;
+            if tape.op_at(k0) == Op::DotC {
+                let e = tape.extent_at(k0);
+                let mut f = Vec::with_capacity((e.len * b.reps) as usize);
+                for c in 0..e.len as usize {
+                    for i in 0..b.reps {
+                        let at = b.start + i * b.len + j as u32;
+                        f.push(tape.coeffs(tape.extent_at(at))[c]);
+                    }
+                }
+                t.dot = Some(push(&mut buf, &f));
+            }
             m.push(t);
         }
         maps.push(m);
@@ -434,6 +449,8 @@ struct PosRel {
     out: SlotRel,
     arg1: Option<SlotRel>,
     arg2i: Option<SlotRel>,
+    /// Every element of a contraction's operand run; empty for other opcodes.
+    elems: Vec<SlotRel>,
 }
 
 /// Which scratch slot each tape node's primal occupies; its adjoint sits `n`
@@ -541,10 +558,21 @@ impl Slots {
                     reroll::ArgRel::Affine(t) => self.rel(arg0, *t, b.reps).map(Some),
                     reroll::ArgRel::Tabled(_) => Some(None),
                 };
+                let mut elems = Vec::new();
+                if tape.op_at(k0) == Op::DotC {
+                    let e = tape.extent_at(k0);
+                    let reroll::ArgRel::Affine(t) = b.args[j as usize].arg1 else {
+                        return None;
+                    };
+                    for c in 0..e.len {
+                        elems.push(self.rel(tape.arg1_at(k0) + c * e.stride, t, b.reps)?);
+                    }
+                }
                 Some(PosRel {
                     out: self.rel(k0, b.len, b.reps)?,
                     arg1: arg(&b.args[j as usize].arg1, tape.arg1_at(k0))?,
                     arg2i: arg(&b.args[j as usize].arg2i, tape.arg2i_at(k0))?,
+                    elems,
                 })
             })
             .collect()
@@ -607,7 +635,12 @@ fn block_strides(b: &reroll::Block, rels: &[PosRel]) -> Vec<u32> {
                 None => want(1, &mut out),
             }
         }
-        if b.consts[j].is_some() {
+        for e in &r.elems {
+            want(e.stride, &mut out);
+        }
+        // A contraction's coefficients are staged one column per element, so
+        // reading this repeat's walks by one.
+        if b.consts[j].is_some() || !r.elems.is_empty() {
             want(1, &mut out);
         }
     }
@@ -665,6 +698,71 @@ fn adj_of(rel: Option<SlotRel>, pa: Addr, adj: u32, sp: &StridePtrs) -> Addr {
     }
 }
 
+/// A contraction's operand run, paired with its coefficients: the addresses
+/// the unrolled sum reads, in element order.
+type DotOps = Vec<(Addr, Cst)>;
+
+/// `∑ elem * coeff`, left on the stack.
+fn emit_dot_forward(f: &mut Function, ops: &DotOps) {
+    for (c, (a, k)) in ops.iter().enumerate() {
+        aload(f, *a);
+        cload(f, *k);
+        f.instruction(&Instruction::F64Mul);
+        if c > 0 {
+            f.instruction(&Instruction::F64Add);
+        }
+    }
+}
+
+/// Its backward step: each element's adjoint takes `dk * coeff`. The
+/// coefficients are constants, so nothing needs the primal.
+fn emit_dot_backward(f: &mut Function, dk: Addr, ops: &DotOps) {
+    for (da, k) in ops {
+        adj_incr_mulc(f, *da, dk, *k);
+    }
+}
+
+/// The addresses a block-resident contraction reads: its operand elements at
+/// this repeat, against the column of coefficients staged for each.
+/// `off` is 0 for the primals and the adjoint offset for the adjoints, which
+/// sit that many slots above them.
+fn block_dot_ops(
+    tape: &Tape,
+    k0: u32,
+    r: &PosRel,
+    reps: u32,
+    at: u32,
+    sp: &StridePtrs,
+    off: u32,
+) -> DotOps {
+    let e = tape.extent_at(k0);
+    (0..e.len as usize)
+        .map(|c| {
+            (
+                sp.addr(off + r.elems[c].base, r.elems[c].stride),
+                Cst::At(sp.addr(at + c as u32 * reps, 1)),
+            )
+        })
+        .collect()
+}
+
+/// The same for a contraction the emitter left straight-line, whose
+/// coefficients fold into immediates rather than a staged column.
+fn straight_dot_ops(tape: &Tape, k: u32, slots: &Slots, lay: Layout, off: u32) -> DotOps {
+    let e = tape.extent_at(k);
+    let base = tape.arg1_at(k);
+    tape.coeffs(e)
+        .iter()
+        .enumerate()
+        .map(|(c, v)| {
+            (
+                lay.at(off + slots.at(base + c as u32 * e.stride)),
+                Cst::Imm(*v),
+            )
+        })
+        .collect()
+}
+
 /// One forward pass over a block body. `locals_only` limits it to the
 /// positions kept in locals: the backward loop reconstructs those, because a
 /// local cannot carry a value from the forward loop to here.
@@ -692,6 +790,14 @@ fn emit_block_forward(
         // Gather addresses are computed before the value is pushed: the store
         // address has to stay on top of the stack.
         let r = &rels[j as usize];
+        if tape.op_at(k0) == Op::DotC {
+            let ops = block_dot_ops(tape, k0, r, b.reps, nt.dot.expect("staged"), sp, 0);
+            let w = bl.prim(j).unwrap_or(sp.addr(r.out.base, r.out.stride));
+            astore_addr(f, w);
+            emit_dot_forward(f, &ops);
+            astore_end(f, w);
+            continue;
+        }
         let a1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
             Some(t) => bl.prim(t).expect("checked local"),
             None => block_arg(f, sp, r.arg1, nt.arg1, tmp1),
@@ -779,9 +885,16 @@ fn build_log_prob_grad(
         f.instruction(&Instruction::MemoryFill(0));
     }
 
-    let (_, tables) = stage_tables(blocks, const_base, slots);
+    let (_, tables) = stage_tables(tape, blocks, const_base, slots);
 
     let straight_fwd = |f: &mut Function, k: u32| {
+        let w = lay.at(slots.at(k));
+        if tape.op_at(k) == Op::DotC {
+            astore_addr(f, w);
+            emit_dot_forward(f, &straight_dot_ops(tape, k, slots, lay, 0));
+            astore_end(f, w);
+            return;
+        }
         let a1 = lay.at(slots.at(tape.arg1_at(k)));
         let a2 = lay.at(slots.at(tape.arg2i_at(k)));
         let cst = Cst::Imm(if tape.op_at(k) == Op::Leaf {
@@ -789,9 +902,9 @@ fn build_log_prob_grad(
         } else {
             tape.arg2f_at(k)
         });
-        astore_addr(f, lay.at(slots.at(k)));
+        astore_addr(f, w);
         emit_forward(f, tape, k, m, a1, a2, cst);
-        astore_end(f, lay.at(slots.at(k)));
+        astore_end(f, w);
     };
 
     // ---- forward pass ------------------------------------------------------
@@ -889,6 +1002,13 @@ fn build_log_prob_grad(
                 let nt = tables[bi][j as usize];
                 let ar = &b.args[j as usize];
                 let r = &block_rels[bi][j as usize];
+                if tape.op_at(k0) == Op::DotC {
+                    let at = nt.dot.expect("staged");
+                    let ops = block_dot_ops(tape, k0, r, b.reps, at, &sp, adj);
+                    let dk = bl.adj(j).unwrap_or(sp.addr(adj + r.out.base, r.out.stride));
+                    emit_dot_backward(&mut f, dk, &ops);
+                    continue;
+                }
                 let pa1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
                     Some(t) => bl.prim(t).expect("checked local"),
                     None => block_arg(&mut f, &sp, r.arg1, nt.arg1, tmp1),
@@ -934,6 +1054,11 @@ fn build_log_prob_grad(
             k = b.start;
         } else {
             k -= 1;
+            if tape.op_at(k) == Op::DotC {
+                let ops = straight_dot_ops(tape, k, slots, lay, adj);
+                emit_dot_backward(&mut f, lay.at(adj + slots.at(k)), &ops);
+                continue;
+            }
             emit_backward(
                 &mut f,
                 tape,
@@ -1119,6 +1244,7 @@ fn emit_forward(
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
             unimplemented!("codegen for op {op:?}");
         }
+        Op::DotC => unreachable!("a contraction is emitted from its own path"),
     }
 }
 
@@ -1220,6 +1346,7 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
             unimplemented!("backward for op {op:?}");
         }
+        Op::DotC => unreachable!("a contraction is emitted from its own path"),
     }
 }
 

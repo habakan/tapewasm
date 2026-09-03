@@ -407,13 +407,16 @@ model {
     }
 }
 
-/// A matrix-vector product: the mean is one re-rolled block and the density
-/// is another, so every row's mean is written by the first and read back by
-/// the second. That crossing is the only place the scratch buffer's slot
-/// order is observable, and it has to give the same gradient either way.
+/// A matrix-vector product: one contraction node per row, in a block of its
+/// own, whose result the density block reads back. That crossing is the only
+/// place the scratch buffer's slot order is observable, and the contraction
+/// has two emitters — unrolled in place, or inside a loop reading a staged
+/// column of coefficients — which have to agree with each other and with the
+/// oracle.
 #[test]
-fn rerolled_matrix_product_matches_oracle() {
-    const N: usize = 1200;
+fn matrix_product_matches_oracle_in_every_reroll_mode() {
+    use stanwasm_codegen::{compile_with, Reroll};
+    const N: usize = 2000;
     const K: usize = 4;
     let src = r#"data { int<lower=0> N; int<lower=0> K; matrix[N,K] X; vector[N] y; }
 parameters { vector[K] beta; real<lower=0> sigma; }
@@ -441,34 +444,38 @@ model {
     let model =
         Model::parse_and_load(src, stanwasm_runtime::data_from_json(&data_json).unwrap()).unwrap();
 
-    let compiled = compile(&model, &vec![0.1; model.n_params()]).unwrap();
-    assert!(
-        !compiled.const_table.is_empty(),
-        "expected re-rolled loops with staged tables"
-    );
-
-    for test_params in [
-        vec![0.5, -0.3, 0.8, 0.1, -0.5],
-        vec![-1.2, 0.4, 0.0, 0.9, 0.25],
-    ] {
-        let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
-        let (aot_lp, aot_grads) = run_aot_log_prob_grad(
-            &compiled.wasm,
-            compiled.n_params,
-            &test_params,
-            compiled.scratch_len,
-            &compiled.const_table,
-        );
-        assert!(
-            close(oracle_lp, aot_lp, 1e-10),
-            "lp: oracle={oracle_lp}, aot={aot_lp}"
-        );
-        for (i, (o, a)) in oracle_grads.iter().zip(aot_grads.iter()).enumerate() {
+    let dummy = vec![0.1; model.n_params()];
+    for mode in [Reroll::Auto, Reroll::Always, Reroll::Never] {
+        let compiled = compile_with(&model, &dummy, mode).unwrap();
+        if mode != Reroll::Never {
             assert!(
-                close(*o, *a, 1e-10),
-                "grad[{i}]: oracle={o}, aot={a}, diff={}",
-                o - a
+                !compiled.const_table.is_empty(),
+                "{mode:?}: expected re-rolled loops with staged coefficients"
             );
+        }
+        for test_params in [
+            vec![0.5, -0.3, 0.8, 0.1, -0.5],
+            vec![-1.2, 0.4, 0.0, 0.9, 0.25],
+        ] {
+            let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
+            let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+                &compiled.wasm,
+                compiled.n_params,
+                &test_params,
+                compiled.scratch_len,
+                &compiled.const_table,
+            );
+            assert!(
+                close(oracle_lp, aot_lp, 1e-10),
+                "{mode:?}: lp oracle={oracle_lp}, aot={aot_lp}"
+            );
+            for (i, (o, a)) in oracle_grads.iter().zip(aot_grads.iter()).enumerate() {
+                assert!(
+                    close(*o, *a, 1e-10),
+                    "{mode:?}: grad[{i}] oracle={o}, aot={a}, diff={}",
+                    o - a
+                );
+            }
         }
     }
 }

@@ -78,6 +78,9 @@ pub struct ArgRels {
 pub(crate) fn uses(op: Op) -> (bool, bool, bool) {
     match op {
         Op::Leaf => (false, false, true),
+        // `arg2i` is a handle into the tape's extent table, not a slot, and the
+        // coefficients are a run rather than one immediate.
+        Op::DotC => (true, false, false),
         Op::Add | Op::Sub | Op::Mul | Op::Div => (true, true, false),
         Op::AddC
         | Op::SubC
@@ -179,9 +182,11 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
         });
     }
 
-    // Two shapes the emitter has no form for: a leaf reads the parameter buffer
-    // by absolute index, and `Pow` folds `exponent - 1` into an immediate for
-    // its backward step.
+    // Three shapes the emitter has no form for: a leaf reads the parameter
+    // buffer by absolute index, `Pow` folds `exponent - 1` into an immediate
+    // for its backward step, and a contraction is emitted unrolled, so every
+    // repeat has to contract the same number of elements the same distance
+    // apart.
     for j in 0..len {
         let op = tape.op_at(start + j);
         if op == Op::Leaf {
@@ -189,6 +194,15 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
         }
         if op == Op::Pow && consts[j as usize].is_some() {
             return None;
+        }
+        if op == Op::DotC {
+            let e0 = tape.extent_at(start + j);
+            if (1..reps).any(|i| {
+                let e = tape.extent_at(start + i * len + j);
+                (e.len, e.stride) != (e0.len, e0.stride)
+            }) {
+                return None;
+            }
         }
     }
 
@@ -311,41 +325,6 @@ model {
         (tape, root)
     }
 
-    /// `y ~ normal(X * beta, sigma)`: the mean is a run of `2K` nodes per row,
-    /// preceded by a prologue whose last node has the same opcode as the row's.
-    pub fn matrix_tape(n: usize, k: usize) -> (Tape, u32) {
-        use stanwasm_runtime::{data_from_json, Model};
-        let src = r#"data { int<lower=0> N; int<lower=0> K; matrix[N,K] X; vector[N] y; }
-parameters { vector[K] beta; real<lower=0> sigma; }
-model {
-  beta ~ normal(0, 1); sigma ~ exponential(1);
-  y ~ normal(X * beta, sigma);
-}"#;
-        let mut seed: u64 = 12345;
-        let mut rnd = || {
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
-            seed as f64 / 4294967296.0 * 2.0 - 1.0
-        };
-        let rows: Vec<String> = (0..n)
-            .map(|_| {
-                let cells: Vec<String> = (0..k).map(|_| format!("{}", rnd())).collect();
-                format!("[{}]", cells.join(","))
-            })
-            .collect();
-        let ys: Vec<String> = (0..n).map(|_| format!("{}", rnd())).collect();
-        let data = format!(
-            "{{\"N\": {n}, \"K\": {k}, \"X\": [{}], \"y\": [{}]}}",
-            rows.join(","),
-            ys.join(",")
-        );
-        let model = Model::parse_and_load(src, data_from_json(&data).unwrap()).unwrap();
-        let mut tape = Tape::new();
-        let init: Vec<f64> = (0..k).map(|_| 0.1).chain([-0.5]).collect();
-        let leaves: Vec<u32> = init.iter().map(|p| tape.new_var(*p)).collect();
-        let root = model.trace_forward(&mut tape, &leaves, true).unwrap();
-        (tape, root)
-    }
-
     /// A hierarchical model whose group index is irregular, the way real data
     /// is: `mu[g[i]]` cannot be described by a stride.
     pub fn gather_tape(n: usize) -> (Tape, u32) {
@@ -381,7 +360,6 @@ model {
 mod tests {
     use super::tests_support::gather_tape;
     use super::tests_support::linreg_tape;
-    use super::tests_support::matrix_tape;
     use super::*;
 
     #[test]
@@ -514,20 +492,25 @@ mod tests {
     /// row, and every value straddling the split needs an address.
     #[test]
     fn a_block_starts_on_its_statement_boundary() {
-        let (tape, root) = matrix_tape(200, 4);
+        let mut tape = Tape::new();
+        let a = tape.new_var(0.5);
+        let b = tape.new_var(1.5);
+        // A prologue whose last opcode is the one each row ends with.
+        let mut acc = tape.add(a, b);
+        for i in 0..40 {
+            let p = tape.mul_c(a, 1.0 + i as f64);
+            acc = tape.add(acc, p);
+        }
+
         let blocks = detect(&tape);
-        let flags = local_positions(&tape, &blocks, root);
-        let (i, b) = blocks
-            .iter()
-            .enumerate()
-            .find(|(_, b)| b.len == 8)
-            .expect("no matrix-product block");
-        assert_eq!(tape.op_at(b.start), Op::MulC, "block starts mid-row");
-        assert_eq!(
-            flags[i].iter().filter(|f| **f).count(),
-            b.len as usize - 1,
-            "only the row's result should need an address"
+        let found = blocks.first().expect("no block found");
+        assert_eq!(tape.op_at(found.start), Op::MulC, "block starts mid-row");
+        assert!(
+            carried(&tape, found.start, found.len) < carried(&tape, found.start - 1, found.len),
+            "the rotation did not reduce what straddles the boundary"
         );
+        let flags = local_positions(&tape, &blocks, acc);
+        assert_eq!(flags[0], vec![true, false], "the product should stay local");
     }
 
     #[test]
@@ -575,6 +558,18 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
             out[bi][j as usize] = false;
         }
     };
+
+    // A contraction reads a whole run, not one node, and the emitter addresses
+    // every element of it.
+    for k in 0..n {
+        if tape.op_at(k) != Op::DotC {
+            continue;
+        }
+        let e = tape.extent_at(k);
+        for c in 0..e.len {
+            demote(tape.arg1_at(k) + c * e.stride, &mut out);
+        }
+    }
 
     for k in 0..n {
         let (u1, u2, _) = uses(tape.op_at(k));
