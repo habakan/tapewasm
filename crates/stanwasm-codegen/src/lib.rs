@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+mod math;
 mod reroll;
 
 use stanwasm_autodiff::{Op, Tape};
@@ -190,7 +191,8 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     if needs.exp {
         math_idx.exp = Some(math_idx_add_unary(&mut math_idx, &mut imports, "exp"));
     }
-    if needs.log {
+    // The two defined below reach for `log`, so it is imported for them too.
+    if needs.log || needs.lgamma || needs.digamma {
         math_idx.log = Some(math_idx_add_unary(&mut math_idx, &mut imports, "log"));
     }
     if needs.sin {
@@ -198,12 +200,6 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     }
     if needs.cos {
         math_idx.cos = Some(math_idx_add_unary(&mut math_idx, &mut imports, "cos"));
-    }
-    if needs.lgamma {
-        math_idx.lgamma = Some(math_idx_add_unary(&mut math_idx, &mut imports, "lgamma"));
-    }
-    if needs.digamma {
-        math_idx.digamma = Some(math_idx_add_unary(&mut math_idx, &mut imports, "digamma"));
     }
     if needs.phi {
         math_idx.phi = Some(math_idx_add_unary(&mut math_idx, &mut imports, "phi"));
@@ -221,6 +217,24 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     functions.function(0); // log_prob_grad: type 0
 
     let log_prob_grad_idx = n_func_imports;
+    // JavaScript has no lgamma or digamma, so the module carries its own
+    // rather than leaving every embedder to write a series of its choosing.
+    let mut inline: Vec<Function> = Vec::new();
+    let mut define = |body: Function, functions: &mut FunctionSection| {
+        functions.function(1); // (f64) -> f64
+        let idx = log_prob_grad_idx + 1 + inline.len() as u32;
+        inline.push(body);
+        idx
+    };
+    if needs.lgamma || needs.digamma {
+        let log = math_idx.log.expect("imported for them");
+        if needs.lgamma {
+            math_idx.lgamma = Some(define(math::lgamma(log), &mut functions));
+        }
+        if needs.digamma {
+            math_idx.digamma = Some(define(math::digamma(log), &mut functions));
+        }
+    }
 
     // ---- export section ----------------------------------------------------
     let mut exports = ExportSection::new();
@@ -232,6 +246,9 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     let _ = n_params;
     let lpg = build_log_prob_grad(tape, root, n, &math_idx, &blocks, const_base, &slots);
     codes.function(&lpg);
+    for body in &inline {
+        codes.function(body);
+    }
 
     // ---- assemble ----------------------------------------------------------
     let mut module = Module::new();

@@ -605,45 +605,63 @@ impl Tape {
 
 // ---- special functions (free standing — also used as primal helpers) ----
 
+// The three below are an asymptotic series preceded by a recurrence that
+// shifts the argument up to where the series converges. Both halves are sized
+// so the first dropped term lands below the double they return: a gradient
+// through `student_t` is exactly as accurate as `digamma` is, and
+// `tests/special_functions.rs` holds them to 1e-14 against a reference
+// computed at 60 decimal digits.
+const SHIFT_TO: f64 = 12.0;
+
 /// Stirling-series log-Gamma.
 pub fn lgamma(x: f64) -> f64 {
     let mut z = x;
     let mut r = 0.0;
-    while z < 10.0 {
+    while z < SHIFT_TO {
         r -= z.ln();
         z += 1.0;
     }
     let zinv = 1.0 / z;
-    let zinv2 = zinv * zinv;
-    r + (z - 0.5) * z.ln() - z
-        + 0.5 * (2.0 * PI).ln()
-        + zinv * (1.0 / 12.0 + zinv2 * (-1.0 / 360.0 + zinv2 / 1260.0))
+    let z2 = zinv * zinv;
+    let series = 1.0 / 12.0
+        - z2 * (1.0 / 360.0
+            - z2 * (1.0 / 1260.0
+                - z2 * (1.0 / 1680.0 - z2 * (1.0 / 1188.0 - z2 * (691.0 / 360360.0)))));
+    r + (z - 0.5) * z.ln() - z + 0.5 * (2.0 * PI).ln() + zinv * series
 }
 
 /// Asymptotic-series digamma (Ψ).
 pub fn digamma(x: f64) -> f64 {
     let mut xx = x;
     let mut result = 0.0;
-    while xx < 6.0 {
+    while xx < SHIFT_TO {
         result -= 1.0 / xx;
         xx += 1.0;
     }
     let r = 1.0 / xx;
     let r2 = r * r;
-    result + xx.ln() - 0.5 * r - r2 * (1.0 / 12.0 - r2 * (1.0 / 120.0 - r2 / 252.0))
+    let series = 1.0 / 12.0
+        - r2 * (1.0 / 120.0
+            - r2 * (1.0 / 252.0
+                - r2 * (1.0 / 240.0 - r2 * (1.0 / 132.0 - r2 * (691.0 / 32760.0)))));
+    result + xx.ln() - 0.5 * r - r2 * series
 }
 
 /// Asymptotic-series trigamma (Ψ').
 pub fn trigamma(x: f64) -> f64 {
     let mut xx = x;
     let mut result = 0.0;
-    while xx < 6.0 {
+    while xx < SHIFT_TO {
         result += 1.0 / (xx * xx);
         xx += 1.0;
     }
     let r = 1.0 / xx;
     let r2 = r * r;
-    result + r + 0.5 * r2 + r2 * r * (1.0 / 6.0 - r2 * (1.0 / 30.0 - r2 / 42.0))
+    let series = 1.0 / 6.0
+        - r2 * (1.0 / 30.0
+            - r2 * (1.0 / 42.0
+                - r2 * (1.0 / 30.0 - r2 * (5.0 / 66.0 - r2 * (691.0 / 2730.0)))));
+    result + r + 0.5 * r2 + r2 * r * series
 }
 
 /// Standard normal CDF (Abramowitz & Stegun 26.2.17).
