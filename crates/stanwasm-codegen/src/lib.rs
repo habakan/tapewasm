@@ -1987,7 +1987,6 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
 // ---- adjoint update emitters: given adjoint `da`, source adjoint `dk` and any
 // primal locals, emit `da += <expression in dk and primals>`. ----
 
-
 // ---- value storage -------------------------------------------------------
 //
 // A tape node's primal and adjoint each occupy one "slot": primals are slots
@@ -2008,10 +2007,16 @@ enum Addr {
     Local(u32),
     /// `ptr` is an i32 local holding a byte address; `slot` is added as an
     /// f64-indexed immediate offset.
-    Mem { ptr: u32, slot: u32 },
+    Mem {
+        ptr: u32,
+        slot: u32,
+    },
     /// In a widened body: one scalar read, broadcast to both lanes. What a
     /// loop-invariant operand becomes when two repeats run at once.
-    Splat { ptr: u32, slot: u32 },
+    Splat {
+        ptr: u32,
+        slot: u32,
+    },
 }
 
 /// How the straight-line emitter turns a slot number into an [`Addr`].

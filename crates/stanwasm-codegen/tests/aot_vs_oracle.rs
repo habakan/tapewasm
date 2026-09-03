@@ -91,7 +91,10 @@ fn run_aot_log_prob_grad(
     }
 
     let lp = lpg
-        .call(&mut store, (params_ptr, grads_ptr, n_params as i32, scratch_ptr))
+        .call(
+            &mut store,
+            (params_ptr, grads_ptr, n_params as i32, scratch_ptr),
+        )
         .unwrap();
 
     let mut grad_bytes = vec![0u8; n_params * 8];
@@ -142,8 +145,13 @@ fn linear_regression_aot_matches_oracle() {
 
     let test_params = vec![0.5, 1.5, -0.2];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
-    let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len, &compiled.const_table);
+    let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+        &compiled.wasm,
+        compiled.n_params,
+        &test_params,
+        compiled.scratch_len,
+        &compiled.const_table,
+    );
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -190,8 +198,13 @@ fn poisson_regression_aot_matches_oracle() {
 
     let test_params = vec![0.0, 1.0];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
-    let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len, &compiled.const_table);
+    let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+        &compiled.wasm,
+        compiled.n_params,
+        &test_params,
+        compiled.scratch_len,
+        &compiled.const_table,
+    );
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -230,8 +243,13 @@ fn multivariate_lkj_aot_matches_oracle() {
 
     let test_params = vec![0.5, 1.5, 0.3];
     let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
-    let (aot_lp, aot_grads) =
-        run_aot_log_prob_grad(&compiled.wasm, compiled.n_params, &test_params, compiled.scratch_len, &compiled.const_table);
+    let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+        &compiled.wasm,
+        compiled.n_params,
+        &test_params,
+        compiled.scratch_len,
+        &compiled.const_table,
+    );
 
     assert!(
         close(oracle_lp, aot_lp, 1e-12),
@@ -331,10 +349,16 @@ fn rerolled_model_is_reentrant() {
     let mut data = Env::new();
     data.set_scalar("N", N as f64);
     data.set_vector("x", &(0..N).map(|i| i as f64 * 0.1).collect::<Vec<_>>());
-    data.set_vector("y", &(0..N).map(|i| 1.0 + i as f64 * 0.2).collect::<Vec<_>>());
+    data.set_vector(
+        "y",
+        &(0..N).map(|i| 1.0 + i as f64 * 0.2).collect::<Vec<_>>(),
+    );
     let model = Model::parse_and_load(LINEAR_REGRESSION, data).unwrap();
     let compiled = compile(&model, &vec![0.1; model.n_params()]).unwrap();
-    assert!(!compiled.const_table.is_empty(), "expected a re-rolled loop");
+    assert!(
+        !compiled.const_table.is_empty(),
+        "expected a re-rolled loop"
+    );
 
     let p = vec![0.4, 1.1, 0.3];
     let first = run_aot_log_prob_grad(
@@ -369,8 +393,12 @@ model {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
         seed as f64 / 4294967296.0
     };
-    let gs: Vec<String> = (0..N).map(|_| format!("{}", 1 + (rnd() * 8.0) as u32)).collect();
-    let ys: Vec<String> = (0..N).map(|i| format!("{}", (i as f64).sin() * 2.0)).collect();
+    let gs: Vec<String> = (0..N)
+        .map(|_| format!("{}", 1 + (rnd() * 8.0) as u32))
+        .collect();
+    let ys: Vec<String> = (0..N)
+        .map(|i| format!("{}", (i as f64).sin() * 2.0))
+        .collect();
     let data_json = format!(
         "{{\"N\": {N}, \"G\": {G}, \"g\": [{}], \"y\": [{}]}}",
         gs.join(","),
@@ -511,7 +539,10 @@ fn reroll_modes_agree() {
             c.scratch_len,
             &c.const_table,
         );
-        assert!(close(oracle_lp, lp, 1e-12), "{mode:?}: lp {oracle_lp} vs {lp}");
+        assert!(
+            close(oracle_lp, lp, 1e-12),
+            "{mode:?}: lp {oracle_lp} vs {lp}"
+        );
         for (i, (o, a)) in oracle_grads.iter().zip(grads.iter()).enumerate() {
             assert!(close(*o, *a, 1e-12), "{mode:?}: grad[{i}] {o} vs {a}");
         }

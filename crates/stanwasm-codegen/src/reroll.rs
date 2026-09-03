@@ -82,13 +82,9 @@ pub(crate) fn uses(op: Op) -> (bool, bool, bool) {
         // run of coefficients is not one immediate.
         Op::DotC | Op::Sum => (true, false, false),
         Op::Add | Op::Sub | Op::Mul | Op::Div => (true, true, false),
-        Op::AddC
-        | Op::SubC
-        | Op::RsubC
-        | Op::MulC
-        | Op::DivC
-        | Op::RdivC
-        | Op::Pow => (true, false, true),
+        Op::AddC | Op::SubC | Op::RsubC | Op::MulC | Op::DivC | Op::RdivC | Op::Pow => {
+            (true, false, true)
+        }
         _ => (true, false, false),
     }
 }
@@ -315,7 +311,9 @@ model {
   y ~ normal(alpha + beta * x, sigma);
 }"#;
         let xs: Vec<String> = (0..n).map(|i| format!("{}", i as f64 * 0.1)).collect();
-        let ys: Vec<String> = (0..n).map(|i| format!("{}", 1.0 + i as f64 * 0.2)).collect();
+        let ys: Vec<String> = (0..n)
+            .map(|i| format!("{}", 1.0 + i as f64 * 0.2))
+            .collect();
         let data = format!(
             "{{\"N\": {n}, \"x\": [{}], \"y\": [{}]}}",
             xs.join(","),
@@ -343,8 +341,12 @@ model {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
             seed as f64 / 4294967296.0
         };
-        let gs: Vec<String> = (0..n).map(|_| format!("{}", 1 + (rnd() * 8.0) as u32)).collect();
-        let ys: Vec<String> = (0..n).map(|i| format!("{}", (i as f64).sin() * 2.0)).collect();
+        let gs: Vec<String> = (0..n)
+            .map(|_| format!("{}", 1 + (rnd() * 8.0) as u32))
+            .collect();
+        let ys: Vec<String> = (0..n)
+            .map(|i| format!("{}", (i as f64).sin() * 2.0))
+            .collect();
         let data = format!(
             "{{\"N\": {n}, \"G\": 8, \"g\": [{}], \"y\": [{}]}}",
             gs.join(","),
@@ -408,14 +410,24 @@ mod tests {
                             ArgRel::Affine(t) => tape.arg1_at(k0) + i * t,
                             ArgRel::Tabled(ix) => ix[i as usize],
                         };
-                        assert_eq!(tape.arg1_at(k), want, "arg1 at block {}, i={i}, j={j}", b.start);
+                        assert_eq!(
+                            tape.arg1_at(k),
+                            want,
+                            "arg1 at block {}, i={i}, j={j}",
+                            b.start
+                        );
                     }
                     if u2 {
                         let want = match &rels.arg2i {
                             ArgRel::Affine(t) => tape.arg2i_at(k0) + i * t,
                             ArgRel::Tabled(ix) => ix[i as usize],
                         };
-                        assert_eq!(tape.arg2i_at(k), want, "arg2i at block {}, i={i}, j={j}", b.start);
+                        assert_eq!(
+                            tape.arg2i_at(k),
+                            want,
+                            "arg2i at block {}, i={i}, j={j}",
+                            b.start
+                        );
                     }
                 }
             }
@@ -534,7 +546,6 @@ mod tests {
     }
 }
 
-
 /// Which positions in each block can live in a wasm local rather than in the
 /// scratch buffer: written and read inside one iteration, and invisible from
 /// anywhere else on the tape.
@@ -581,7 +592,9 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
             if !used {
                 continue;
             }
-            let Some((tb, ti, tj)) = owner(t) else { continue };
+            let Some((tb, ti, tj)) = owner(t) else {
+                continue;
+            };
             // A reference from outside the block, or from another iteration of
             // it, needs an address.
             match owner(k) {
