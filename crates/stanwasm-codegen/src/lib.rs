@@ -149,7 +149,8 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     // Constants that move with the loop index live past the adjoints, in block
     // then node order; the caller stages them once.
     let const_base = 2 * n;
-    let (const_table, _) = stage_tables(&blocks, const_base);
+    let slots = Slots::plan(tape, &blocks);
+    let (const_table, _) = stage_tables(&blocks, const_base, &slots);
     let needs = scan_imports(tape);
 
     // ---- type section: 0 = (i32,i32,i32,i32)->f64 (log_prob_grad: params_ptr,
@@ -224,7 +225,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     let mut codes = CodeSection::new();
 
     let _ = n_params;
-    let lpg = build_log_prob_grad(tape, root, n, &math_idx, &blocks, const_base);
+    let lpg = build_log_prob_grad(tape, root, n, &math_idx, &blocks, const_base, &slots);
     codes.function(&lpg);
 
     // ---- assemble ----------------------------------------------------------
@@ -382,7 +383,11 @@ struct NodeTables {
 /// Lay out every re-rolled block's tables in one buffer the caller stages at
 /// `const_base`. Emission and staging must agree on the order, so both come
 /// from here.
-fn stage_tables(blocks: &[reroll::Block], const_base: u32) -> (Vec<f64>, Vec<Vec<NodeTables>>) {
+fn stage_tables(
+    blocks: &[reroll::Block],
+    const_base: u32,
+    slots: &Slots,
+) -> (Vec<f64>, Vec<Vec<NodeTables>>) {
     let mut buf: Vec<f64> = Vec::new();
     let mut maps = Vec::with_capacity(blocks.len());
     let push = |buf: &mut Vec<f64>, vals: &[f64]| {
@@ -397,12 +402,14 @@ fn stage_tables(blocks: &[reroll::Block], const_base: u32) -> (Vec<f64>, Vec<Vec
             if let Some(v) = &b.consts[j] {
                 t.cst = Some(push(&mut buf, v));
             }
+            // A table holds slots, not tape indices: what the emitted load
+            // adds to the scratch pointer.
             if let reroll::ArgRel::Tabled(ix) = &b.args[j].arg1 {
-                let f: Vec<f64> = ix.iter().map(|&i| i as f64).collect();
+                let f: Vec<f64> = ix.iter().map(|&i| slots.at(i) as f64).collect();
                 t.arg1 = Some(push(&mut buf, &f));
             }
             if let reroll::ArgRel::Tabled(ix) = &b.args[j].arg2i {
-                let f: Vec<f64> = ix.iter().map(|&i| i as f64).collect();
+                let f: Vec<f64> = ix.iter().map(|&i| slots.at(i) as f64).collect();
                 t.arg2i = Some(push(&mut buf, &f));
             }
             m.push(t);
@@ -410,6 +417,138 @@ fn stage_tables(blocks: &[reroll::Block], const_base: u32) -> (Vec<f64>, Vec<Vec
         maps.push(m);
     }
     (buf, maps)
+}
+
+/// Where one of a block's operands sits in the scratch buffer: slot
+/// `base + i * stride` at repeat `i`.
+#[derive(Clone, Copy)]
+struct SlotRel {
+    base: u32,
+    stride: u32,
+}
+
+/// One block position's slot relations: the value it writes, and each integer
+/// argument — `None` where the argument is tabled and its address comes from
+/// the table instead.
+struct PosRel {
+    out: SlotRel,
+    arg1: Option<SlotRel>,
+    arg2i: Option<SlotRel>,
+}
+
+/// Which scratch slot each tape node's primal occupies; its adjoint sits `n`
+/// slots above that.
+///
+/// Position-major inside a re-rolled block — repeat `i` of position `j` lands
+/// at `base + j * reps + i` — so consecutive repeats of one value are
+/// adjacent. The tape's own order interleaves a block's positions instead, and
+/// a later block reading a value the earlier one produced then walks by the
+/// producing block's length rather than by one slot.
+///
+/// A block keeps the tape's order when an argument would stop being affine
+/// under the permutation, which the emitter has no form for. That happens to
+/// the accumulator of a vectorised density: its chain starts at a node outside
+/// the block, one the tape order puts exactly one repeat before the first, so
+/// a single stride describes it only by adjacency. Leaving that block alone
+/// still lets the block it reads from be permuted, which is the crossing that
+/// matters.
+struct Slots(Option<Vec<u32>>);
+
+impl Slots {
+    fn at(&self, k: u32) -> u32 {
+        match &self.0 {
+            Some(m) => m[k as usize],
+            None => k,
+        }
+    }
+
+    fn plan(tape: &Tape, blocks: &[reroll::Block]) -> Self {
+        if blocks.is_empty() {
+            return Slots(None);
+        }
+        let mut packed = vec![true; blocks.len()];
+        loop {
+            let slots = Slots(Some(Slots::assign(tape, blocks, &packed)));
+            let bad: Vec<usize> = (0..blocks.len())
+                .filter(|&i| slots.rels(tape, &blocks[i]).is_none())
+                .collect();
+            if bad.is_empty() {
+                return slots;
+            }
+            // Un-permuting a block only moves its slots back towards the
+            // tape's own order, so this settles; a round that changes nothing
+            // means the failure is elsewhere and the tape's order has to do.
+            if !bad.iter().any(|&i| packed[i]) {
+                return Slots(None);
+            }
+            for i in bad {
+                packed[i] = false;
+            }
+        }
+    }
+
+    /// Slots in tape order, except that a permuted block's repeats of one
+    /// position are laid out consecutively.
+    fn assign(tape: &Tape, blocks: &[reroll::Block], packed: &[bool]) -> Vec<u32> {
+        let n = tape.len() as u32;
+        let mut map = vec![0u32; n as usize];
+        let (mut next, mut k, mut bi) = (0u32, 0u32, 0usize);
+        while k < n {
+            match blocks.get(bi) {
+                Some(b) if b.start == k => {
+                    for i in 0..b.reps {
+                        for j in 0..b.len {
+                            map[(b.start + i * b.len + j) as usize] = next
+                                + if packed[bi] {
+                                    j * b.reps + i
+                                } else {
+                                    i * b.len + j
+                                };
+                        }
+                    }
+                    next += b.len * b.reps;
+                    k = b.end();
+                    bi += 1;
+                }
+                _ => {
+                    map[k as usize] = next;
+                    next += 1;
+                    k += 1;
+                }
+            }
+        }
+        map
+    }
+
+    /// `slot(arg0 + i * t)` as an affine function of `i`, or `None` when the
+    /// permutation does not leave it one.
+    fn rel(&self, arg0: u32, t: u32, reps: u32) -> Option<SlotRel> {
+        let base = self.at(arg0);
+        if t == 0 || reps < 2 {
+            return Some(SlotRel { base, stride: 0 });
+        }
+        let stride = self.at(arg0 + t).checked_sub(base)?;
+        (2..reps)
+            .all(|i| self.at(arg0 + i * t) == base + i * stride)
+            .then_some(SlotRel { base, stride })
+    }
+
+    fn rels(&self, tape: &Tape, b: &reroll::Block) -> Option<Vec<PosRel>> {
+        (0..b.len)
+            .map(|j| {
+                let k0 = b.start + j;
+                let arg = |rel: &reroll::ArgRel, arg0: u32| match rel {
+                    reroll::ArgRel::Affine(t) => self.rel(arg0, *t, b.reps).map(Some),
+                    reroll::ArgRel::Tabled(_) => Some(None),
+                };
+                Some(PosRel {
+                    out: self.rel(k0, b.len, b.reps)?,
+                    arg1: arg(&b.args[j as usize].arg1, tape.arg1_at(k0))?,
+                    arg2i: arg(&b.args[j as usize].arg2i, tape.arg2i_at(k0))?,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Per-iteration base pointers for a re-rolled block: one i32 local per
@@ -451,20 +590,21 @@ impl StridePtrs {
     }
 }
 
-/// Every non-zero stride a block's reads and writes use, deduplicated. Any
-/// table walks one f64 per repeat, so reading one needs stride 1.
-fn block_strides(b: &reroll::Block) -> Vec<u32> {
-    let mut out: Vec<u32> = vec![b.len];
+/// Every non-zero slot stride a block's reads and writes use, deduplicated.
+/// Any table walks one f64 per repeat, so reading one needs stride 1.
+fn block_strides(b: &reroll::Block, rels: &[PosRel]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
     let want = |t: u32, out: &mut Vec<u32>| {
         if t != 0 && !out.contains(&t) {
             out.push(t);
         }
     };
-    for j in 0..b.len as usize {
-        for rel in [&b.args[j].arg1, &b.args[j].arg2i] {
+    for (j, r) in rels.iter().enumerate() {
+        want(r.out.stride, &mut out);
+        for rel in [r.arg1, r.arg2i] {
             match rel {
-                reroll::ArgRel::Affine(t) => want(*t, &mut out),
-                reroll::ArgRel::Tabled(_) => want(1, &mut out),
+                Some(sr) => want(sr.stride, &mut out),
+                None => want(1, &mut out),
             }
         }
         if b.consts[j].is_some() {
@@ -494,14 +634,13 @@ fn block_cst(tape: &Tape, b: &reroll::Block, j: u32, tbl: &[NodeTables], sp: &St
 fn block_arg(
     f: &mut Function,
     sp: &StridePtrs,
-    rel: &reroll::ArgRel,
-    base_slot: u32,
+    rel: Option<SlotRel>,
     tbl: Option<u32>,
     tmp: u32,
 ) -> Addr {
     match rel {
-        reroll::ArgRel::Affine(stride) => sp.addr(base_slot, *stride),
-        reroll::ArgRel::Tabled(_) => {
+        Some(sr) => sp.addr(sr.base, sr.stride),
+        None => {
             let at = tbl.expect("a tabled argument has a table");
             // tmp = scratch + table[at + i] * 8
             f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
@@ -518,10 +657,10 @@ fn block_arg(
 
 /// The adjoint address matching a primal one. A gather's adjoint sits `adj`
 /// slots above its primal, which is an immediate on the same base pointer.
-fn adj_of(rel: &reroll::ArgRel, pa: Addr, adj: u32, arg0: u32, sp: &StridePtrs) -> Addr {
+fn adj_of(rel: Option<SlotRel>, pa: Addr, adj: u32, sp: &StridePtrs) -> Addr {
     match (rel, pa) {
-        (reroll::ArgRel::Tabled(_), Addr::Mem { ptr, .. }) => Addr::Mem { ptr, slot: adj },
-        (reroll::ArgRel::Affine(t), _) => sp.addr(adj + arg0, *t),
+        (Some(sr), _) => sp.addr(adj + sr.base, sr.stride),
+        (None, Addr::Mem { ptr, .. }) => Addr::Mem { ptr, slot: adj },
         _ => unreachable!("a tabled argument resolves to a memory address"),
     }
 }
@@ -538,6 +677,7 @@ fn emit_block_forward(
     sp: &StridePtrs,
     bl: &BlockLocals,
     tbl: &[NodeTables],
+    rels: &[PosRel],
     tmp1: u32,
     tmp2: u32,
     locals_only: bool,
@@ -551,16 +691,17 @@ fn emit_block_forward(
         let ar = &b.args[j as usize];
         // Gather addresses are computed before the value is pushed: the store
         // address has to stay on top of the stack.
+        let r = &rels[j as usize];
         let a1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
             Some(t) => bl.prim(t).expect("checked local"),
-            None => block_arg(f, sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1),
+            None => block_arg(f, sp, r.arg1, nt.arg1, tmp1),
         };
         let a2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
             Some(t) => bl.prim(t).expect("checked local"),
-            None => block_arg(f, sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2),
+            None => block_arg(f, sp, r.arg2i, nt.arg2i, tmp2),
         };
         let cst = block_cst(tape, b, j, tbl, sp);
-        let w = bl.prim(j).unwrap_or_else(|| sp.addr(k0, b.len));
+        let w = bl.prim(j).unwrap_or(sp.addr(r.out.base, r.out.stride));
         astore_addr(f, w);
         emit_forward(f, tape, k0, m, a1, a2, cst);
         astore_end(f, w);
@@ -574,6 +715,7 @@ fn build_log_prob_grad(
     m: &MathImportIndex,
     blocks: &[reroll::Block],
     const_base: u32,
+    slots: &Slots,
 ) -> Function {
     // 4 i32 params at local indices 0..4: params_ptr, grads_ptr, n_params
     // (unused — the recorded tape already encodes it), scratch_ptr.
@@ -592,9 +734,14 @@ fn build_log_prob_grad(
         Layout::Locals { .. } => lay.local_count(2 * n),
         Layout::Memory => 2 * widest_locals,
     };
+    let block_rels: Vec<Vec<PosRel>> = blocks
+        .iter()
+        .map(|b| slots.rels(tape, b).expect("checked by the plan"))
+        .collect();
     let widest = blocks
         .iter()
-        .map(|b| block_strides(b).len() as u32)
+        .zip(&block_rels)
+        .map(|(b, r)| block_strides(b, r).len() as u32)
         .max()
         .unwrap_or(0);
     // One induction variable, reused by every block, then the base pointers,
@@ -632,19 +779,19 @@ fn build_log_prob_grad(
         f.instruction(&Instruction::MemoryFill(0));
     }
 
-    let (_, tables) = stage_tables(blocks, const_base);
+    let (_, tables) = stage_tables(blocks, const_base, slots);
 
     let straight_fwd = |f: &mut Function, k: u32| {
-        let a1 = lay.at(tape.arg1_at(k));
-        let a2 = lay.at(tape.arg2i_at(k));
+        let a1 = lay.at(slots.at(tape.arg1_at(k)));
+        let a2 = lay.at(slots.at(tape.arg2i_at(k)));
         let cst = Cst::Imm(if tape.op_at(k) == Op::Leaf {
             tape.value(k)
         } else {
             tape.arg2f_at(k)
         });
-        astore_addr(f, lay.at(k));
+        astore_addr(f, lay.at(slots.at(k)));
         emit_forward(f, tape, k, m, a1, a2, cst);
-        astore_end(f, lay.at(k));
+        astore_end(f, lay.at(slots.at(k)));
     };
 
     // ---- forward pass ------------------------------------------------------
@@ -655,7 +802,7 @@ fn build_log_prob_grad(
             let b = &blocks[bi];
             let sp = StridePtrs {
                 iv,
-                strides: block_strides(b),
+                strides: block_strides(b, &block_rels[bi]),
                 first_local: iv + 1,
             };
             let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
@@ -663,7 +810,19 @@ fn build_log_prob_grad(
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
-            emit_block_forward(&mut f, tape, m, b, &sp, &bl, &tables[bi], tmp1, tmp2, false);
+            emit_block_forward(
+                &mut f,
+                tape,
+                m,
+                b,
+                &sp,
+                &bl,
+                &tables[bi],
+                &block_rels[bi],
+                tmp1,
+                tmp2,
+                false,
+            );
             f.instruction(&Instruction::LocalGet(iv));
             f.instruction(&Instruction::I32Const(1));
             f.instruction(&Instruction::I32Add);
@@ -681,9 +840,9 @@ fn build_log_prob_grad(
     }
 
     // ---- initialize root adjoint = 1.0 ------------------------------------
-    astore_addr(&mut f, lay.at(adj + root));
+    astore_addr(&mut f, lay.at(adj + slots.at(root)));
     f.instruction(&Instruction::F64Const(1.0.into()));
-    astore_end(&mut f, lay.at(adj + root));
+    astore_end(&mut f, lay.at(adj + slots.at(root)));
 
     // ---- backward pass (reverse order) ------------------------------------
     let mut k = n;
@@ -694,7 +853,7 @@ fn build_log_prob_grad(
             let b = &blocks[bi];
             let sp = StridePtrs {
                 iv,
-                strides: block_strides(b),
+                strides: block_strides(b, &block_rels[bi]),
                 first_local: iv + 1,
             };
             let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
@@ -705,7 +864,19 @@ fn build_log_prob_grad(
             // Forward left iteration-local values in locals, which do not
             // survive to here: recompute this iteration's, then clear the
             // adjoints they accumulate into.
-            emit_block_forward(&mut f, tape, m, b, &sp, &bl, &tables[bi], tmp1, tmp2, true);
+            emit_block_forward(
+                &mut f,
+                tape,
+                m,
+                b,
+                &sp,
+                &bl,
+                &tables[bi],
+                &block_rels[bi],
+                tmp1,
+                tmp2,
+                true,
+            );
             for j in 0..b.len {
                 if let Some(a) = bl.adj(j) {
                     astore_addr(&mut f, a);
@@ -717,34 +888,37 @@ fn build_log_prob_grad(
                 let k0 = b.start + j;
                 let nt = tables[bi][j as usize];
                 let ar = &b.args[j as usize];
+                let r = &block_rels[bi][j as usize];
                 let pa1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
                     Some(t) => bl.prim(t).expect("checked local"),
-                    None => block_arg(&mut f, &sp, &ar.arg1, tape.arg1_at(k0), nt.arg1, tmp1),
+                    None => block_arg(&mut f, &sp, r.arg1, nt.arg1, tmp1),
                 };
                 let pa2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
                     Some(t) => bl.prim(t).expect("checked local"),
-                    None => block_arg(&mut f, &sp, &ar.arg2i, tape.arg2i_at(k0), nt.arg2i, tmp2),
+                    None => block_arg(&mut f, &sp, r.arg2i, nt.arg2i, tmp2),
                 };
                 let da1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
                     Some(t) => bl.adj(t).expect("checked local"),
-                    None => adj_of(&ar.arg1, pa1, adj, tape.arg1_at(k0), &sp),
+                    None => adj_of(r.arg1, pa1, adj, &sp),
                 };
                 let da2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
                     Some(t) => bl.adj(t).expect("checked local"),
-                    None => adj_of(&ar.arg2i, pa2, adj, tape.arg2i_at(k0), &sp),
+                    None => adj_of(r.arg2i, pa2, adj, &sp),
                 };
+                let pout = sp.addr(r.out.base, r.out.stride);
+                let dout = sp.addr(adj + r.out.base, r.out.stride);
                 emit_backward(
                     &mut f,
                     tape,
                     k0,
                     m,
                     Back {
-                        dk: bl.adj(j).unwrap_or_else(|| sp.addr(adj + k0, b.len)),
+                        dk: bl.adj(j).unwrap_or(dout),
                         da1,
                         da2,
                         pa1,
                         pa2,
-                        pk: bl.prim(j).unwrap_or_else(|| sp.addr(k0, b.len)),
+                        pk: bl.prim(j).unwrap_or(pout),
                         cst: block_cst(tape, b, j, &tables[bi], &sp),
                     },
                 );
@@ -766,12 +940,12 @@ fn build_log_prob_grad(
                 k,
                 m,
                 Back {
-                    dk: lay.at(adj + k),
-                    da1: lay.at(adj + tape.arg1_at(k)),
-                    da2: lay.at(adj + tape.arg2i_at(k)),
-                    pa1: lay.at(tape.arg1_at(k)),
-                    pa2: lay.at(tape.arg2i_at(k)),
-                    pk: lay.at(k),
+                    dk: lay.at(adj + slots.at(k)),
+                    da1: lay.at(adj + slots.at(tape.arg1_at(k))),
+                    da2: lay.at(adj + slots.at(tape.arg2i_at(k))),
+                    pa1: lay.at(slots.at(tape.arg1_at(k))),
+                    pa2: lay.at(slots.at(tape.arg2i_at(k))),
+                    pk: lay.at(slots.at(k)),
                     cst: Cst::Imm(tape.arg2f_at(k)),
                 },
             );
@@ -785,7 +959,7 @@ fn build_log_prob_grad(
         f.instruction(&Instruction::LocalGet(GRADS_PTR));
         f.instruction(&Instruction::I32Const((pi * 8) as i32));
         f.instruction(&Instruction::I32Add);
-        aload(&mut f, lay.at(adj + pi));
+        aload(&mut f, lay.at(adj + slots.at(pi)));
         f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
             offset: 0,
             align: 3,
@@ -794,7 +968,7 @@ fn build_log_prob_grad(
     }
 
     // ---- return log_prob ---------------------------------------------------
-    aload(&mut f, lay.at(root));
+    aload(&mut f, lay.at(slots.at(root)));
     f.instruction(&Instruction::End);
     f
 }

@@ -407,6 +407,72 @@ model {
     }
 }
 
+/// A matrix-vector product: the mean is one re-rolled block and the density
+/// is another, so every row's mean is written by the first and read back by
+/// the second. That crossing is the only place the scratch buffer's slot
+/// order is observable, and it has to give the same gradient either way.
+#[test]
+fn rerolled_matrix_product_matches_oracle() {
+    const N: usize = 1200;
+    const K: usize = 4;
+    let src = r#"data { int<lower=0> N; int<lower=0> K; matrix[N,K] X; vector[N] y; }
+parameters { vector[K] beta; real<lower=0> sigma; }
+model {
+  beta ~ normal(0, 1); sigma ~ exponential(1);
+  y ~ normal(X * beta, sigma);
+}"#;
+    let mut seed: u64 = 6789;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
+        seed as f64 / 4294967296.0 * 2.0 - 1.0
+    };
+    let rows: Vec<String> = (0..N)
+        .map(|_| {
+            let cells: Vec<String> = (0..K).map(|_| format!("{}", rnd())).collect();
+            format!("[{}]", cells.join(","))
+        })
+        .collect();
+    let ys: Vec<String> = (0..N).map(|_| format!("{}", rnd())).collect();
+    let data_json = format!(
+        "{{\"N\": {N}, \"K\": {K}, \"X\": [{}], \"y\": [{}]}}",
+        rows.join(","),
+        ys.join(",")
+    );
+    let model =
+        Model::parse_and_load(src, stanwasm_runtime::data_from_json(&data_json).unwrap()).unwrap();
+
+    let compiled = compile(&model, &vec![0.1; model.n_params()]).unwrap();
+    assert!(
+        !compiled.const_table.is_empty(),
+        "expected re-rolled loops with staged tables"
+    );
+
+    for test_params in [
+        vec![0.5, -0.3, 0.8, 0.1, -0.5],
+        vec![-1.2, 0.4, 0.0, 0.9, 0.25],
+    ] {
+        let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
+        let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+            &compiled.wasm,
+            compiled.n_params,
+            &test_params,
+            compiled.scratch_len,
+            &compiled.const_table,
+        );
+        assert!(
+            close(oracle_lp, aot_lp, 1e-10),
+            "lp: oracle={oracle_lp}, aot={aot_lp}"
+        );
+        for (i, (o, a)) in oracle_grads.iter().zip(aot_grads.iter()).enumerate() {
+            assert!(
+                close(*o, *a, 1e-10),
+                "grad[{i}]: oracle={o}, aot={a}, diff={}",
+                o - a
+            );
+        }
+    }
+}
+
 /// Every re-roll mode has to compute the same gradient. `Always` and `Never`
 /// exercise the loop and straight-line emitters on the same trace, which is
 /// the only place their outputs can be compared directly.
