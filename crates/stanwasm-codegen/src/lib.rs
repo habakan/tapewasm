@@ -909,12 +909,9 @@ fn lane_wise(op: Op) -> bool {
 /// Two lanes have to be one `v128` apart, which means every slot a repeat
 /// touches moves by one or not at all; a value carried from the previous
 /// repeat would need the lanes to run in sequence, and a gather would need
-/// each lane addressed separately. Positions kept in wasm locals are excluded
-/// for now — widening those needs a second local pool.
-fn widenable(tape: &Tape, b: &reroll::Block, rels: &[PosRel], flags: &[bool]) -> bool {
-    if !b.reps.is_multiple_of(2) || flags.iter().any(|keep| *keep) {
-        return false;
-    }
+/// each lane addressed separately. An odd repeat count is fine — the last one
+/// runs on its own afterwards.
+fn widenable(tape: &Tape, b: &reroll::Block, rels: &[PosRel]) -> bool {
     (0..b.len).all(|j| {
         let k0 = b.start + j;
         let r = &rels[j as usize];
@@ -982,129 +979,181 @@ fn priv_targets(tape: &Tape, b: &reroll::Block, rels: &[PosRel], adj: u32) -> Ve
     out
 }
 
-/// One widened pass over a block body, forward or backward: two repeats per
-/// iteration, every value a lane pair.
+/// One widened forward pass over a block body: two repeats per iteration,
+/// every value a lane pair. `locals_only` limits it to the positions kept in
+/// locals, which the backward pass has to reconstruct.
 #[allow(clippy::too_many_arguments)]
-fn emit_wide_body(
+fn emit_wide_forward(
     f: &mut Function,
     tape: &Tape,
     b: &reroll::Block,
     sp: &StridePtrs,
+    bl: &BlockLocals,
     tbl: &[NodeTables],
     rels: &[PosRel],
-    adj: u32,
-    privs: &[(u32, u32)],
-    forward: bool,
+    locals_only: bool,
 ) {
-    let order: Vec<u32> = if forward {
-        (0..b.len).collect()
-    } else {
-        (0..b.len).rev().collect()
-    };
-    for j in order {
+    for j in 0..b.len {
+        if locals_only && bl.prim(j).is_none() {
+            continue;
+        }
         let k0 = b.start + j;
         let r = &rels[j as usize];
-        let out = wide_addr(r.out, sp, 0);
-        let dout = wide_addr(r.out, sp, adj);
+        let ar = &b.args[j as usize];
+        let out = bl.prim(j).unwrap_or(wide_addr(r.out, sp, 0));
         let cst = block_cst(tape, b, j, tbl, sp);
 
         if tape.op_at(k0) == Op::DotC {
             let at = tbl[j as usize].dot.expect("staged");
-            let col = |c: usize| sp.addr(at + c as u32 * b.reps, 1);
             let e = tape.extent_at(k0);
-            if forward {
-                wstore_addr(f, out);
-                for c in 0..e.len as usize {
-                    wload(f, wide_addr(r.elems[c], sp, 0));
-                    wload(f, col(c));
-                    f.instruction(&Instruction::F64x2Mul);
-                    if c > 0 {
-                        f.instruction(&Instruction::F64x2Add);
-                    }
-                }
-                wstore_end(f, out);
-            } else {
-                for c in 0..e.len as usize {
-                    let da = wide_adj(r.elems[c], sp, adj, privs);
-                    wadj(f, da, false, |f| {
-                        wload(f, dout);
-                        wload(f, col(c));
-                        f.instruction(&Instruction::F64x2Mul);
-                    });
-                }
-            }
-            continue;
-        }
-
-        let (s1, s2) = (r.arg1.expect("checked"), r.arg2i.expect("checked"));
-        let (pa1, pa2) = (wide_addr(s1, sp, 0), wide_addr(s2, sp, 0));
-        let op = tape.op_at(k0);
-        if forward {
             wstore_addr(f, out);
-            match op {
-                Op::Add | Op::Sub | Op::Mul | Op::Div => {
-                    wload(f, pa1);
-                    wload(f, pa2);
-                }
-                Op::RsubC | Op::RdivC => {
-                    wcload(f, cst);
-                    wload(f, pa1);
-                }
-                Op::Neg => wload(f, pa1),
-                _ => {
-                    wload(f, pa1);
-                    wcload(f, cst);
+            for c in 0..e.len as usize {
+                wload(f, wide_addr(r.elems[c], sp, 0));
+                wload(f, sp.addr(at + c as u32 * b.reps, 1));
+                f.instruction(&Instruction::F64x2Mul);
+                if c > 0 {
+                    f.instruction(&Instruction::F64x2Add);
                 }
             }
-            f.instruction(&match op {
-                Op::Add | Op::AddC => Instruction::F64x2Add,
-                Op::Sub | Op::SubC | Op::RsubC => Instruction::F64x2Sub,
-                Op::Mul | Op::MulC => Instruction::F64x2Mul,
-                Op::Div | Op::DivC | Op::RdivC => Instruction::F64x2Div,
-                Op::Neg => Instruction::F64x2Neg,
-                _ => unreachable!("checked by `lane_wise`"),
-            });
             wstore_end(f, out);
             continue;
         }
 
-        // Only the arguments the opcode actually reads get resolved: an unused
-        // `arg2i` holds a stale index, and a lane pair was never set aside for
-        // whatever slot that lands on.
-        let da1 = wide_adj(s1, sp, adj, privs);
+        let pa1 = wide_arg(bl, b, &ar.arg1, tape.arg1_at(k0), r.arg1, sp, 0);
+        let pa2 = wide_arg(bl, b, &ar.arg2i, tape.arg2i_at(k0), r.arg2i, sp, 0);
+        let op = tape.op_at(k0);
+        wstore_addr(f, out);
+        match op {
+            Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                wload(f, pa1);
+                wload(f, pa2);
+            }
+            Op::RsubC | Op::RdivC => {
+                wcload(f, cst);
+                wload(f, pa1);
+            }
+            Op::Neg => wload(f, pa1),
+            _ => {
+                wload(f, pa1);
+                wcload(f, cst);
+            }
+        }
+        f.instruction(&match op {
+            Op::Add | Op::AddC => Instruction::F64x2Add,
+            Op::Sub | Op::SubC | Op::RsubC => Instruction::F64x2Sub,
+            Op::Mul | Op::MulC => Instruction::F64x2Mul,
+            Op::Div | Op::DivC | Op::RdivC => Instruction::F64x2Div,
+            Op::Neg => Instruction::F64x2Neg,
+            _ => unreachable!("checked by `lane_wise`"),
+        });
+        wstore_end(f, out);
+    }
+}
+
+/// The address a widened body reads an argument from: a lane pair it kept in a
+/// local when the value is this iteration's, and a slot pair or a broadcast
+/// otherwise.
+fn wide_arg(
+    bl: &BlockLocals,
+    b: &reroll::Block,
+    rel: &reroll::ArgRel,
+    arg0: u32,
+    sr: Option<SlotRel>,
+    sp: &StridePtrs,
+    off: u32,
+) -> Addr {
+    match bl.arg(b, rel, arg0) {
+        Some(t) if off == 0 => bl.prim(t).expect("checked local"),
+        Some(t) => bl.adj(t).expect("checked local"),
+        None => wide_addr(sr.expect("checked by `widenable`"), sp, off),
+    }
+}
+
+/// One widened backward pass: recompute the lane pairs the forward loop kept
+/// in locals, clear the adjoints they accumulate into, then one step per node
+/// in reverse.
+#[allow(clippy::too_many_arguments)]
+fn emit_wide_backward(
+    f: &mut Function,
+    tape: &Tape,
+    b: &reroll::Block,
+    sp: &StridePtrs,
+    bl: &BlockLocals,
+    tbl: &[NodeTables],
+    rels: &[PosRel],
+    adj: u32,
+    privs: &[(u32, u32)],
+) {
+    emit_wide_forward(f, tape, b, sp, bl, tbl, rels, true);
+    for j in 0..b.len {
+        if let Some(a) = bl.adj(j) {
+            wstore_addr(f, a);
+            f.instruction(&Instruction::V128Const(0));
+            wstore_end(f, a);
+        }
+    }
+    for j in (0..b.len).rev() {
+        let k0 = b.start + j;
+        let r = &rels[j as usize];
+        let ar = &b.args[j as usize];
+        let dout = bl.adj(j).unwrap_or(wide_addr(r.out, sp, adj));
+        let cst = block_cst(tape, b, j, tbl, sp);
+
+        if tape.op_at(k0) == Op::DotC {
+            let at = tbl[j as usize].dot.expect("staged");
+            let e = tape.extent_at(k0);
+            for c in 0..e.len as usize {
+                let da = wide_adj(r.elems[c], sp, adj, privs);
+                wadj(f, da, false, |f| {
+                    wload(f, dout);
+                    wload(f, sp.addr(at + c as u32 * b.reps, 1));
+                    f.instruction(&Instruction::F64x2Mul);
+                });
+            }
+            continue;
+        }
+
+        let pa1 = wide_arg(bl, b, &ar.arg1, tape.arg1_at(k0), r.arg1, sp, 0);
+        let pa2 = wide_arg(bl, b, &ar.arg2i, tape.arg2i_at(k0), r.arg2i, sp, 0);
+        // Only the arguments the opcode actually reads get an adjoint: an
+        // unused `arg2i` holds a stale index, and no lane pair was set aside
+        // for whatever slot that lands on.
+        let da1 = wide_darg(bl, b, &ar.arg1, tape.arg1_at(k0), r.arg1, sp, adj, privs);
+        let op = tape.op_at(k0);
         let pass = |f: &mut Function| wload(f, dout);
+        let da2 = |sp: &StridePtrs| {
+            wide_darg(bl, b, &ar.arg2i, tape.arg2i_at(k0), r.arg2i, sp, adj, privs)
+        };
         match op {
             Op::Add => {
-                let da2 = wide_adj(s2, sp, adj, privs);
                 wadj(f, da1, false, pass);
-                wadj(f, da2, false, pass);
+                wadj(f, da2(sp), false, pass);
             }
             Op::Sub => {
-                let da2 = wide_adj(s2, sp, adj, privs);
                 wadj(f, da1, false, pass);
-                wadj(f, da2, true, pass);
+                wadj(f, da2(sp), true, pass);
             }
             Op::Mul => {
-                let da2 = wide_adj(s2, sp, adj, privs);
+                let d2 = da2(sp);
                 wadj(f, da1, false, |f| {
                     wload(f, dout);
                     wload(f, pa2);
                     f.instruction(&Instruction::F64x2Mul);
                 });
-                wadj(f, da2, false, |f| {
+                wadj(f, d2, false, |f| {
                     wload(f, dout);
                     wload(f, pa1);
                     f.instruction(&Instruction::F64x2Mul);
                 });
             }
             Op::Div => {
-                let da2 = wide_adj(s2, sp, adj, privs);
+                let d2 = da2(sp);
                 wadj(f, da1, false, |f| {
                     wload(f, dout);
                     wload(f, pa2);
                     f.instruction(&Instruction::F64x2Div);
                 });
-                wadj(f, da2, true, |f| {
+                wadj(f, d2, true, |f| {
                     wload(f, dout);
                     wload(f, pa1);
                     f.instruction(&Instruction::F64x2Mul);
@@ -1137,6 +1186,24 @@ fn emit_wide_body(
             }),
             _ => unreachable!("checked by `lane_wise`"),
         }
+    }
+}
+
+/// The adjoint matching [`wide_arg`].
+#[allow(clippy::too_many_arguments)]
+fn wide_darg(
+    bl: &BlockLocals,
+    b: &reroll::Block,
+    rel: &reroll::ArgRel,
+    arg0: u32,
+    sr: Option<SlotRel>,
+    sp: &StridePtrs,
+    adj: u32,
+    privs: &[(u32, u32)],
+) -> Addr {
+    match bl.arg(b, rel, arg0) {
+        Some(t) => bl.adj(t).expect("checked local"),
+        None => wide_adj(sr.expect("checked by `widenable`"), sp, adj, privs),
     }
 }
 
@@ -1346,8 +1413,12 @@ fn build_log_prob_grad(
     let wide: Vec<bool> = blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| widenable(tape, b, &block_rels[i], &block_local[i]))
+        .map(|(i, b)| widenable(tape, b, &block_rels[i]))
         .collect();
+    // The v128 pool holds a widened block's iteration-local lane pairs first,
+    // laid out like the f64 pool, then its loop-invariant adjoints.
+    let any_wide = wide.iter().any(|w| *w);
+    let wide_locals = if any_wide { widest_locals } else { 0 };
     let v128_base = i32_base + i32_locals;
     let privs: Vec<Vec<(u32, u32)>> = blocks
         .iter()
@@ -1359,11 +1430,11 @@ fn build_log_prob_grad(
             priv_targets(tape, b, &block_rels[i], adj)
                 .into_iter()
                 .enumerate()
-                .map(|(n, slot)| (slot, v128_base + n as u32))
+                .map(|(n, slot)| (slot, v128_base + 2 * wide_locals + n as u32))
                 .collect()
         })
         .collect();
-    let v128_locals = privs.iter().map(|p| p.len() as u32).max().unwrap_or(0);
+    let v128_locals = 2 * wide_locals + privs.iter().map(|p| p.len() as u32).max().unwrap_or(0);
 
     let mut decl: Vec<(u32, ValType)> = Vec::new();
     if f64_locals > 0 {
@@ -1428,23 +1499,25 @@ fn build_log_prob_grad(
                 strides: block_strides(b, &block_rels[bi]),
                 first_local: iv + 1,
             };
-            let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
+            let base = if wide[bi] { v128_base } else { locals_base };
+            let bl = block_locals_of(&block_local[bi], b.len, base, widest_locals);
+            let tail = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
             let step = if wide[bi] { 2 } else { 1 };
+            let paired = b.reps - if wide[bi] { b.reps % 2 } else { 0 };
             f.instruction(&Instruction::I32Const(0));
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
             if wide[bi] {
-                emit_wide_body(
+                emit_wide_forward(
                     &mut f,
                     tape,
                     b,
                     &sp,
+                    &bl,
                     &tables[bi],
                     &block_rels[bi],
-                    adj,
-                    &privs[bi],
-                    true,
+                    false,
                 );
             } else {
                 emit_block_forward(
@@ -1465,10 +1538,28 @@ fn build_log_prob_grad(
             f.instruction(&Instruction::I32Const(step));
             f.instruction(&Instruction::I32Add);
             f.instruction(&Instruction::LocalTee(iv));
-            f.instruction(&Instruction::I32Const(b.reps as i32));
+            f.instruction(&Instruction::I32Const(paired as i32));
             f.instruction(&Instruction::I32LtU);
             f.instruction(&Instruction::BrIf(0));
             f.instruction(&Instruction::End);
+            if paired != b.reps {
+                f.instruction(&Instruction::I32Const(b.reps as i32 - 1));
+                f.instruction(&Instruction::LocalSet(iv));
+                sp.emit_setup(&mut f);
+                emit_block_forward(
+                    &mut f,
+                    tape,
+                    m,
+                    b,
+                    &sp,
+                    &tail,
+                    &tables[bi],
+                    &block_rels[bi],
+                    tmp1,
+                    tmp2,
+                    false,
+                );
+            }
             k = b.end();
             bi += 1;
         } else {
@@ -1494,29 +1585,50 @@ fn build_log_prob_grad(
                 strides: block_strides(b, &block_rels[bi]),
                 first_local: iv + 1,
             };
-            let bl = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
+            let base = if wide[bi] { v128_base } else { locals_base };
+            let bl = block_locals_of(&block_local[bi], b.len, base, widest_locals);
             let step: i32 = if wide[bi] { 2 } else { 1 };
+            let paired = b.reps - if wide[bi] { b.reps % 2 } else { 0 };
+            if paired != b.reps {
+                let tail = block_locals_of(&block_local[bi], b.len, locals_base, widest_locals);
+                f.instruction(&Instruction::I32Const(b.reps as i32 - 1));
+                f.instruction(&Instruction::LocalSet(iv));
+                sp.emit_setup(&mut f);
+                emit_block_backward(
+                    &mut f,
+                    tape,
+                    m,
+                    b,
+                    &sp,
+                    &tail,
+                    &tables[bi],
+                    &block_rels[bi],
+                    adj,
+                    tmp1,
+                    tmp2,
+                );
+            }
             if wide[bi] {
                 for (_, local) in &privs[bi] {
                     f.instruction(&Instruction::V128Const(0));
                     f.instruction(&Instruction::LocalSet(*local));
                 }
             }
-            f.instruction(&Instruction::I32Const(b.reps as i32 - step));
+            f.instruction(&Instruction::I32Const(paired as i32 - step));
             f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
             sp.emit_setup(&mut f);
             if wide[bi] {
-                emit_wide_body(
+                emit_wide_backward(
                     &mut f,
                     tape,
                     b,
                     &sp,
+                    &bl,
                     &tables[bi],
                     &block_rels[bi],
                     adj,
                     &privs[bi],
-                    false,
                 );
                 f.instruction(&Instruction::LocalGet(iv));
                 f.instruction(&Instruction::I32Const(step));
