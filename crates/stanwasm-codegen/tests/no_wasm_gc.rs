@@ -1,9 +1,12 @@
-//! Confirms the AOT model wasm we emit (and, when run directly, the
-//! stanwasm wasm bundle) do NOT use any wasm-gc opcodes — i.e. they
-//! pass `wasmparser` validation with the `GC` feature explicitly disabled.
+//! Opcodes the shipped artifacts deliberately do not use, pinned by validating
+//! them with that feature switched off in `wasmparser`.
 //!
-//! This pins a deliberate choice: the artifacts we ship are plain wasm32
-//! (linear memory + manual heap), not wasm-gc — see ARCHITECTURE.md for why.
+//! wasm-gc, because what we ship is plain wasm32 — linear memory and a manual
+//! heap; see ARCHITECTURE.md. And relaxed SIMD, which WebKit rejects: nuts-rs
+//! reaches it through pulp, and the `[patch.crates-io]` in the workspace
+//! manifest is there to keep it out. That patch does not travel into a
+//! published crate, so this is the check that says whether it can be dropped —
+//! as of nuts-rs 0.18.3 and pulp 0.22.3, it still cannot.
 
 use stanwasm_codegen::compile;
 use stanwasm_runtime::{Env, Model};
@@ -40,15 +43,33 @@ model {
     validates_without_gc(&compiled.wasm).expect("AOT wasm must not use GC opcodes");
 }
 
-#[test]
-fn host_wasm_uses_no_wasm_gc() {
-    // Read the most recently-built stanwasm artifact, if it exists.
+/// The most recently built bundle, if there is one.
+fn host_wasm() -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/wasm32-unknown-unknown/release/stanwasm.wasm");
     if !path.exists() {
         eprintln!("skipping: build with `cargo build -p stanwasm --target wasm32-unknown-unknown --release` first");
-        return;
+        return None;
     }
-    let bytes = std::fs::read(&path).unwrap();
+    Some(std::fs::read(&path).unwrap())
+}
+
+#[test]
+fn host_wasm_uses_no_wasm_gc() {
+    let Some(bytes) = host_wasm() else { return };
     validates_without_gc(&bytes).expect("stanwasm wasm must not use GC opcodes");
+}
+
+/// Safari refuses a module carrying relaxed SIMD. The emitter's own `f64x2` is
+/// fixed-width and stays enabled here; what this rules out is the relaxed set
+/// that nuts-rs pulls in through pulp.
+#[test]
+fn host_wasm_uses_no_relaxed_simd() {
+    let Some(bytes) = host_wasm() else { return };
+    let no_relaxed = WasmFeatures::default() - WasmFeatures::RELAXED_SIMD;
+    Validator::new_with_features(no_relaxed)
+        .validate_all(&bytes)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+        .expect("stanwasm wasm must not use relaxed SIMD opcodes");
 }
