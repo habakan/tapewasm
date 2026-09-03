@@ -195,6 +195,50 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
     Some((reps, args, consts))
 }
 
+/// How many of a block's positions read a value the previous repeat wrote.
+/// Each one needs an address rather than a wasm local, so a block that starts
+/// mid-statement pays for every value straddling the boundary it chose.
+fn carried(tape: &Tape, start: u32, len: u32) -> u32 {
+    let mut n = 0;
+    for j in 0..len {
+        let k = start + j;
+        let (u1, u2, _) = uses(tape.op_at(k));
+        for (used, a) in [(u1, tape.arg1_at(k)), (u2, tape.arg2i_at(k))] {
+            if used && a < start && a + len >= start {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Slide a block forward to the boundary that leaves the fewest values
+/// straddling it. Greedy detection takes the first offset where the opcodes
+/// repeat, which can be mid-statement when a preceding node happens to match.
+fn rotate(tape: &Tape, b: &Block) -> Option<Block> {
+    let base = carried(tape, b.start, b.len);
+    if base == 0 {
+        return None;
+    }
+    let r = (1..b.len).min_by_key(|&r| carried(tape, b.start + r, b.len))?;
+    if carried(tape, b.start + r, b.len) >= base {
+        return None;
+    }
+    let (reps, args, consts) = probe(tape, b.start + r, b.len)?;
+    // The nodes left in front stay straight-line; giving up more than one
+    // repeat's worth of coverage is not a trade worth making.
+    if reps < MIN_REPS || (reps + 1) * b.len < b.reps * b.len {
+        return None;
+    }
+    Some(Block {
+        start: b.start + r,
+        len: b.len,
+        reps,
+        args,
+        consts,
+    })
+}
+
 /// Partition the tape into re-rollable runs, in tape order and non-overlapping.
 /// Nodes not covered by any block stay straight-line.
 pub fn detect(tape: &Tape) -> Vec<Block> {
@@ -229,6 +273,7 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
         }
         match best {
             Some(b) => {
+                let b = rotate(tape, &b).unwrap_or(b);
                 k = b.end();
                 out.push(b);
             }
@@ -262,6 +307,41 @@ model {
         let model = Model::parse_and_load(src, data_from_json(&data).unwrap()).unwrap();
         let mut tape = Tape::new();
         let leaves: Vec<u32> = [0.1, 0.9, 0.2].iter().map(|p| tape.new_var(*p)).collect();
+        let root = model.trace_forward(&mut tape, &leaves, true).unwrap();
+        (tape, root)
+    }
+
+    /// `y ~ normal(X * beta, sigma)`: the mean is a run of `2K` nodes per row,
+    /// preceded by a prologue whose last node has the same opcode as the row's.
+    pub fn matrix_tape(n: usize, k: usize) -> (Tape, u32) {
+        use stanwasm_runtime::{data_from_json, Model};
+        let src = r#"data { int<lower=0> N; int<lower=0> K; matrix[N,K] X; vector[N] y; }
+parameters { vector[K] beta; real<lower=0> sigma; }
+model {
+  beta ~ normal(0, 1); sigma ~ exponential(1);
+  y ~ normal(X * beta, sigma);
+}"#;
+        let mut seed: u64 = 12345;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223) & 0xffff_ffff;
+            seed as f64 / 4294967296.0 * 2.0 - 1.0
+        };
+        let rows: Vec<String> = (0..n)
+            .map(|_| {
+                let cells: Vec<String> = (0..k).map(|_| format!("{}", rnd())).collect();
+                format!("[{}]", cells.join(","))
+            })
+            .collect();
+        let ys: Vec<String> = (0..n).map(|_| format!("{}", rnd())).collect();
+        let data = format!(
+            "{{\"N\": {n}, \"K\": {k}, \"X\": [{}], \"y\": [{}]}}",
+            rows.join(","),
+            ys.join(",")
+        );
+        let model = Model::parse_and_load(src, data_from_json(&data).unwrap()).unwrap();
+        let mut tape = Tape::new();
+        let init: Vec<f64> = (0..k).map(|_| 0.1).chain([-0.5]).collect();
+        let leaves: Vec<u32> = init.iter().map(|p| tape.new_var(*p)).collect();
         let root = model.trace_forward(&mut tape, &leaves, true).unwrap();
         (tape, root)
     }
@@ -301,6 +381,7 @@ model {
 mod tests {
     use super::tests_support::gather_tape;
     use super::tests_support::linreg_tape;
+    use super::tests_support::matrix_tape;
     use super::*;
 
     #[test]
@@ -426,6 +507,27 @@ mod tests {
             .filter(|a| a.arg1.is_tabled() || a.arg2i.is_tabled())
             .count();
         assert!(tabled > 0, "the gather was not tabled");
+    }
+
+    /// Greedy detection takes the first offset where the opcodes repeat, and a
+    /// prologue node can share the row's last opcode. Starting there splits the
+    /// row, and every value straddling the split needs an address.
+    #[test]
+    fn a_block_starts_on_its_statement_boundary() {
+        let (tape, root) = matrix_tape(200, 4);
+        let blocks = detect(&tape);
+        let flags = local_positions(&tape, &blocks, root);
+        let (i, b) = blocks
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.len == 8)
+            .expect("no matrix-product block");
+        assert_eq!(tape.op_at(b.start), Op::MulC, "block starts mid-row");
+        assert_eq!(
+            flags[i].iter().filter(|f| **f).count(),
+            b.len as usize - 1,
+            "only the row's result should need an address"
+        );
     }
 
     #[test]
