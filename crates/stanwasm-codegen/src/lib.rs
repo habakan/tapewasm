@@ -1090,6 +1090,82 @@ fn emit_block_forward(
     }
 }
 
+/// One backward pass over a block body: recompute the iteration-local primals
+/// the forward loop left in locals, clear the adjoints they accumulate into,
+/// then one step per node in reverse.
+#[allow(clippy::too_many_arguments)]
+fn emit_block_backward(
+    f: &mut Function,
+    tape: &Tape,
+    m: &MathImportIndex,
+    b: &reroll::Block,
+    sp: &StridePtrs,
+    bl: &BlockLocals,
+    tbl: &[NodeTables],
+    rels: &[PosRel],
+    adj: u32,
+    tmp1: u32,
+    tmp2: u32,
+) {
+    // Forward left iteration-local values in locals, which do not
+    // survive to here: recompute this iteration's, then clear the
+    // adjoints they accumulate into.
+    emit_block_forward(f, tape, m, b, sp, bl, tbl, rels, tmp1, tmp2, true);
+    for j in 0..b.len {
+        if let Some(a) = bl.adj(j) {
+            astore_addr(f, a);
+            f.instruction(&Instruction::F64Const(0.0.into()));
+            astore_end(f, a);
+        }
+    }
+    for j in (0..b.len).rev() {
+        let k0 = b.start + j;
+        let nt = tbl[j as usize];
+        let ar = &b.args[j as usize];
+        let r = &rels[j as usize];
+        if tape.op_at(k0) == Op::DotC {
+            let at = nt.dot.expect("staged");
+            let ops = block_dot_ops(tape, k0, r, b.reps, at, sp, adj);
+            let dk = bl.adj(j).unwrap_or(sp.addr(adj + r.out.base, r.out.stride));
+            emit_dot_backward(f, dk, &ops);
+            continue;
+        }
+        let pa1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
+            Some(t) => bl.prim(t).expect("checked local"),
+            None => block_arg(f, sp, r.arg1, nt.arg1, tmp1),
+        };
+        let pa2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
+            Some(t) => bl.prim(t).expect("checked local"),
+            None => block_arg(f, sp, r.arg2i, nt.arg2i, tmp2),
+        };
+        let da1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
+            Some(t) => bl.adj(t).expect("checked local"),
+            None => adj_of(r.arg1, pa1, adj, sp),
+        };
+        let da2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
+            Some(t) => bl.adj(t).expect("checked local"),
+            None => adj_of(r.arg2i, pa2, adj, sp),
+        };
+        let pout = sp.addr(r.out.base, r.out.stride);
+        let dout = sp.addr(adj + r.out.base, r.out.stride);
+        emit_backward(
+            f,
+            tape,
+            k0,
+            m,
+            Back {
+                dk: bl.adj(j).unwrap_or(dout),
+                da1,
+                da2,
+                pa1,
+                pa2,
+                pk: bl.prim(j).unwrap_or(pout),
+                cst: block_cst(tape, b, j, tbl, sp),
+            },
+        );
+    }
+}
+
 fn build_log_prob_grad(
     tape: &Tape,
     root: u32,
@@ -1323,10 +1399,7 @@ fn build_log_prob_grad(
                 k = b.start;
                 continue;
             }
-            // Forward left iteration-local values in locals, which do not
-            // survive to here: recompute this iteration's, then clear the
-            // adjoints they accumulate into.
-            emit_block_forward(
+            emit_block_backward(
                 &mut f,
                 tape,
                 m,
@@ -1335,63 +1408,10 @@ fn build_log_prob_grad(
                 &bl,
                 &tables[bi],
                 &block_rels[bi],
+                adj,
                 tmp1,
                 tmp2,
-                true,
             );
-            for j in 0..b.len {
-                if let Some(a) = bl.adj(j) {
-                    astore_addr(&mut f, a);
-                    f.instruction(&Instruction::F64Const(0.0.into()));
-                    astore_end(&mut f, a);
-                }
-            }
-            for j in (0..b.len).rev() {
-                let k0 = b.start + j;
-                let nt = tables[bi][j as usize];
-                let ar = &b.args[j as usize];
-                let r = &block_rels[bi][j as usize];
-                if tape.op_at(k0) == Op::DotC {
-                    let at = nt.dot.expect("staged");
-                    let ops = block_dot_ops(tape, k0, r, b.reps, at, &sp, adj);
-                    let dk = bl.adj(j).unwrap_or(sp.addr(adj + r.out.base, r.out.stride));
-                    emit_dot_backward(&mut f, dk, &ops);
-                    continue;
-                }
-                let pa1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
-                    Some(t) => bl.prim(t).expect("checked local"),
-                    None => block_arg(&mut f, &sp, r.arg1, nt.arg1, tmp1),
-                };
-                let pa2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
-                    Some(t) => bl.prim(t).expect("checked local"),
-                    None => block_arg(&mut f, &sp, r.arg2i, nt.arg2i, tmp2),
-                };
-                let da1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
-                    Some(t) => bl.adj(t).expect("checked local"),
-                    None => adj_of(r.arg1, pa1, adj, &sp),
-                };
-                let da2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
-                    Some(t) => bl.adj(t).expect("checked local"),
-                    None => adj_of(r.arg2i, pa2, adj, &sp),
-                };
-                let pout = sp.addr(r.out.base, r.out.stride);
-                let dout = sp.addr(adj + r.out.base, r.out.stride);
-                emit_backward(
-                    &mut f,
-                    tape,
-                    k0,
-                    m,
-                    Back {
-                        dk: bl.adj(j).unwrap_or(dout),
-                        da1,
-                        da2,
-                        pa1,
-                        pa2,
-                        pk: bl.prim(j).unwrap_or(pout),
-                        cst: block_cst(tape, b, j, &tables[bi], &sp),
-                    },
-                );
-            }
             f.instruction(&Instruction::LocalGet(iv));
             f.instruction(&Instruction::I32Const(1));
             f.instruction(&Instruction::I32Sub);
