@@ -522,9 +522,15 @@ impl Tape {
                 Op::Sqrt => {
                     self.grad[a1] += g / (2.0 * self.val[i]);
                 }
+                // A base of exactly zero contributes nothing. `x^n` with `n < 1`
+                // — `sqrt` among them — has an infinite slope there, and one
+                // underflowed intermediate would otherwise turn the whole
+                // gradient into NaN on the way back.
                 Op::Pow => {
                     let va = self.val[a1];
-                    self.grad[a1] += g * a2f * va.powf(a2f - 1.0);
+                    if va != 0.0 {
+                        self.grad[a1] += g * a2f * va.powf(a2f - 1.0);
+                    }
                 }
                 Op::Abs => {
                     let sign = if self.val[a1] >= 0.0 { 1.0 } else { -1.0 };

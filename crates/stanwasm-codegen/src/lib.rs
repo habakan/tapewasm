@@ -2348,6 +2348,14 @@ fn adj_incr_pow(f: &mut Function, da: Addr, dk: Addr, tv: Addr, exponent: f64, p
     f.instruction(&Instruction::F64Const((exponent - 1.0).into()));
     f.instruction(&Instruction::Call(pow_idx));
     f.instruction(&Instruction::F64Mul);
+    // Zero when the base is: `x^n` with `n < 1` has an infinite slope there,
+    // and `select` takes the arm rather than the arithmetic, so the infinity
+    // never meets an adjoint. Same rule as the tape's backward.
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    aload(f, tv);
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    f.instruction(&Instruction::F64Ne);
+    f.instruction(&Instruction::Select);
     f.instruction(&Instruction::F64Add);
     astore_end(f, da);
 }
