@@ -50,6 +50,10 @@ pub enum Op {
     /// carries a value from each element to the next — which is the one shape
     /// a re-rolled loop cannot run two repeats of at a time.
     Sum = 29,
+    /// `log P(T > t)` for a Student-t with `arg2f` degrees of freedom. Its
+    /// value needs an incomplete beta, but its slope in `t` is just the
+    /// density over the tail it names, so the node carries only that.
+    StudentTLccdf = 30,
 }
 
 /// The shape of a contraction, held beside the node rather than in it: the
@@ -200,6 +204,7 @@ impl Tape {
                 Op::DivC => self.val[a1] / a2f,
                 Op::RdivC => a2f / self.val[a1],
                 Op::Phi => phi_cdf(self.val[a1]),
+                Op::StudentTLccdf => student_t_lccdf(self.val[a1], a2f),
                 Op::Erf => erf(self.val[a1]),
                 Op::Erfc => 1.0 - erf(self.val[a1]),
                 Op::Tan => self.val[a1].tan(),
@@ -344,6 +349,12 @@ impl Tape {
     pub fn phi(&mut self, a: u32) -> u32 {
         let v = phi_cdf(self.val[a as usize]);
         self.push(v, Op::Phi, a, 0, 0.0)
+    }
+
+    /// `log P(T > t)` at `nu` degrees of freedom, `nu` fixed at record time.
+    pub fn student_t_lccdf(&mut self, a: u32, nu: f64) -> u32 {
+        let v = student_t_lccdf(self.val[a as usize], nu);
+        self.push(v, Op::StudentTLccdf, a, 0, nu)
     }
 
     pub fn erf(&mut self, a: u32) -> u32 {
@@ -542,6 +553,12 @@ impl Tape {
                     let x = self.val[a1];
                     self.grad[a1] += g * INV_SQRT_2PI * (-0.5 * x * x).exp();
                 }
+                // d/dt log(1 - F(t)) = -f(t) / (1 - F(t)), and the node's own
+                // value is that logarithm, so the tail comes back by exp.
+                Op::StudentTLccdf => {
+                    let x = self.val[a1];
+                    self.grad[a1] -= g * (student_t_lpdf_std(x, a2f) - self.val[i]).exp();
+                }
                 Op::Erf => {
                     let x = self.val[a1];
                     self.grad[a1] += g * TWO_OVER_SQRT_PI * (-(x * x)).exp();
@@ -669,6 +686,89 @@ pub fn trigamma(x: f64) -> f64 {
 }
 
 /// Standard normal CDF (Abramowitz & Stegun 26.2.17).
+/// `log f(t)` for a standard Student-t: the density with `mu = 0`, `sigma = 1`.
+pub fn student_t_lpdf_std(t: f64, nu: f64) -> f64 {
+    lgamma(0.5 * (nu + 1.0))
+        - lgamma(0.5 * nu)
+        - 0.5 * (nu * PI).ln()
+        - 0.5 * (nu + 1.0) * (1.0 + t * t / nu).ln()
+}
+
+/// `log P(T > t)` for a standard Student-t.
+///
+/// `P(T > t)` is half the regularized incomplete beta `I_x(nu/2, 1/2)` at
+/// `x = nu / (nu + t^2)` above the median and its complement below, which is
+/// the identity the Student-t CDF is defined by.
+pub fn student_t_lccdf(t: f64, nu: f64) -> f64 {
+    let half_tail = 0.5 * betai(0.5 * nu, 0.5, nu / (nu + t * t));
+    if t > 0.0 {
+        half_tail.ln()
+    } else {
+        (-half_tail).ln_1p()
+    }
+}
+
+/// Regularized incomplete beta `I_x(a, b)`. The continued fraction below
+/// converges quickly only on the side of the distribution's mean that `x` is
+/// on, so the other side is reached through `I_x(a, b) = 1 - I_{1-x}(b, a)`.
+fn betai(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let front = (lgamma(a + b) - lgamma(a) - lgamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
+    }
+}
+
+/// The continued fraction for the incomplete beta, evaluated by Lentz's
+/// method. `TINY` stands in for a zero denominator, which the recurrence is
+/// allowed to produce and cannot divide by.
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    const EPS: f64 = 3e-16;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < TINY {
+        d = TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=300 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        // The fraction alternates between two forms of numerator, one per half
+        // step, so each iteration advances it twice.
+        for aa in [
+            m * (b - m) * x / ((qam + m2) * (a + m2)),
+            -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2)),
+        ] {
+            d = 1.0 + aa * d;
+            if d.abs() < TINY {
+                d = TINY;
+            }
+            c = 1.0 + aa / c;
+            if c.abs() < TINY {
+                c = TINY;
+            }
+            d = 1.0 / d;
+            h *= d * c;
+        }
+        if (d * c - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
 pub fn phi_cdf(x: f64) -> f64 {
     if x >= 0.0 {
         let t = 1.0 / (1.0 + 0.231_641_9 * x);

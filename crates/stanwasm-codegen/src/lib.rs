@@ -127,7 +127,14 @@ pub fn compile_with(
         let op = tape.op_at(k as u32);
         if matches!(
             op,
-            Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma
+            Op::Erf
+                | Op::Erfc
+                | Op::Tan
+                | Op::Asin
+                | Op::Acos
+                | Op::Atan
+                | Op::Digamma
+                | Op::StudentTLccdf
         ) {
             return Err(CodegenError::UnsupportedOp {
                 op: format!("{op:?}"),
@@ -1875,7 +1882,14 @@ fn emit_forward(
             aload(f, a1);
             f.instruction(&Instruction::Call(m.phi.expect("phi import missing")));
         }
-        Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
+        Op::Erf
+        | Op::Erfc
+        | Op::Tan
+        | Op::Asin
+        | Op::Acos
+        | Op::Atan
+        | Op::Digamma
+        | Op::StudentTLccdf => {
             unimplemented!("codegen for op {op:?}");
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
@@ -1977,7 +1991,14 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Phi => {
             adj_incr_phi(f, da1, dk, pa1, m.exp.unwrap());
         }
-        Op::Erf | Op::Erfc | Op::Tan | Op::Asin | Op::Acos | Op::Atan | Op::Digamma => {
+        Op::Erf
+        | Op::Erfc
+        | Op::Tan
+        | Op::Asin
+        | Op::Acos
+        | Op::Atan
+        | Op::Digamma
+        | Op::StudentTLccdf => {
             unimplemented!("backward for op {op:?}");
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
