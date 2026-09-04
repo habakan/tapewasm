@@ -237,6 +237,21 @@ impl Tape {
         self.val.len()
     }
 
+    /// Whether the tape has grown past what a 32-bit address space can hold it
+    /// in. The caller checks between statements so a model that was never going
+    /// to run says so, rather than meeting an allocator abort — on wasm a trap
+    /// that takes the module instance down with it.
+    pub fn over_limit(&self) -> bool {
+        self.val.len() > Self::MAX_NODES
+    }
+
+    /// Six parallel arrays and an entry in the common-subexpression table.
+    const BYTES_PER_NODE: usize = 70;
+
+    /// A gigabyte of tape: fourteen times the largest trace in the posteriordb
+    /// corpus, and it still leaves a 32-bit address space room for the data.
+    pub const MAX_NODES: usize = 1_000_000_000 / Self::BYTES_PER_NODE;
+
     pub fn is_empty(&self) -> bool {
         self.val.is_empty()
     }
