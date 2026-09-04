@@ -55,8 +55,12 @@ impl Block {
 }
 
 /// At most this many arguments per block may need an index table. A gather
-/// costs one; a block wanting more is not a loop worth rolling.
-pub(crate) const MAX_TABLED: usize = 2;
+/// costs one, and a statement can hold several: an LDA term reads two gathers
+/// per topic, so its block wants ten. Refusing them left that model re-rolled
+/// into fragments — 2.0 MB of wasm against 0.6 at this bound, and 576 µs per
+/// gradient against 372, since the smaller module is also the one V8 keeps
+/// optimising. Nothing in posteriordb asks for more than twelve.
+pub(crate) const MAX_TABLED: usize = 12;
 
 /// How one integer argument moves from one repeat to the next.
 #[derive(Debug, Clone, PartialEq)]
