@@ -592,6 +592,11 @@ impl Tape {
     pub fn op_at(&self, i: u32) -> Op {
         self.op[i as usize]
     }
+    /// Every opcode in order. Comparing two stretches of tape one node at a
+    /// time costs a bounds check apiece; a slice comparison does not.
+    pub fn ops(&self) -> &[Op] {
+        &self.op
+    }
     pub fn arg1_at(&self, i: u32) -> u32 {
         self.arg1[i as usize]
     }

@@ -27,6 +27,13 @@ const MAX_BLOCK: u32 = 96;
 /// variable cost more than the unrolled copies.
 const MIN_REPS: u32 = 4;
 
+/// How far a *candidate* is followed. Detection asks about `MAX_BLOCK` lengths
+/// at every node it does not cover, and a periodic region answers "still
+/// repeating" to most of them, so following each to the end walked the tape
+/// `MAX_BLOCK` times over. A candidate that gets this far is periodic; the
+/// shortest period describes it, and only that one is then measured exactly.
+const PROBE_REPS: u32 = 8;
+
 /// A run of `reps` identical blocks of `len` nodes starting at `start`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
@@ -95,7 +102,7 @@ type Probe = (u32, Vec<ArgRels>, Vec<Option<Vec<f64>>>);
 /// Check that `len`-node blocks at `start` repeat, and describe how their
 /// arguments move. Returns `None` if the opcodes do not repeat, or if too many
 /// arguments would need an index table.
-fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
+fn probe(tape: &Tape, start: u32, len: u32, max_reps: u32) -> Option<Probe> {
     let n = tape.len() as u32;
     if start + 2 * len > n {
         return None;
@@ -103,17 +110,43 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
 
     // How far the opcode pattern repeats. Arguments cannot bound this any more:
     // a tabled one is allowed to be arbitrary.
+    let ops = tape.ops();
+    let (head, width) = (start as usize, len as usize);
     let mut reps = 1;
-    'outer: while start + (reps + 1) * len <= n {
-        for j in 0..len {
-            if tape.op_at(start + reps * len + j) != tape.op_at(start + j) {
-                break 'outer;
-            }
+    while reps < max_reps && start + (reps + 1) * len <= n {
+        let next = (start + reps * len) as usize;
+        if ops[next..next + width] != ops[head..head + width] {
+            break;
         }
         reps += 1;
     }
     if reps < 2 {
         return None;
+    }
+
+    // Three shapes the emitter has no form for. Rejected before the argument
+    // walk below, which costs `len * reps` reads: most of the candidates this
+    // is asked about die here, and detection probes `MAX_BLOCK` of them at
+    // every node it does not cover.
+    for j in 0..len {
+        // A leaf reads the parameter buffer by absolute index, and a reduction
+        // walks a run the loop emitter has no form for — it is one node for a
+        // whole vectorised statement, so it never wants re-rolling anyway.
+        match tape.op_at(start + j) {
+            Op::Leaf | Op::Sum => return None,
+            // A contraction is emitted unrolled, so every repeat has to
+            // contract the same number of elements the same distance apart.
+            Op::DotC => {
+                let e0 = tape.extent_at(start + j);
+                if (1..reps).any(|i| {
+                    let e = tape.extent_at(start + i * len + j);
+                    (e.len, e.stride) != (e0.len, e0.stride)
+                }) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
     }
 
     // An argument is affine when one stride explains every repeat, and tabled
@@ -171,38 +204,16 @@ fn probe(tape: &Tape, start: u32, len: u32) -> Option<Probe> {
         };
         let first = read(k0);
         let varies = (1..reps).any(|i| read(start + i * len + j).to_bits() != first.to_bits());
+        // `Pow` folds `exponent - 1` into an immediate for its backward step,
+        // so a moving exponent has no form.
+        if varies && tape.op_at(k0) == Op::Pow {
+            return None;
+        }
         consts.push(if varies {
             Some((0..reps).map(|i| read(start + i * len + j)).collect())
         } else {
             None
         });
-    }
-
-    // Three shapes the emitter has no form for: a leaf reads the parameter
-    // buffer by absolute index, `Pow` folds `exponent - 1` into an immediate
-    // for its backward step, and a contraction is emitted unrolled, so every
-    // repeat has to contract the same number of elements the same distance
-    // apart.
-    for j in 0..len {
-        let op = tape.op_at(start + j);
-        // A leaf reads the parameter buffer by absolute index, and a reduction
-        // walks a run the loop emitter has no form for — it is one node for a
-        // whole vectorised statement, so it never wants re-rolling anyway.
-        if op == Op::Leaf || op == Op::Sum {
-            return None;
-        }
-        if op == Op::Pow && consts[j as usize].is_some() {
-            return None;
-        }
-        if op == Op::DotC {
-            let e0 = tape.extent_at(start + j);
-            if (1..reps).any(|i| {
-                let e = tape.extent_at(start + i * len + j);
-                (e.len, e.stride) != (e0.len, e0.stride)
-            }) {
-                return None;
-            }
-        }
     }
 
     Some((reps, args, consts))
@@ -237,7 +248,7 @@ fn rotate(tape: &Tape, b: &Block) -> Option<Block> {
     if carried(tape, b.start + r, b.len) >= base {
         return None;
     }
-    let (reps, args, consts) = probe(tape, b.start + r, b.len)?;
+    let (reps, args, consts) = probe(tape, b.start + r, b.len, u32::MAX)?;
     // The nodes left in front stay straight-line; giving up more than one
     // repeat's worth of coverage is not a trade worth making.
     if reps < MIN_REPS || (reps + 1) * b.len < b.reps * b.len {
@@ -261,7 +272,7 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
     while k < n {
         let mut best: Option<Block> = None;
         for len in 1..=MAX_BLOCK.min(n - k) {
-            let Some((reps, args, consts)) = probe(tape, k, len) else {
+            let Some((reps, args, consts)) = probe(tape, k, len, PROBE_REPS) else {
                 continue;
             };
             if reps < MIN_REPS {
@@ -283,9 +294,16 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
             if better {
                 best = Some(cand);
             }
+            // Lengths ascend, so the first one still repeating at the cap is the
+            // shortest period here; a longer one can only describe the same
+            // region with a bigger body.
+            if best.as_ref().is_some_and(|b| b.reps == PROBE_REPS) {
+                break;
+            }
         }
         match best {
             Some(b) => {
+                let b = extend(tape, b);
                 let b = rotate(tape, &b).unwrap_or(b);
                 k = b.end();
                 out.push(b);
@@ -294,6 +312,23 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
         }
     }
     out
+}
+
+/// Follow the chosen block to its real end. Only the winner pays for this, so
+/// the walk costs the tape once rather than `MAX_BLOCK` times.
+fn extend(tape: &Tape, b: Block) -> Block {
+    if b.reps < PROBE_REPS {
+        return b;
+    }
+    match probe(tape, b.start, b.len, u32::MAX) {
+        Some((reps, args, consts)) => Block {
+            reps,
+            args,
+            consts,
+            ..b
+        },
+        None => b,
+    }
 }
 
 #[cfg(test)]
@@ -557,13 +592,15 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
     let n = tape.len() as u32;
     let mut out: Vec<Vec<bool>> = blocks.iter().map(|b| vec![true; b.len as usize]).collect();
 
-    // Which block, if any, owns a tape index, and at which position.
+    // Which block, if any, owns a tape index, and at which position. Blocks are
+    // non-overlapping and in tape order, so this bisects rather than scanning:
+    // it is asked once per argument of every node on the tape.
     let owner = |k: u32| -> Option<(usize, u32, u32)> {
-        blocks.iter().enumerate().find_map(|(bi, b)| {
-            (k >= b.start && k < b.end()).then(|| {
-                let off = k - b.start;
-                (bi, off / b.len, off % b.len)
-            })
+        let bi = blocks.partition_point(|b| b.end() <= k);
+        let b = blocks.get(bi)?;
+        (k >= b.start).then(|| {
+            let off = k - b.start;
+            (bi, off / b.len, off % b.len)
         })
     };
 
