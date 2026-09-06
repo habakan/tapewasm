@@ -36,6 +36,10 @@ fn install_math(linker: &mut Linker<HostState>, store: &mut Store<HostState>) {
     unary!("lgamma", lgamma);
     unary!("digamma", digamma);
     unary!("phi", phi);
+    unary!("tan", f64::tan);
+    unary!("asin", f64::asin);
+    unary!("acos", f64::acos);
+    unary!("atan", f64::atan);
     let pow = Func::wrap(
         &mut *store,
         |_: Caller<'_, HostState>, x: f64, y: f64| -> f64 { x.powf(y) },
@@ -274,12 +278,14 @@ fn module_validates_with_wasmparser() {
 
 #[test]
 fn unsupported_op_is_reported_rather_than_trapping() {
-    // The emitters have no arm for Atan, and `unimplemented!` would compile to a
-    // wasm trap that takes down the module instead of reporting anything.
+    // The emitters have no arm for the Student-t tail, and `unimplemented!`
+    // would compile to a wasm trap that takes down the module instead of
+    // reporting anything. It is reachable from Stan source, so the refusal has
+    // to be a message.
     let src = r#"
 data { int<lower=0> N; vector[N] y; }
 parameters { real a; }
-model { for (n in 1:N) y[n] ~ normal(atan(a), 1.0); }
+model { for (n in 1:N) target += student_t_lccdf(y[n] | 4.0, a, 1.0); }
 "#;
     let mut data = Env::new();
     data.set_scalar("N", 2.0);
@@ -287,9 +293,12 @@ model { for (n in 1:N) y[n] ~ normal(atan(a), 1.0); }
     let model = Model::parse_and_load(src, data).unwrap();
 
     let err = stanwasm_codegen::compile(&model, &[0.1])
-        .expect_err("Atan has no AOT emitter")
+        .expect_err("the Student-t tail has no AOT emitter")
         .to_string();
-    assert!(err.contains("Atan") && err.contains("sample()"), "{err}");
+    assert!(
+        err.contains("StudentTLccdf") && err.contains("sample()"),
+        "{err}"
+    );
 }
 
 /// Enough data points that the emitter re-rolls the vectorised statement into
@@ -545,6 +554,58 @@ fn reroll_modes_agree() {
         );
         for (i, (o, a)) in oracle_grads.iter().zip(grads.iter()).enumerate() {
             assert!(close(*o, *a, 1e-12), "{mode:?}: grad[{i}] {o} vs {a}");
+        }
+    }
+}
+
+/// `tan`, `asin`, `acos` and `atan` are callable from Stan source, so the
+/// emitter has to have them too — otherwise a model samples but will not
+/// compile, which is the one asymmetry between the two paths a user would hit.
+const TRIG: &str = r#"
+data { int<lower=0> N; vector[N] x; }
+parameters { real a; real b; }
+model {
+  a ~ normal(0, 1);
+  b ~ normal(0, 1);
+  for (i in 1:N) {
+    target += tan(0.3 * a + 0.1 * x[i]);
+    target += asin(0.2 * b);
+    target += acos(0.15 * a);
+    target += atan(a * b + x[i]);
+  }
+}
+"#;
+
+#[test]
+fn the_inverse_trig_functions_agree_with_the_oracle() {
+    let mut data = Env::new();
+    data.set_scalar("N", 4.0);
+    data.set_vector("x", &[0.0, 0.5, -0.75, 1.25]);
+    let model = Model::parse_and_load(TRIG, data).unwrap();
+
+    let dummy = vec![0.1; model.n_params()];
+    let compiled = compile(&model, &dummy).unwrap();
+
+    // Two points, because `acos` and `asin` bend hardest away from zero.
+    for test_params in [vec![0.4, -0.6], vec![-1.1, 0.9]] {
+        let (oracle_lp, oracle_grads) = model.log_prob_grad(&test_params).unwrap();
+        let (aot_lp, aot_grads) = run_aot_log_prob_grad(
+            &compiled.wasm,
+            compiled.n_params,
+            &test_params,
+            compiled.scratch_len,
+            &compiled.const_table,
+        );
+        assert!(
+            close(oracle_lp, aot_lp, 1e-12),
+            "lp at {test_params:?}: oracle={oracle_lp}, aot={aot_lp}"
+        );
+        for (i, (o, a)) in oracle_grads.iter().zip(aot_grads.iter()).enumerate() {
+            assert!(
+                close(*o, *a, 1e-12),
+                "grad[{i}] at {test_params:?}: oracle={o}, aot={a}, diff={}",
+                o - a
+            );
         }
     }
 }

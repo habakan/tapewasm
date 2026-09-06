@@ -127,14 +127,10 @@ pub fn compile_with(
         let op = tape.op_at(k as u32);
         if matches!(
             op,
-            Op::Erf
-                | Op::Erfc
-                | Op::Tan
-                | Op::Asin
-                | Op::Acos
-                | Op::Atan
-                | Op::Digamma
-                | Op::StudentTLccdf
+            // `erf`, `erfc` and a bare `digamma` are not reachable from Stan
+            // source — nothing in the runtime emits them as a forward node —
+            // so they are here to fail loudly if that ever changes.
+            Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf
         ) {
             return Err(CodegenError::UnsupportedOp {
                 op: format!("{op:?}"),
@@ -208,6 +204,22 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     if needs.cos {
         math_idx.cos = Some(math_idx_add_unary(&mut math_idx, &mut imports, "cos"));
     }
+    for (want, slot, name) in [
+        (needs.tan, 0, "tan"),
+        (needs.asin, 1, "asin"),
+        (needs.acos, 2, "acos"),
+        (needs.atan, 3, "atan"),
+    ] {
+        if want {
+            let idx = math_idx_add_unary(&mut math_idx, &mut imports, name);
+            match slot {
+                0 => math_idx.tan = Some(idx),
+                1 => math_idx.asin = Some(idx),
+                2 => math_idx.acos = Some(idx),
+                _ => math_idx.atan = Some(idx),
+            }
+        }
+    }
     if needs.phi {
         math_idx.phi = Some(math_idx_add_unary(&mut math_idx, &mut imports, "phi"));
     }
@@ -273,6 +285,10 @@ struct ImportNeeds {
     log: bool,
     sin: bool,
     cos: bool,
+    tan: bool,
+    asin: bool,
+    acos: bool,
+    atan: bool,
     pow: bool,
     lgamma: bool,
     digamma: bool,
@@ -285,6 +301,10 @@ struct MathImportIndex {
     log: Option<u32>,
     sin: Option<u32>,
     cos: Option<u32>,
+    tan: Option<u32>,
+    asin: Option<u32>,
+    acos: Option<u32>,
+    atan: Option<u32>,
     pow: Option<u32>,
     lgamma: Option<u32>,
     digamma: Option<u32>,
@@ -328,6 +348,12 @@ fn scan_imports(tape: &Tape) -> ImportNeeds {
                 needs.cos = true;
                 needs.sin = true; // backward of cos uses sin
             }
+            // Each one's derivative is written from its own value or argument,
+            // so none of these pulls in a second import.
+            Op::Tan => needs.tan = true,
+            Op::Asin => needs.asin = true,
+            Op::Acos => needs.acos = true,
+            Op::Atan => needs.atan = true,
             Op::Pow => needs.pow = true,
             Op::Lgamma => {
                 needs.lgamma = true;
@@ -337,8 +363,8 @@ fn scan_imports(tape: &Tape) -> ImportNeeds {
                 needs.phi = true;
                 needs.exp = true; // backward uses exp
             }
-            // Tan/Asin/Acos/Atan/Erf/Erfc/Digamma/Sqrt/Abs and arithmetic are inline;
-            // the rest are not emitted because the runtime does not produce them.
+            // Sqrt, Abs and the arithmetic are inline; the rest are refused by
+            // the check above because nothing here emits them.
             _ => {}
         }
     }
@@ -1831,6 +1857,22 @@ fn emit_forward(
             aload(f, a1);
             f.instruction(&Instruction::Call(m.cos.expect("cos import missing")));
         }
+        Op::Tan => {
+            aload(f, a1);
+            f.instruction(&Instruction::Call(m.tan.expect("tan import missing")));
+        }
+        Op::Asin => {
+            aload(f, a1);
+            f.instruction(&Instruction::Call(m.asin.expect("asin import missing")));
+        }
+        Op::Acos => {
+            aload(f, a1);
+            f.instruction(&Instruction::Call(m.acos.expect("acos import missing")));
+        }
+        Op::Atan => {
+            aload(f, a1);
+            f.instruction(&Instruction::Call(m.atan.expect("atan import missing")));
+        }
         Op::Sqrt => {
             aload(f, a1);
             f.instruction(&Instruction::F64Sqrt);
@@ -1882,14 +1924,7 @@ fn emit_forward(
             aload(f, a1);
             f.instruction(&Instruction::Call(m.phi.expect("phi import missing")));
         }
-        Op::Erf
-        | Op::Erfc
-        | Op::Tan
-        | Op::Asin
-        | Op::Acos
-        | Op::Atan
-        | Op::Digamma
-        | Op::StudentTLccdf => {
+        Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf => {
             unimplemented!("codegen for op {op:?}");
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
@@ -1954,6 +1989,13 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Cos => {
             adj_decr_fn1(f, da1, dk, pa1, m.sin.unwrap());
         }
+        // d/dx tan = 1 + tan(x)², and the node already holds tan(x).
+        Op::Tan => adj_incr_mul_1p_sq(f, da1, dk, pk),
+        // d/dx asin = 1/√(1 - x²); acos is the same with the sign flipped.
+        Op::Asin => adj_pm_div_sqrt_1m_sq(f, da1, dk, pa1, false),
+        Op::Acos => adj_pm_div_sqrt_1m_sq(f, da1, dk, pa1, true),
+        // d/dx atan = 1/(1 + x²)
+        Op::Atan => adj_incr_div_1p_sq(f, da1, dk, pa1),
         Op::Sqrt => {
             adj_incr_div2(f, da1, dk, pk);
         }
@@ -1991,14 +2033,7 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Phi => {
             adj_incr_phi(f, da1, dk, pa1, m.exp.unwrap());
         }
-        Op::Erf
-        | Op::Erfc
-        | Op::Tan
-        | Op::Asin
-        | Op::Acos
-        | Op::Atan
-        | Op::Digamma
-        | Op::StudentTLccdf => {
+        Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf => {
             unimplemented!("backward for op {op:?}");
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
@@ -2271,6 +2306,56 @@ fn adj_incr_div2(f: &mut Function, da: Addr, dk: Addr, tk: Addr) {
     f.instruction(&Instruction::F64Const(2.0.into()));
     aload(f, tk);
     f.instruction(&Instruction::F64Mul);
+    f.instruction(&Instruction::F64Div);
+    f.instruction(&Instruction::F64Add);
+    astore_end(f, da);
+}
+
+// d[da] += d[dk] * (1 + t[tv]²)
+fn adj_incr_mul_1p_sq(f: &mut Function, da: Addr, dk: Addr, tv: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    f.instruction(&Instruction::F64Const(1.0.into()));
+    aload(f, tv);
+    aload(f, tv);
+    f.instruction(&Instruction::F64Mul);
+    f.instruction(&Instruction::F64Add);
+    f.instruction(&Instruction::F64Mul);
+    f.instruction(&Instruction::F64Add);
+    astore_end(f, da);
+}
+
+// d[da] ±= d[dk] / √(1 - t[tv]²)
+fn adj_pm_div_sqrt_1m_sq(f: &mut Function, da: Addr, dk: Addr, tv: Addr, negate: bool) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    f.instruction(&Instruction::F64Const(1.0.into()));
+    aload(f, tv);
+    aload(f, tv);
+    f.instruction(&Instruction::F64Mul);
+    f.instruction(&Instruction::F64Sub);
+    f.instruction(&Instruction::F64Sqrt);
+    f.instruction(&Instruction::F64Div);
+    f.instruction(&if negate {
+        Instruction::F64Sub
+    } else {
+        Instruction::F64Add
+    });
+    astore_end(f, da);
+}
+
+// d[da] += d[dk] / (1 + t[tv]²)
+fn adj_incr_div_1p_sq(f: &mut Function, da: Addr, dk: Addr, tv: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    f.instruction(&Instruction::F64Const(1.0.into()));
+    aload(f, tv);
+    aload(f, tv);
+    f.instruction(&Instruction::F64Mul);
+    f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
     astore_end(f, da);
