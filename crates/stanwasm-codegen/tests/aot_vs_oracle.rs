@@ -609,3 +609,47 @@ fn the_inverse_trig_functions_agree_with_the_oracle() {
         }
     }
 }
+
+fn linear_regression_model(n: usize) -> Model {
+    let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let y: Vec<f64> = (0..n).map(|i| 0.5 * i as f64).collect();
+    let mut data = Env::new();
+    data.set_scalar("N", n as f64);
+    data.set_vector("x", &x);
+    data.set_vector("y", &y);
+    Model::parse_and_load(LINEAR_REGRESSION, data).unwrap()
+}
+
+/// The id a host compares before handing a module someone else's scratch
+/// buffer, so it has to travel with the module and it has to differ whenever
+/// the buffers do.
+#[test]
+fn layout_id_is_exported_and_identifies_the_buffers() {
+    let two = compile(&linear_regression_model(2), &[0.1; 3]).unwrap();
+    let two_again = compile(&linear_regression_model(2), &[0.1; 3]).unwrap();
+    let four = compile(&linear_regression_model(4), &[0.1; 3]).unwrap();
+
+    assert_eq!(
+        two.layout_id, two_again.layout_id,
+        "recompiling one model must not move its id"
+    );
+    assert_ne!(two.layout_id, four.layout_id);
+    assert_ne!(two.scratch_len, four.scratch_len);
+
+    let mut found = None;
+    for payload in wasmparser::Parser::new(0).parse_all(&two.wasm) {
+        if let wasmparser::Payload::ExportSection(section) = payload.unwrap() {
+            for export in section {
+                let export = export.unwrap();
+                if export.name == "stanwasm_layout_id" {
+                    found = Some(export.kind);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        Some(wasmparser::ExternalKind::Global),
+        "the module exports no layout id global"
+    );
+}

@@ -12,6 +12,7 @@
 //!   log_prob_grad(params_ptr: i32, grads_ptr: i32, n_params: i32) -> f64
 //!     reads params_ptr..params_ptr+n_params*8 and writes
 //!     grads_ptr..grads_ptr+n_params*8 in shared memory; returns log_prob.
+//!   (global "stanwasm_layout_id" i32)             — see [`Compiled::layout_id`]
 //!
 //! The module uses the fixed-width SIMD proposal: a re-rolled loop whose every
 //! slot moves by one or not at all runs two repeats at a time. Every engine
@@ -32,8 +33,9 @@ use stanwasm_autodiff::{Op, Tape};
 use stanwasm_runtime::Model;
 use thiserror::Error;
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    Instruction, MemoryType, Module, TypeSection, ValType,
+    CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+    GlobalSection, GlobalType, ImportSection, Instruction, MemoryType, Module, TypeSection,
+    ValType,
 };
 
 #[derive(Debug, Error)]
@@ -94,6 +96,12 @@ pub struct Compiled {
     /// Loop constants the caller stages at slot `scratch_len - const_table.len()`
     /// before the first call. Empty when nothing was re-rolled.
     pub const_table: Vec<f64>,
+    /// Identifies the buffers this module expects, and is exported from it as
+    /// the immutable i32 global `stanwasm_layout_id`. Calling one model's
+    /// `log_prob_grad` with another's scratch writes at slot offsets the buffer
+    /// was never sized for, so a host that keeps the binding in one place
+    /// compares the two before the first call.
+    pub layout_id: u32,
 }
 
 /// Trace `model` on a fresh tape at `dummy_params` (0.1 throughout; eight_schools
@@ -137,17 +145,40 @@ pub fn compile_with(
             });
         }
     }
-    let (wasm, const_table) = emit(&tape, dummy_params.len(), root, reroll);
+    let (wasm, const_table, layout_id) = emit(&tape, dummy_params.len(), root, reroll);
     Ok(Compiled {
         wasm,
         n_params: dummy_params.len(),
         scratch_len: 2 * tape.len() + const_table.len(),
         const_table,
+        layout_id,
     })
 }
 
+/// Hash of everything that has to agree between an emitted module and the
+/// buffers it is handed: the recorded graph, the parameter count, and the
+/// constants staged past the adjoints. Deterministic, so recompiling the same
+/// model twice yields the same id.
+fn layout_id(tape: &Tape, n_params: usize, const_table: &[f64]) -> u32 {
+    use std::hash::Hasher;
+    let mut h = stanwasm_autodiff::VnHasher::default();
+    h.write_u32(n_params as u32);
+    h.write_u32(tape.len() as u32);
+    for k in 0..tape.len() as u32 {
+        h.write_u32(tape.op_at(k) as u32);
+        h.write_u32(tape.arg1_at(k));
+        h.write_u32(tape.arg2i_at(k));
+        h.write_u64(tape.arg2f_at(k).to_bits());
+    }
+    h.write_u32(const_table.len() as u32);
+    for c in const_table {
+        h.write_u64(c.to_bits());
+    }
+    h.finish() as u32
+}
+
 /// Lower the recorded tape to a wasm module.
-fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Vec<f64>) {
+fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Vec<f64>, u32) {
     let n = tape.len() as u32;
     let blocks = match reroll {
         Reroll::Never => Vec::new(),
@@ -255,14 +286,26 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
         }
     }
 
+    // ---- global section ----------------------------------------------------
+    let id = layout_id(tape, n_params, &const_table);
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: false,
+            shared: false,
+        },
+        &ConstExpr::i32_const(id as i32),
+    );
+
     // ---- export section ----------------------------------------------------
     let mut exports = ExportSection::new();
     exports.export("log_prob_grad", ExportKind::Func, log_prob_grad_idx);
+    exports.export("stanwasm_layout_id", ExportKind::Global, 0);
 
     // ---- code section ------------------------------------------------------
     let mut codes = CodeSection::new();
 
-    let _ = n_params;
     let lpg = build_log_prob_grad(tape, root, n, &math_idx, &blocks, const_base, &slots);
     codes.function(&lpg);
     for body in &inline {
@@ -274,9 +317,10 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     module.section(&types);
     module.section(&imports);
     module.section(&functions);
+    module.section(&globals);
     module.section(&exports);
     module.section(&codes);
-    (module.finish(), const_table)
+    (module.finish(), const_table, id)
 }
 
 #[derive(Default, Debug)]
