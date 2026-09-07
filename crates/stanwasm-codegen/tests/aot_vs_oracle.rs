@@ -278,10 +278,8 @@ fn module_validates_with_wasmparser() {
 
 #[test]
 fn unsupported_op_is_reported_rather_than_trapping() {
-    // The emitters have no arm for the Student-t tail, and `unimplemented!`
-    // would compile to a wasm trap that takes down the module instead of
-    // reporting anything. It is reachable from Stan source, so the refusal has
-    // to be a message.
+    // No emitter arm for the Student-t tail, which is reachable from Stan source,
+    // so the refusal has to be a message rather than a wasm trap.
     let src = r#"
 data { int<lower=0> N; vector[N] y; }
 parameters { real a; }

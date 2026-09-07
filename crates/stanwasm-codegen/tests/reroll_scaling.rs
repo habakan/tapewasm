@@ -60,9 +60,8 @@ fn a_fragmented_model_compiles_in_time_proportional_to_its_tape() {
     assert!(!compiled.wasm.is_empty());
     assert!(secs < 5.0, "compiled in {secs:.1}s");
 
-    // And it has to actually re-roll. This shape's blocks each want ten index
-    // tables; at a lower `MAX_TABLED` detection settles for fragments and the
-    // module lands within 2.5x of the straight-line one instead of 8x under it.
+    // And it has to actually re-roll: these blocks each want ten index tables, and
+    // a lower `MAX_TABLED` leaves detection settling for fragments.
     let straight = compile_with(&model, &dummy, Reroll::Never).unwrap();
     let ratio = straight.wasm.len() as f64 / compiled.wasm.len() as f64;
     assert!(

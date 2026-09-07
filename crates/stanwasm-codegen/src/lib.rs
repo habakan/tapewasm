@@ -129,15 +129,12 @@ pub fn compile_with(
     if tape.is_empty() {
         return Err(CodegenError::EmptyTape);
     }
-    // The emitters have no arm for these, and an `unimplemented!` would compile to a
-    // wasm trap that takes the whole module down rather than reporting anything.
+    // No emitter arm for these; an `unimplemented!` would trap the whole module.
     for k in 0..tape.len() {
         let op = tape.op_at(k as u32);
         if matches!(
             op,
-            // `erf`, `erfc` and a bare `digamma` are not reachable from Stan
-            // source — nothing in the runtime emits them as a forward node —
-            // so they are here to fail loudly if that ever changes.
+            // Not reachable from Stan source today; listed so a new path fails loudly.
             Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf
         ) {
             return Err(CodegenError::UnsupportedOp {
@@ -186,16 +183,13 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
         Reroll::Auto if tape.len() > RE_ROLL_ABOVE => reroll::detect(tape),
         Reroll::Auto => Vec::new(),
     };
-    // Constants that move with the loop index live past the adjoints, in block
-    // then node order; the caller stages them once.
+    // Loop-index-dependent constants live past the adjoints, in block then node order.
     let const_base = 2 * n;
     let slots = Slots::plan(tape, &blocks);
     let (const_table, _) = stage_tables(tape, &blocks, const_base, &slots);
     let needs = scan_imports(tape);
 
-    // ---- type section: 0 = (i32,i32,i32,i32)->f64 (log_prob_grad: params_ptr,
-    // grads_ptr, n_params, scratch_ptr), 1 = (f64)->f64 (unary math),
-    // 2 = (f64,f64)->f64 (pow)
+    // ---- type section: 0 = log_prob_grad, 1 = (f64)->f64, 2 = (f64,f64)->f64
     let mut types = TypeSection::new();
     types.ty().function(
         [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
@@ -258,8 +252,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
         math_idx.pow = Some(math_idx_add_binary(&mut math_idx, &mut imports, "pow"));
     }
 
-    // Imported funcs first, then defined. The memory import takes no function-index
-    // slot, so n_func_imports counts only the math imports.
+    // The memory import takes no function-index slot, so this counts only math.
     let n_func_imports = math_idx.count();
 
     // ---- function section --------------------------------------------------
@@ -267,8 +260,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     functions.function(0); // log_prob_grad: type 0
 
     let log_prob_grad_idx = n_func_imports;
-    // JavaScript has no lgamma or digamma, so the module carries its own
-    // rather than leaving every embedder to write a series of its choosing.
+    // JavaScript has no lgamma or digamma, so the module carries its own.
     let mut inline: Vec<Function> = Vec::new();
     let mut define = |body: Function, functions: &mut FunctionSection| {
         functions.function(1); // (f64) -> f64
@@ -392,8 +384,7 @@ fn scan_imports(tape: &Tape) -> ImportNeeds {
                 needs.cos = true;
                 needs.sin = true; // backward of cos uses sin
             }
-            // Each one's derivative is written from its own value or argument,
-            // so none of these pulls in a second import.
+            // Each derivative reads its own value or argument: no second import.
             Op::Tan => needs.tan = true,
             Op::Asin => needs.asin = true,
             Op::Acos => needs.acos = true,
@@ -407,8 +398,7 @@ fn scan_imports(tape: &Tape) -> ImportNeeds {
                 needs.phi = true;
                 needs.exp = true; // backward uses exp
             }
-            // Sqrt, Abs and the arithmetic are inline; the rest are refused by
-            // the check above because nothing here emits them.
+            // Sqrt, Abs and the arithmetic are inline; the rest are refused above.
             _ => {}
         }
     }
@@ -504,8 +494,7 @@ fn stage_tables(
             if let Some(v) = &b.consts[j] {
                 t.cst = Some(push(&mut buf, v));
             }
-            // A table holds slots, not tape indices: what the emitted load
-            // adds to the scratch pointer.
+            // A table holds slots, not tape indices: the emitted load's offset.
             if let reroll::ArgRel::Tabled(ix) = &b.args[j].arg1 {
                 let f: Vec<f64> = ix.iter().map(|&i| slots.at(i) as f64).collect();
                 t.arg1 = Some(push(&mut buf, &f));
@@ -591,9 +580,8 @@ impl Slots {
             if bad.is_empty() {
                 return slots;
             }
-            // Un-permuting a block only moves its slots back towards the
-            // tape's own order, so this settles; a round that changes nothing
-            // means the failure is elsewhere and the tape's order has to do.
+            // Un-permuting only moves slots back towards the tape's order, so this
+            // settles; a round that changes nothing means the tape's order has to do.
             if !bad.iter().any(|&i| packed[i]) {
                 return Slots(None);
             }
@@ -737,8 +725,7 @@ fn block_strides(b: &reroll::Block, rels: &[PosRel]) -> Vec<u32> {
         for e in &r.elems {
             want(e.stride, &mut out);
         }
-        // A contraction's coefficients are staged one column per element, so
-        // reading this repeat's walks by one.
+        // Coefficients are staged one column per element, so reading walks by one.
         if b.consts[j].is_some() || !r.elems.is_empty() {
             want(1, &mut out);
         }
@@ -1209,9 +1196,8 @@ fn emit_wide_backward(
 
         let pa1 = wide_arg(bl, b, &ar.arg1, tape.arg1_at(k0), r.arg1, sp, 0);
         let pa2 = wide_arg(bl, b, &ar.arg2i, tape.arg2i_at(k0), r.arg2i, sp, 0);
-        // Only the arguments the opcode actually reads get an adjoint: an
-        // unused `arg2i` holds a stale index, and no lane pair was set aside
-        // for whatever slot that lands on.
+        // Only arguments the opcode reads get an adjoint: an unused `arg2i` holds a
+        // stale index with no lane pair set aside for it.
         let da1 = wide_darg(bl, b, &ar.arg1, tape.arg1_at(k0), r.arg1, sp, adj, privs);
         let op = tape.op_at(k0);
         let pass = |f: &mut Function| wload(f, dout);
@@ -1340,8 +1326,7 @@ fn emit_block_forward(
         let k0 = b.start + j;
         let nt = tbl[j as usize];
         let ar = &b.args[j as usize];
-        // Gather addresses are computed before the value is pushed: the store
-        // address has to stay on top of the stack.
+        // The store address has to stay on top of the stack, so it is computed first.
         let r = &rels[j as usize];
         if tape.op_at(k0) == Op::DotC {
             let ops = block_dot_ops(tape, k0, r, b.reps, nt.dot.expect("staged"), sp, 0);
@@ -1384,9 +1369,8 @@ fn emit_block_backward(
     tmp1: u32,
     tmp2: u32,
 ) {
-    // Forward left iteration-local values in locals, which do not
-    // survive to here: recompute this iteration's, then clear the
-    // adjoints they accumulate into.
+    // Iteration-local values live in locals that do not survive to here: recompute
+    // this iteration's, then clear the adjoints they accumulate into.
     emit_block_forward(f, tape, m, b, sp, bl, tbl, rels, tmp1, tmp2, true);
     for j in 0..b.len {
         if let Some(a) = bl.adj(j) {
@@ -1452,13 +1436,12 @@ fn build_log_prob_grad(
     const_base: u32,
     slots: &Slots,
 ) -> Function {
-    // 4 i32 params at local indices 0..4: params_ptr, grads_ptr, n_params
-    // (unused — the recorded tape already encodes it), scratch_ptr.
+    // Locals 0..4: params_ptr, grads_ptr, n_params (unused — the tape encodes it),
+    // scratch_ptr.
     const GRADS_PTR: u32 = 1;
     let adj = n; // adjoint slots follow the primals
     let lay = Layout::for_tape(2 * n, !blocks.is_empty());
-    // Positions written and read inside one iteration go in locals instead of
-    // scratch; the widest block sizes the pool, and every block reuses it.
+    // The widest block sizes the locals pool, and every block reuses it.
     let block_local = reroll::local_positions(tape, blocks, root);
     let widest_locals = block_local
         .iter()
@@ -1489,8 +1472,7 @@ fn build_log_prob_grad(
         .map(|(b, r)| block_strides(b, r).len() as u32)
         .max()
         .unwrap_or(0);
-    // One induction variable, reused by every block, then the base pointers,
-    // then a scratch address per possible gather.
+    // One induction variable, then the base pointers, then one address per gather.
     let i32_locals = if blocks.is_empty() && !has_sum_loop {
         0
     } else {
@@ -1502,15 +1484,13 @@ fn build_log_prob_grad(
     let tmp1 = iv + 1 + widest;
     let tmp2 = tmp1 + 1;
 
-    // Which blocks run two repeats at a time, and where each one's
-    // loop-invariant adjoints accumulate while they do.
+    // Which blocks run two repeats at a time.
     let wide: Vec<bool> = blocks
         .iter()
         .enumerate()
         .map(|(i, b)| widenable(tape, b, &block_rels[i]))
         .collect();
-    // The v128 pool holds a widened block's iteration-local lane pairs first,
-    // laid out like the f64 pool, then its loop-invariant adjoints.
+    // The v128 pool mirrors the f64 pool, then holds the loop-invariant adjoints.
     let any_wide = wide.iter().any(|w| *w);
     let wide_locals = if any_wide { widest_locals } else { 0 };
     let v128_base = i32_base + i32_locals;
@@ -1543,9 +1523,7 @@ fn build_log_prob_grad(
     let mut f = Function::new(decl);
 
     // ---- zero the adjoint half --------------------------------------------
-    // Locals start at zero; a caller-owned scratch buffer is reused across
-    // calls, so its adjoint half has to be cleared. Primals are all written
-    // before they are read either way.
+    // Locals start at zero, but a caller-owned scratch buffer is reused across calls.
     if let Layout::Memory = lay {
         f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
         f.instruction(&Instruction::I32Const((n * 8) as i32));
@@ -1788,8 +1766,8 @@ fn build_log_prob_grad(
         }
     }
 
-    // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter,
-    // so unroll over the leaf-prefix count observed during tracing instead. ---
+    // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter, so
+    // unroll over the leaf-prefix count observed during tracing instead. ---------
     let n_params_observed = leaf_count(tape);
     for pi in 0..n_params_observed {
         f.instruction(&Instruction::LocalGet(GRADS_PTR));
@@ -1825,8 +1803,7 @@ fn is_param_leaf(tape: &Tape, k: u32) -> bool {
     if tape.op_at(k) != Op::Leaf {
         return false;
     }
-    // Leaves before the first non-leaf op are parameters; later leaves (rare
-    // — only created if Val::to_tape forces a constant) are not.
+    // Leaves before the first non-leaf op are parameters; later ones are constants.
     for j in 0..k {
         if tape.op_at(j) != Op::Leaf {
             return false;
@@ -2045,8 +2022,7 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         }
         Op::Pow => {
             {
-                // `reroll` rejects a block whose Pow exponent moves, so this
-                // is always an immediate.
+                // `reroll` rejects a block whose Pow exponent moves.
                 let Cst::Imm(e) = cst else {
                     unreachable!("Pow exponent is never table-backed")
                 };
@@ -2084,16 +2060,11 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
     }
 }
 
-// ---- adjoint update emitters: given adjoint `da`, source adjoint `dk` and any
-// primal locals, emit `da += <expression in dk and primals>`. ----
-
 // ---- value storage -------------------------------------------------------
 //
-// A tape node's primal and adjoint each occupy one "slot": primals are slots
-// 0..n, adjoints n..2n, and a re-rolled loop's moving constants follow at 2n.
-// Locals are register-allocated and much faster, but a function is capped at
-// 50,000 of them and a loop body cannot hold a whole vector in locals, so
-// slots otherwise live in a caller-owned scratch buffer.
+// One "slot" per primal (0..n), adjoint (n..2n) and moving constant (2n..).
+// Locals are much faster but capped per function, so slots otherwise live in a
+// caller-owned scratch buffer.
 
 /// Wasm locals cost nothing to address but are capped per function. V8's limit
 /// is the binding one; other engines allow more.
@@ -2214,9 +2185,8 @@ fn astore_end(f: &mut Function, a: Addr) {
 
 // ---- widened access ------------------------------------------------------
 //
-// Two lanes at a time. A `v128` here is always two consecutive repeats of one
-// value, so the only alignment a slot pair can promise is the 8 bytes a slot
-// has: `iv` steps by two but the slot itself may sit at either parity.
+// Two consecutive repeats per `v128`. `iv` steps by two but a slot may sit at
+// either parity, so a pair can only promise a slot's own 8-byte alignment.
 
 fn wmemarg(slot: u32) -> wasm_encoder::MemArg {
     wasm_encoder::MemArg {
@@ -2477,9 +2447,8 @@ fn adj_incr_pow(f: &mut Function, da: Addr, dk: Addr, tv: Addr, exponent: f64, p
     f.instruction(&Instruction::F64Const((exponent - 1.0).into()));
     f.instruction(&Instruction::Call(pow_idx));
     f.instruction(&Instruction::F64Mul);
-    // Zero when the base is: `x^n` with `n < 1` has an infinite slope there,
-    // and `select` takes the arm rather than the arithmetic, so the infinity
-    // never meets an adjoint. Same rule as the tape's backward.
+    // Zero at a zero base: `x^n` with `n < 1` has an infinite slope there, and
+    // `select` takes the arm rather than the arithmetic. Same as the tape's backward.
     f.instruction(&Instruction::F64Const(0.0.into()));
     aload(f, tv);
     f.instruction(&Instruction::F64Const(0.0.into()));

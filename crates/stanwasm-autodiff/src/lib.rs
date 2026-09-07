@@ -257,8 +257,7 @@ impl Tape {
     }
 
     fn push(&mut self, v: f64, op: Op, a1: u32, a2i: u32, a2f: f64) -> u32 {
-        // A leaf is a fresh input even when it repeats a value, so it is the
-        // one thing never shared.
+        // A leaf is a fresh input even when it repeats a value, so it is never shared.
         if op != Op::Leaf {
             let key: Vn = (op as u8, a1, a2i, a2f.to_bits());
             if let Some(&i) = self.vn.get(&key) {
@@ -437,8 +436,7 @@ impl Tape {
         let v = (0..coeffs.len())
             .map(|c| self.val[base as usize + c * stride as usize] * coeffs[c])
             .sum();
-        // Every contraction gets its own coefficients, so there is nothing for
-        // the value-numbering table to match and no reason to consult it.
+        // Every contraction has its own coefficients, so value numbering cannot hit.
         self.push_raw(v, Op::DotC, base, handle, 0.0)
     }
 
@@ -537,10 +535,8 @@ impl Tape {
                 Op::Sqrt => {
                     self.grad[a1] += g / (2.0 * self.val[i]);
                 }
-                // A base of exactly zero contributes nothing. `x^n` with `n < 1`
-                // — `sqrt` among them — has an infinite slope there, and one
-                // underflowed intermediate would otherwise turn the whole
-                // gradient into NaN on the way back.
+                // A zero base contributes nothing: `x^n` with `n < 1` has an infinite
+                // slope there, which one underflow would spread as NaN.
                 Op::Pow => {
                     let va = self.val[a1];
                     if va != 0.0 {
@@ -648,12 +644,8 @@ impl Tape {
 
 // ---- special functions (free standing — also used as primal helpers) ----
 
-// The three below are an asymptotic series preceded by a recurrence that
-// shifts the argument up to where the series converges. Both halves are sized
-// so the first dropped term lands below the double they return: a gradient
-// through `student_t` is exactly as accurate as `digamma` is, and
-// `tests/special_functions.rs` holds them to 1e-14 against a reference
-// computed at 60 decimal digits.
+// The three below are an asymptotic series preceded by a recurrence shifting the
+// argument up to where it converges, sized so the first dropped term underflows.
 const SHIFT_TO: f64 = 12.0;
 
 /// Stirling-series log-Gamma.
@@ -766,8 +758,7 @@ fn betacf(a: f64, b: f64, x: f64) -> f64 {
     for m in 1..=300 {
         let m = m as f64;
         let m2 = 2.0 * m;
-        // The fraction alternates between two forms of numerator, one per half
-        // step, so each iteration advances it twice.
+        // The numerator alternates per half step, so each iteration advances twice.
         for aa in [
             m * (b - m) * x / ((qam + m2) * (a + m2)),
             -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2)),

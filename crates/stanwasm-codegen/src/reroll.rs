@@ -128,14 +128,11 @@ fn probe(tape: &Tape, start: u32, len: u32, max_reps: u32) -> Option<Probe> {
         return None;
     }
 
-    // Three shapes the emitter has no form for. Rejected before the argument
-    // walk below, which costs `len * reps` reads: most of the candidates this
-    // is asked about die here, and detection probes `MAX_BLOCK` of them at
-    // every node it does not cover.
+    // Three shapes the emitter has no form for, rejected before the argument walk
+    // below: that walk costs `len * reps` reads and most candidates die here.
     for j in 0..len {
-        // A leaf reads the parameter buffer by absolute index, and a reduction
-        // walks a run the loop emitter has no form for — it is one node for a
-        // whole vectorised statement, so it never wants re-rolling anyway.
+        // A leaf reads the parameter buffer by absolute index; a reduction is already
+        // one node for a whole vectorised statement.
         match tape.op_at(start + j) {
             Op::Leaf | Op::Sum => return None,
             // A contraction is emitted unrolled, so every repeat has to
@@ -153,9 +150,8 @@ fn probe(tape: &Tape, start: u32, len: u32, max_reps: u32) -> Option<Probe> {
         }
     }
 
-    // An argument is affine when one stride explains every repeat, and tabled
-    // otherwise. The write target is structural and always affine, so a block
-    // is describable as long as few enough reads need a table.
+    // Affine when one stride explains every repeat, tabled otherwise. The write
+    // target is structural and always affine.
     let classify = |read: &dyn Fn(u32) -> u32| -> ArgRel {
         let v0 = read(start);
         let v1 = read(start + len);
@@ -299,8 +295,7 @@ pub fn detect(tape: &Tape) -> Vec<Block> {
                 best = Some(cand);
             }
             // Lengths ascend, so the first one still repeating at the cap is the
-            // shortest period here; a longer one can only describe the same
-            // region with a bigger body.
+            // shortest period here.
             if best.as_ref().is_some_and(|b| b.reps == PROBE_REPS) {
                 break;
             }
@@ -596,9 +591,8 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
     let n = tape.len() as u32;
     let mut out: Vec<Vec<bool>> = blocks.iter().map(|b| vec![true; b.len as usize]).collect();
 
-    // Which block, if any, owns a tape index, and at which position. Blocks are
-    // non-overlapping and in tape order, so this bisects rather than scanning:
-    // it is asked once per argument of every node on the tape.
+    // Which block owns a tape index, and where. Blocks are non-overlapping and in
+    // tape order, so this bisects — it runs once per argument of every node.
     let owner = |k: u32| -> Option<(usize, u32, u32)> {
         let bi = blocks.partition_point(|b| b.end() <= k);
         let b = blocks.get(bi)?;

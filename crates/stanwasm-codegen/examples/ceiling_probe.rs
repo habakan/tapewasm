@@ -462,9 +462,8 @@ fn build(v: V, n: u32, k: u32) -> (Vec<u8>, Lay) {
         }
     };
 
-    // Density backward, node by node: recompute the block's iteration-local
-    // primals, clear their adjoint locals, then one step per node in reverse.
-    // Leaves d_mu in L_DMU / W_T0.
+    // Density backward: recompute the iteration-local primals, clear their adjoint
+    // locals, then one step per node in reverse. Leaves d_mu in L_DMU / W_T0.
     let density_back = |e: &mut E| {
         if v.simd {
             e.vld(I_MU, 0).set(W_MU);
