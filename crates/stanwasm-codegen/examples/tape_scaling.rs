@@ -94,7 +94,7 @@ fn main() {
     for k in [2usize, 3, 4, 5, 6, 8, 10, 12, 16, 20, 25, 30, 40, 50] {
         let mut data = Env::new();
         data.set_scalar("K", k as f64);
-        let y: Vec<f64> = (0..k).map(|j| 0.1 * j as f64 % 3.7).collect();
+        let y: Vec<f64> = (0..k).map(|j| 0.37 * (j + 1) as f64).collect();
         data.set_vector("y", &y);
         match Model::parse_and_load(MULTIVARIATE_LKJ, data) {
             Ok(model) => report("K =", k, &model),
@@ -115,15 +115,16 @@ fn main() {
         data.set_scalar("N", n as f64);
         data.set_scalar("K", k as f64);
         // Distinct values throughout: identical rows are common subexpressions,
-        // and the tape numbers them into one node.
+        // and a node the tape shares makes both counts unrepresentative.
+        let mut seed: u64 = 987654321;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
         let rows: Vec<Val> = (0..n)
-            .map(|i| {
-                Val::Vec(
-                    (0..k)
-                        .map(|j| Val::Num(0.1 * (i * k + j) as f64 % 3.7))
-                        .collect(),
-                )
-            })
+            .map(|_| Val::Vec((0..k).map(|_| Val::Num(rnd() * 4.0 - 2.0)).collect()))
             .collect();
         data.set("y", Val::Vec(rows));
         match Model::parse_and_load(MULTIVARIATE_N, data) {

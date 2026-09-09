@@ -19,9 +19,18 @@
 
 use stanwasm_autodiff::{Op, Tape};
 
-/// Longest block considered. A vectorised density is well under this; the cap
-/// keeps detection from going quadratic on a tape with no structure.
-const MAX_BLOCK: u32 = 96;
+/// Longest block considered. A vectorised density is well under this, but a
+/// likelihood written as a loop over observations is not: one repeat of
+/// `multi_normal_cholesky` is about `1.2 * K * K` nodes, so `K = 14` needs 243.
+///
+/// The cap bounds detection on a tape with no structure, where the cost is
+/// linear in it: 60,000 unrepeating nodes take 25 ms at 96, 65 ms at 288 and
+/// 111 ms at 512. On a tape that does repeat it is the other way round —
+/// finding the real block is cheaper than shredding the tape into fragments,
+/// and K=10 at N=200 compiles in 2 ms at 288 against 12 ms at 96, emitting
+/// 47 KB against 896 KB. Raising it past here buys larger `K` at a cost paid
+/// by models with no repetition at all.
+const MAX_BLOCK: u32 = 288;
 
 /// Fewer repeats than this is not worth a loop: the prologue and induction
 /// variable cost more than the unrolled copies.
@@ -656,4 +665,72 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
     // The log density is read after the loops have run.
     demote(root, &mut out);
     out
+}
+
+#[cfg(test)]
+mod loop_form {
+    use super::detect;
+    use stanwasm_autodiff::Tape;
+    use stanwasm_runtime::{Env, Model, Val};
+
+    /// `for (n in 1:N) y[n] ~ multi_normal_cholesky(mu, L)`: one block per
+    /// observation, `K` deciding how long it is.
+    fn mvn_tape(n: usize, k: usize) -> Tape {
+        let src = r#"
+data { int<lower=1> N; int<lower=1> K; array[N] vector[K] y; }
+parameters { vector[K] mu; cholesky_factor_corr[K] L; }
+model {
+  mu ~ normal(0, 5);
+  L  ~ lkj_corr_cholesky(2.0);
+  for (n in 1:N) y[n] ~ multi_normal_cholesky(mu, L);
+}"#;
+        let mut data = Env::new();
+        data.set_scalar("N", n as f64);
+        data.set_scalar("K", k as f64);
+        // Distinct throughout: a repeated value is a common subexpression, and
+        // the node the tape then shares reads as a break in the period.
+        let mut seed: u64 = 987654321;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows: Vec<Val> = (0..n)
+            .map(|_| Val::Vec((0..k).map(|_| Val::Num(rnd() * 4.0 - 2.0)).collect()))
+            .collect();
+        data.set("y", Val::Vec(rows));
+        let model = Model::parse_and_load(src, data).unwrap();
+        let dummy = vec![0.1; model.n_params()];
+        let mut tape = Tape::new();
+        let leaves: Vec<u32> = dummy.iter().map(|p| tape.new_var(*p)).collect();
+        model.trace_forward(&mut tape, &leaves, true).unwrap();
+        tape
+    }
+
+    /// The block is ~1.2K² nodes, so this is what `MAX_BLOCK` has to reach past.
+    /// At 96 the K=10 tape found no per-observation block at all and shredded
+    /// into 1608 fragments covering 78%, which emitted 895 KB where 47 KB does.
+    #[test]
+    fn a_per_observation_block_is_found_up_to_k_14() {
+        for k in [5usize, 10, 14] {
+            let tape = mvn_tape(120, k);
+            let blocks = detect(&tape);
+            let covered: u32 = blocks.iter().map(|b| b.len * b.reps).sum();
+            let coverage = covered as f64 / tape.len() as f64;
+            let widest = blocks.iter().max_by_key(|b| b.reps).unwrap();
+            assert!(
+                coverage > 0.9,
+                "K={k}: only {:.0}% of the tape covered by {} blocks",
+                coverage * 100.0,
+                blocks.len()
+            );
+            assert!(
+                widest.reps >= 100,
+                "K={k}: the widest block repeats {} times, so the loop over \
+                 observations was not the thing found",
+                widest.reps
+            );
+        }
+    }
 }
