@@ -84,6 +84,32 @@ $(SAMPLER_OUT): $(WASM_SRC)
 browser-test: wasm ## Run a compiled module in Chromium, Firefox and WebKit
 	cd browser-tests && npm test
 
+.PHONY: package
+package: wasm ## Dry-run packaging every crate + the npm tarball
+	cargo package --workspace --no-verify
+# Apache-2.0 requires the licence text to travel with the artifact, and both
+# `cargo package` and `npm pack` only collect files inside their own directory
+# — the LICENSE at the repo root reaches no tarball on its own. The npm tarball
+# has a second invisible failure: `wasm-pack` writes its own `.gitignore`
+# (containing `*`) into `ts/pkg/`, which npm honours when no `.npmignore` sits
+# beside it, and that ships a package carrying no wasm at all. A published
+# version cannot be taken back, so both are asserted rather than assumed.
+	@list=$$(mktemp); \
+	for f in target/package/*.crate; do \
+	  tar tzf "$$f" > "$$list"; \
+	  grep -q '/LICENSE$$' "$$list" \
+	    || { echo "error: $$f ships no LICENSE" >&2; rm -f "$$list"; exit 1; }; \
+	done; \
+	rm -f "$$list"
+	@echo "LICENSE present in every .crate"
+# A script rather than a `node -e`: make 4.3 and make 3.81 disagree about a
+# backslash-continued line inside a recipe, and the older one is what macOS
+# ships, so the inline form passes locally and never runs on CI.
+	@pack=$$(mktemp); \
+	(cd ts && npm pack --dry-run --json) > "$$pack" \
+	  && node ts/tests/check_pack.mjs "$$pack"; \
+	status=$$?; rm -f "$$pack"; exit $$status
+
 .PHONY: clean
 clean: ## Remove build output
 	cargo clean
