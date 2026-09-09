@@ -13,7 +13,9 @@
 //!   root 41
 //!
 //! Prints `lp` and the gradient the emitted module computes at `test_params`,
-//! for a caller that wants to check them against its own.
+//! for a caller that wants to check them against its own. Given a second
+//! argument it also writes the module there and prints the buffer sizes a host
+//! needs to call it, so the caller can drive the module itself.
 
 use stanwasm_autodiff::Tape;
 use stanwasm_codegen::{compile_tape, Reroll};
@@ -177,5 +179,16 @@ fn main() {
     println!("lp {lp:.15e}");
     for g in &grads {
         println!("grad {g:.15e}");
+    }
+
+    if let Some(out) = std::env::args().nth(2) {
+        std::fs::write(&out, &compiled.wasm).expect("write module");
+        println!("wasm {out}");
+        println!("n_params {}", compiled.n_params);
+        println!("scratch_len {}", compiled.scratch_len);
+        println!("layout_id {}", compiled.layout_id);
+        for c in &compiled.const_table {
+            println!("const {c:.17e}");
+        }
     }
 }
