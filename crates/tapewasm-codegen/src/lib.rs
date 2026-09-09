@@ -13,9 +13,13 @@
 //! gradient buffers — no inter-wasm memcpy):
 //!
 //!   (import "tapewasm" "memory" (memory 1))           — shared linear memory
-//!   log_prob_grad(params_ptr: i32, grads_ptr: i32, n_params: i32) -> f64
+//!   log_prob_grad(params_ptr: i32, grads_ptr: i32, n_params: i32,
+//!                 scratch_ptr: i32) -> f64
 //!     reads params_ptr..params_ptr+n_params*8 and writes
 //!     grads_ptr..grads_ptr+n_params*8 in shared memory; returns log_prob.
+//!     `scratch_ptr` is where the module works — `Compiled::scratch_len` f64
+//!     slots the caller owns, with the re-rolled loops' constants staged at
+//!     the end. Unused by a module that keeps every value in a local.
 //!   (global "tapewasm_layout_id" i32)             — see [`Compiled::layout_id`]
 //!   (global "tapewasm_abi_version" i32)           — see [`ABI_VERSION`]
 //!
