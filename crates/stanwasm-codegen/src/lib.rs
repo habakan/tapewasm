@@ -32,6 +32,7 @@
 
 mod math;
 mod reroll;
+pub mod tape_text;
 
 use stanwasm_autodiff::{Op, Tape};
 use stanwasm_runtime::Model;
