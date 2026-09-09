@@ -16,6 +16,7 @@
 //!     reads params_ptr..params_ptr+n_params*8 and writes
 //!     grads_ptr..grads_ptr+n_params*8 in shared memory; returns log_prob.
 //!   (global "stanwasm_layout_id" i32)             — see [`Compiled::layout_id`]
+//!   (global "stanwasm_abi_version" i32)           — see [`ABI_VERSION`]
 //!
 //! The module uses the fixed-width SIMD proposal: a re-rolled loop whose every
 //! slot moves by one or not at all runs two repeats at a time. Every engine
@@ -56,6 +57,24 @@ pub enum CodegenError {
     #[error(transparent)]
     Eval(#[from] stanwasm_runtime::EvalError),
 }
+
+/// The shape of an emitted module, as a number a host can refuse.
+///
+/// Everything above is the contract between a module and whatever runs it: the
+/// imports, `log_prob_grad`'s signature, the exported globals, how the scratch
+/// buffer is laid out, and the wasm proposals a module may use. A module
+/// carries this as the immutable i32 global `stanwasm_abi_version`, and a host
+/// compares it against the number it was built with.
+///
+/// [`Compiled::layout_id`] cannot do this job. Both sides of that comparison —
+/// the module's global and the id the caller kept beside it — come from the
+/// same build, so the two move together and a host's own expectation never
+/// enters. This is the number that does not travel with the artifact.
+///
+/// Bump it whenever a change would make an older module unusable by a newer
+/// host, or the reverse. Never for a change a module of either version
+/// survives.
+pub const ABI_VERSION: u32 = 1;
 
 /// When to re-roll a vectorised statement into a wasm loop.
 ///
@@ -309,19 +328,24 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     // ---- global section ----------------------------------------------------
     let id = layout_id(tape, n_params, &const_table);
     let mut globals = GlobalSection::new();
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: false,
-            shared: false,
-        },
-        &ConstExpr::i32_const(id as i32),
-    );
+    let immutable_i32 = |v: i32, globals: &mut GlobalSection| {
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: false,
+                shared: false,
+            },
+            &ConstExpr::i32_const(v),
+        );
+    };
+    immutable_i32(id as i32, &mut globals);
+    immutable_i32(ABI_VERSION as i32, &mut globals);
 
     // ---- export section ----------------------------------------------------
     let mut exports = ExportSection::new();
     exports.export("log_prob_grad", ExportKind::Func, log_prob_grad_idx);
     exports.export("stanwasm_layout_id", ExportKind::Global, 0);
+    exports.export("stanwasm_abi_version", ExportKind::Global, 1);
 
     // ---- code section ------------------------------------------------------
     let mut codes = CodeSection::new();
