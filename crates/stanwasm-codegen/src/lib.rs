@@ -4,6 +4,9 @@
 //! Emits wasm binary directly via `wasm-encoder`, with no WAT step and no
 //! browser-side `wabt` dependency.
 //!
+//! The emitter reads only the tape, so [`compile_tape`] takes one directly —
+//! the entry point for a front end that records a tape some other way.
+//!
 //! Generated module ABI (zero-copy variant: memory is imported, not exported,
 //! so the AOT module shares the host's linear memory for parameter and
 //! gradient buffers — no inter-wasm memcpy):
@@ -126,8 +129,33 @@ pub fn compile_with(
     let mut tape = Tape::new();
     let leaves: Vec<u32> = dummy_params.iter().map(|p| tape.new_var(*p)).collect();
     let root = model.trace_forward(&mut tape, &leaves, true)?;
+    compile_tape(&tape, dummy_params.len(), root, reroll)
+}
+
+/// Emit a module from a tape recorded by something other than [`compile`].
+///
+/// The emitter reads only the tape, so any front end that records one can use
+/// it. Two things the recording must satisfy: the first `n_params` nodes are
+/// the parameter leaves, in the order `log_prob_grad` reads and writes them
+/// (a leaf recorded after the first non-leaf op is a constant, not a
+/// parameter), and `root` names the scalar the module returns.
+///
+/// Note that [`Tape`] numbers equal expressions into one node, so a caller
+/// that emits its own instruction stream cannot assume the two run in step.
+pub fn compile_tape(
+    tape: &Tape,
+    n_params: usize,
+    root: u32,
+    reroll: Reroll,
+) -> Result<Compiled, CodegenError> {
     if tape.is_empty() {
         return Err(CodegenError::EmptyTape);
+    }
+    let leaves = leaf_count(tape) as usize;
+    if leaves != n_params {
+        return Err(CodegenError::Internal(format!(
+            "tape opens with {leaves} leaves, but n_params is {n_params}"
+        )));
     }
     // No emitter arm for these; an `unimplemented!` would trap the whole module.
     for k in 0..tape.len() {
@@ -142,10 +170,10 @@ pub fn compile_with(
             });
         }
     }
-    let (wasm, const_table, layout_id) = emit(&tape, dummy_params.len(), root, reroll);
+    let (wasm, const_table, layout_id) = emit(tape, n_params, root, reroll);
     Ok(Compiled {
         wasm,
-        n_params: dummy_params.len(),
+        n_params,
         scratch_len: 2 * tape.len() + const_table.len(),
         const_table,
         layout_id,
