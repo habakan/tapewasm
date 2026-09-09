@@ -1,6 +1,10 @@
 // Produce what a page would serve: a module compiled ahead of time, the buffer
 // sizes recorded beside it, and the draws Node gets from them.
 //
+// The model is written straight as tape text — the same thing a front end in
+// any language hands over. Instruction numbers are what operands name, so the
+// counter here is the whole bookkeeping a front end has to do.
+//
 // Run from browser-tests/. Needs ts/pkg/, so `make wasm` first.
 
 import { writeFile, readFile, mkdir } from "node:fs/promises";
@@ -9,10 +13,10 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..");
-const { default: init, StanModel, AotSampler, setAotExports, sharedMemory } =
+const { default: init, AotSampler, compileTape, setAotExports, sharedMemory } =
   await import(resolve(repo, "ts", "index.js"));
 
-await init({ module_or_path: await readFile(resolve(repo, "ts/pkg/stanwasm_bg.wasm")) });
+await init({ module_or_path: await readFile(resolve(repo, "ts/pkg/tapewasm_bg.wasm")) });
 
 const N = 40;
 // A deterministic residual: with y an exact line in x the posterior for sigma
@@ -22,47 +26,59 @@ const noise = () => {
   seed = (seed * 1103515245 + 12345) & 0x7fffffff;
   return (seed / 0x7fffffff - 0.5) * 0.6;
 };
-const model = new StanModel(
-  `data { int<lower=0> N; vector[N] x; vector[N] y; }
-   parameters { real alpha; real beta; real<lower=0> sigma; }
-   model {
-     alpha ~ normal(0, 10); beta ~ normal(0, 10); sigma ~ exponential(1);
-     y ~ normal(alpha + beta * x, sigma);
-   }`,
-  JSON.stringify({
-    N,
-    x: Array.from({ length: N }, (_, i) => -2 + i * 0.1),
-    y: Array.from({ length: N }, (_, i) => -1.4 + i * 0.18 + noise()),
-  }),
-);
+const x = Array.from({ length: N }, (_, i) => -2 + i * 0.1);
+const y = Array.from({ length: N }, (_, i) => -1.4 + i * 0.18 + noise());
 
-const moduleBytes = model.compileToWasm();
+// y ~ normal(alpha + beta * x, sigma), sampled in log sigma: normal(0,10) on
+// the coefficients, exponential(1) on sigma, and the Jacobian of the transform.
+const lines = [];
+let next = 0;
+const op = (text) => (lines.push(text), next++);
+
+lines.push(`n_params 3`);
+const alpha = op(`new_var 0.0`);
+const beta = op(`new_var 0.0`);
+const logSigma = op(`new_var 0.0`);
+const sigma = op(`exp ${logSigma}`);
+const invSigma = op(`rdiv_c ${sigma} 1.0`);
+const a2 = op(`mul ${alpha} ${alpha}`);
+const b2 = op(`mul ${beta} ${beta}`);
+const coefPrior = op(`mul_c ${op(`add ${a2} ${b2}`)} -0.005`);
+let acc = op(`sub ${coefPrior} ${sigma}`);
+acc = op(`add ${acc} ${op(`mul_c ${logSigma} ${1 - N}`)}`);
+for (let i = 0; i < N; i++) {
+  const mu = op(`add ${alpha} ${op(`mul_c ${beta} ${x[i]}`)}`);
+  const z = op(`mul ${op(`rsub_c ${mu} ${y[i]}`)} ${invSigma}`);
+  acc = op(`add ${acc} ${op(`mul_c ${op(`mul ${z} ${z}`)} -0.5`)}`);
+}
+lines.push(`root ${acc}`);
+
+const built = compileTape(lines.join("\n"));
 const meta = {
-  nParams: model.n_params,
-  scratchInit: Array.from(model.aotScratchInit()),
-  paramNames: model.paramNames(),
-  init: [0, 0, 0],
+  nParams: built.nParams,
+  scratchInit: Array.from(built.scratchInit),
+  paramNames: ["alpha", "beta", "log_sigma"],
+  init: [0.1, 0.1, 0.1],
   warmup: 500,
   draws: 500,
   seed: 42,
+  layoutId: built.layoutId,
 };
 
 const fixtures = resolve(here, "fixtures");
 await mkdir(fixtures, { recursive: true });
-await writeFile(resolve(fixtures, "model.wasm"), moduleBytes);
+await writeFile(resolve(fixtures, "model.wasm"), built.wasm);
 
 // The same run, in Node, for the page to be compared against.
-const imports = {
-  stan: { memory: sharedMemory() },
+const aot = await WebAssembly.instantiate(built.wasm, {
+  tapewasm: { memory: sharedMemory() },
   Math: {
     exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
     tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
     lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
   },
-};
-const aot = await WebAssembly.instantiate(moduleBytes, imports);
+});
 setAotExports(aot.instance.exports);
-meta.layoutId = aot.instance.exports.stanwasm_layout_id.value >>> 0;
 
 const sampler = new AotSampler(
   meta.nParams, new Float64Array(meta.scratchInit), meta.layoutId, meta.paramNames,
@@ -87,4 +103,4 @@ await writeFile(
   resolve(fixtures, "expected.json"),
   JSON.stringify({ mean, sd: sd.map(Math.sqrt) }),
 );
-console.log(`fixtures: ${moduleBytes.length} byte module, mean beta ${mean[1].toFixed(4)}`);
+console.log(`fixtures: ${built.wasm.length} byte module, mean beta ${mean[1].toFixed(4)}`);

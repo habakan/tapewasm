@@ -1,5 +1,5 @@
 {
-  "name": "stanwasm-browser-tests",
+  "name": "tapewasm-browser-tests",
   "private": true,
   "type": "module",
   "description": "Runs a precompiled model in real engines. Separate from ts/ so the published package's dev install stays small.",

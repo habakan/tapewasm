@@ -3,17 +3,17 @@
 <title>precompiled model</title>
 <pre id="out">running…</pre>
 <script type="module">
-import init, { AotSampler, setAotExports, sharedMemory } from "/pkg/stanwasm.js";
+import init, { AotSampler, setAotExports, sharedMemory } from "/pkg/tapewasm.js";
 
 // `window.result` is what the test reads; a thrown error lands there too, so a
 // failure names itself rather than timing out.
 async function run() {
-  await init({ module_or_path: "/pkg/stanwasm_bg.wasm" });
+  await init({ module_or_path: "/pkg/tapewasm_bg.wasm" });
   const meta = await (await fetch("/fixtures/meta.json")).json();
   const bytes = await (await fetch("/fixtures/model.wasm")).arrayBuffer();
 
   const aot = await WebAssembly.instantiate(bytes, {
-    stan: { memory: sharedMemory() },
+    tapewasm: { memory: sharedMemory() },
     Math: {
       exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
       tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,

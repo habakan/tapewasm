@@ -1,0 +1,19 @@
+[package]
+name = "tapewasm-codegen"
+description = "Emits a recorded autodiff tape as a standalone wasm module computing a value and its gradient."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["autodiff", "wasm", "webassembly", "codegen", "compiler"]
+categories = ["wasm", "compilers", "science"]
+
+[dependencies]
+tapewasm-autodiff.workspace = true
+wasm-encoder.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+wasmparser = "0.258"
+wasmi = { version = "1.1", features = ["simd"] }

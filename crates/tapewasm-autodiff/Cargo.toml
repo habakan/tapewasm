@@ -1,0 +1,10 @@
+[package]
+name = "tapewasm-autodiff"
+description = "Reverse-mode autodiff on a flat (struct-of-arrays) tape."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["autodiff", "gradient", "tape", "reverse-mode", "bayesian"]
+categories = ["science", "mathematics"]

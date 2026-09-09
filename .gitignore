@@ -1,0 +1,26 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# wasm-bindgen output
+/pkg
+/ts/pkg
+/ts/pkg-sampler
+/browser-tests/fixtures
+
+# node
+node_modules
+dist
+
+# maintainer-only planning notes; kept on disk, never published
+/docs/internal/
+
+# agent instructions — personal setup, not part of the project
+/AGENTS.md
+/CLAUDE.md
+
+# editor
+.idea
+.vscode
+*.swp
+.DS_Store

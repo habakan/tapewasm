@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/tapewasm-autodiff", "crates/tapewasm-codegen", "crates/tapewasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Floor set by nuts-rs 0.18 (edition 2024 + let-chains).
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/habakan/tapewasm"
+
+[workspace.dependencies]
+# Each internal dep carries `path` (what local builds resolve) and `version` (what
+# `cargo publish` rewrites to).
+tapewasm-autodiff = { path = "crates/tapewasm-autodiff", version = "0.1.0" }
+tapewasm-codegen = { path = "crates/tapewasm-codegen", version = "0.1.0" }
+
+nuts-rs = { version = "0.18.1", default-features = false }
+wasm-bindgen = "0.2"
+wasm-encoder = "0.258"
+thiserror = "2"
+rand = { version = "0.10", features = ["chacha"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.release.package."tapewasm"]
+opt-level = "z"
+
+# nuts-rs pulled pulp's relaxed-simd, which WebKit rejects. #76 fixed it upstream;
+# this points at that commit until it reaches crates.io, then drop the block.
+[patch.crates-io]
+nuts-rs = { git = "https://github.com/pymc-devs/nuts-rs", rev = "fa647966938ce4116fb4ced8584229e654ca9035" }

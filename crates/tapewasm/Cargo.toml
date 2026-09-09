@@ -1,0 +1,35 @@
+[package]
+name = "tapewasm"
+description = "Compile an autodiff tape to a wasm module and sample it with nuts-rs, in the browser. The wasm-bindgen API over tapewasm-codegen."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["autodiff", "wasm", "bayesian", "mcmc", "nuts"]
+categories = ["wasm", "science", "api-bindings"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["codegen"]
+# The emitter, and `compileTape` over it. Without it only `AotSampler` is left,
+# which reads a module someone compiled earlier and needs no emitter in the
+# bundle.
+codegen = ["dep:tapewasm-codegen"]
+
+[dependencies]
+tapewasm-codegen = { workspace = true, optional = true }
+
+wasm-bindgen.workspace = true
+nuts-rs = { workspace = true }
+rand = { workspace = true }
+thiserror.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+wasmparser = "0.258"
