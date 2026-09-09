@@ -1,0 +1,13 @@
+{
+  "name": "stanwasm-browser-tests",
+  "private": true,
+  "type": "module",
+  "description": "Runs a precompiled model in real engines. Separate from ts/ so the published package's dev install stays small.",
+  "scripts": {
+    "prepare-fixtures": "node prepare.mjs",
+    "test": "node prepare.mjs && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0"
+  }
+}

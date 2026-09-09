@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>precompiled model</title>
+<pre id="out">running…</pre>
+<script type="module">
+import init, { AotSampler, setAotExports, sharedMemory } from "/pkg/stanwasm.js";
+
+// `window.result` is what the test reads; a thrown error lands there too, so a
+// failure names itself rather than timing out.
+async function run() {
+  await init({ module_or_path: "/pkg/stanwasm_bg.wasm" });
+  const meta = await (await fetch("/fixtures/meta.json")).json();
+  const bytes = await (await fetch("/fixtures/model.wasm")).arrayBuffer();
+
+  const aot = await WebAssembly.instantiate(bytes, {
+    stan: { memory: sharedMemory() },
+    Math: {
+      exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+      tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
+      lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
+    },
+  });
+  setAotExports(aot.instance.exports);
+
+  const sampler = new AotSampler(
+    meta.nParams, new Float64Array(meta.scratchInit), meta.layoutId, meta.paramNames,
+  );
+  const t0 = performance.now();
+  const flat = sampler.sample(
+    new Float64Array(meta.init), meta.warmup, meta.draws, BigInt(meta.seed),
+  );
+  const ms = performance.now() - t0;
+
+  const n = meta.nParams;
+  const post = flat.subarray(meta.warmup * n);
+  const mean = new Array(n).fill(0);
+  for (let i = 0; i < meta.draws; i++) {
+    for (let k = 0; k < n; k++) mean[k] += post[i * n + k] / meta.draws;
+  }
+  return { ok: true, mean, ms, moduleBytes: bytes.byteLength };
+}
+
+run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; })
+  .finally(() => { document.getElementById("out").textContent = JSON.stringify(window.result); });
+</script>
