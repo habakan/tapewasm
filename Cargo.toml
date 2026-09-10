@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 # Floor set by nuts-rs 0.18 (edition 2024 + let-chains).
 rust-version = "1.88"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/habakan/tapewasm"
 
 [workspace.dependencies]

@@ -107,4 +107,6 @@ make wasm           # the bundle, into ts/pkg/
 make browser-test   # a compiled module in Chromium, Firefox and WebKit
 ```
 
-Apache-2.0.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
+at your option. Unless you state otherwise, any contribution you submit shall be
+dual licensed as above, with no additional terms.
