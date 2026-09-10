@@ -704,17 +704,31 @@ impl CompiledTape {
 ///
 /// The format is not an artifact and carries no compatibility promise: a tape
 /// is written and consumed inside one call.
+///
+/// `reroll` says when a vectorised statement becomes a wasm loop: `"auto"`
+/// (the default, straight-line below a size threshold), `"always"` or
+/// `"never"`. Which is faster is an engine's preference, not the model's —
+/// on one real model straight-line was faster on V8 and slower on
+/// SpiderMonkey and JavaScriptCore — and `"always"` is also the smallest
+/// module, often by an order of magnitude.
 #[cfg(feature = "codegen")]
 #[wasm_bindgen(js_name = compileTape)]
-pub fn compile_tape(tape: &str) -> Result<CompiledTape, JsError> {
+pub fn compile_tape(tape: &str, reroll: Option<String>) -> Result<CompiledTape, JsError> {
+    use tapewasm_codegen::Reroll;
+    let reroll = match reroll.as_deref() {
+        None | Some("auto") => Reroll::Auto,
+        Some("always") => Reroll::Always,
+        Some("never") => Reroll::Never,
+        Some(other) => {
+            return Err(JsError::new(&format!(
+                "reroll must be \"auto\", \"always\" or \"never\", not {other:?}"
+            )))
+        }
+    };
     let program = tapewasm_codegen::tape_text::parse(tape).map_err(jserr)?;
-    let compiled = tapewasm_codegen::compile_tape(
-        &program.tape,
-        program.n_params,
-        program.root,
-        tapewasm_codegen::Reroll::default(),
-    )
-    .map_err(jserr)?;
+    let compiled =
+        tapewasm_codegen::compile_tape(&program.tape, program.n_params, program.root, reroll)
+            .map_err(jserr)?;
 
     let mut scratch_init = vec![0.0_f64; compiled.scratch_len];
     let at = compiled.scratch_len - compiled.const_table.len();

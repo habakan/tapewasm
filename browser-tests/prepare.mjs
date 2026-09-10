@@ -18,6 +18,12 @@ const { default: init, AotSampler, compileTape, setAotExports, sharedMemory } =
 
 await init({ module_or_path: await readFile(resolve(repo, "ts/pkg/tapewasm_bg.wasm")) });
 
+const MATH = {
+  exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+  tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
+  lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
+};
+
 const N = 40;
 // A deterministic residual: with y an exact line in x the posterior for sigma
 // runs off to zero, and every comparison against it divides by nothing.
@@ -72,11 +78,7 @@ await writeFile(resolve(fixtures, "model.wasm"), built.wasm);
 // The same run, in Node, for the page to be compared against.
 const aot = await WebAssembly.instantiate(built.wasm, {
   tapewasm: { memory: sharedMemory() },
-  Math: {
-    exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
-    tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
-    lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
-  },
+  Math: MATH,
 });
 setAotExports(aot.instance.exports);
 
@@ -104,6 +106,35 @@ await writeFile(
   JSON.stringify({ mean, sd: sd.map(Math.sqrt) }),
 );
 console.log(`fixtures: ${built.wasm.length} byte module, mean beta ${mean[1].toFixed(4)}`);
+
+// `reroll` reaches the emitter. This tape is under the size threshold, so the
+// default is straight-line ("never"), and "always" re-rolls it smaller.
+const text = lines.join("\n");
+if (compileTape(text, "never").layoutId !== built.layoutId) {
+  throw new Error('compileTape(text, "never") differs from the default below the threshold');
+}
+const rolled = compileTape(text, "always");
+if (!(rolled.wasm.length < built.wasm.length)) {
+  throw new Error(`"always" is ${rolled.wasm.length} bytes against ${built.wasm.length} straight-line`);
+}
+let refused = false;
+try { compileTape(text, "sometimes"); } catch { refused = true; }
+if (!refused) throw new Error('compileTape accepted reroll "sometimes"');
+const lpStraight = sampler.logProbGrad(new Float64Array(meta.init));
+const rolledAot = await WebAssembly.instantiate(rolled.wasm, {
+  tapewasm: { memory: sharedMemory() },
+  Math: MATH,
+});
+setAotExports(rolledAot.instance.exports);
+const lpRolled = new AotSampler(rolled.nParams, rolled.scratchInit, rolled.layoutId, [])
+  .logProbGrad(new Float64Array(meta.init));
+setAotExports(aot.instance.exports);
+lpRolled.forEach((v, i) => {
+  if (Math.abs(v - lpStraight[i]) > 1e-9 * Math.max(1, Math.abs(lpStraight[i]))) {
+    throw new Error(`re-rolled [lp, grad][${i}] = ${v}, straight-line ${lpStraight[i]}`);
+  }
+});
+console.log(`reroll: ${built.wasm.length} byte module straight-line, ${rolled.wasm.length} re-rolled`);
 
 // A fixture for `advi()`: two conjugate normal means, whose posterior is exactly
 // Gaussian, so mean-field ADVI has a closed-form answer to recover.
@@ -155,11 +186,7 @@ await writeFile(resolve(fixtures, "advi_expected.json"), JSON.stringify(adviExpe
 // caught here rather than only inside a browser.
 const adviAot = await WebAssembly.instantiate(adviBuilt.wasm, {
   tapewasm: { memory: sharedMemory() },
-  Math: {
-    exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
-    tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
-    lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
-  },
+  Math: MATH,
 });
 setAotExports(adviAot.instance.exports);
 const adviSampler = new AotSampler(
