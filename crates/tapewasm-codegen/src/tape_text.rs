@@ -20,6 +20,29 @@
 //! other instruction is a constant. `root` names the instruction whose value
 //! the module returns.
 //!
+//! The instructions, all of them:
+//!
+//! ```text
+//! new_var C                             a leaf
+//! add A B    sub A B    mul A B         two operands
+//! div A B
+//! neg A      exp A      log A           one operand
+//! sin A      cos A      tan A
+//! asin A     acos A     atan A
+//! sqrt A     abs A      lgamma A
+//! phi A
+//! pow A C                               one operand and a constant
+//! add_c A C  sub_c A C  rsub_c A C      `rsub_c` is `C - A`
+//! mul_c A C  div_c A C  rdiv_c A C      `rdiv_c` is `C / A`
+//! ```
+//!
+//! `Tape` records four more — `student_t_lccdf`, `erf`, `erfc` and `digamma` —
+//! which the emitter has no instruction sequence for, so writing them here
+//! would only move where the refusal happens. The contraction (`dot_c`) and the
+//! reduction (`sum_run`) are absent for a different reason: both take a stride
+//! measured in *node* indices, which a caller counting instructions cannot
+//! supply, so exposing them needs a formulation this format does not have yet.
+//!
 //! **Operands are instruction numbers, not node indices.** The tape numbers
 //! equal expressions into one node, so the k-th instruction is not generally
 //! the k-th node, and a front end that assumes otherwise produces a module that
@@ -122,6 +145,10 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
             "cos" => tape.cos(idx(1)?),
             "sqrt" => tape.sqrt(idx(1)?),
             "abs" => tape.abs(idx(1)?),
+            "tan" => tape.tan(idx(1)?),
+            "asin" => tape.asin(idx(1)?),
+            "acos" => tape.acos(idx(1)?),
+            "atan" => tape.atan(idx(1)?),
             "lgamma" => tape.lgamma(idx(1)?),
             "phi" => tape.phi(idx(1)?),
             "pow" => tape.pow(idx(1)?, num(2)?),

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`tan`, `asin`, `acos` and `atan` in the tape text format.** The emitter has
+  always been able to emit them; no front end outside this crate could ask for
+  them, because the only test that reached them built the tape directly. The
+  module doc now lists every instruction the format accepts, and says why
+  `dot_c` and `sum_run` are not among them — both take a stride in node indices,
+  which a caller counting instructions cannot supply.
+- `every_instruction_in_the_text_format_reaches_the_emitter` runs the whole
+  instruction set through both re-roll modes against the tape's reverse pass.
+
 ## [0.1.1] — 2026-09-10 (npm only)
 
 ### Changed

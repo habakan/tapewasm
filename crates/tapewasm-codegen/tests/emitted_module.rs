@@ -312,3 +312,85 @@ fn compile_tape_rejects_a_param_count_the_tape_does_not_open_with() {
     let err = compile_tape(&tape, 2, root, Reroll::default()).unwrap_err();
     assert!(err.to_string().contains("n_params is 2"), "{err}");
 }
+
+/// Every instruction the text format accepts, through the emitter, against the
+/// tape's reverse pass.
+///
+/// The hole this closes: `tan`, `asin`, `acos` and `atan` were emittable and
+/// unwritable for as long as the format existed, because the only test that
+/// reached them built the tape directly. Adding an op to the emitter without
+/// adding it here now leaves a listed instruction untested rather than an
+/// unreachable one unnoticed.
+#[test]
+fn every_instruction_in_the_text_format_reaches_the_emitter() {
+    // One line per instruction, arranged so nothing lands outside a domain:
+    // `asin`/`acos` want |x| <= 1, `log`/`lgamma`/`sqrt` want x > 0.
+    let src = "\
+n_params 2
+new_var 0.4
+new_var 0.7
+add 0 1
+sub 0 1
+mul 0 1
+div 0 1
+neg 0
+exp 0
+mul_c 7 0.1
+log 8
+sin 0
+cos 0
+tan 0
+asin 0
+acos 0
+atan 0
+sqrt 8
+abs 3
+lgamma 8
+phi 0
+pow 0 3.0
+add_c 0 1.5
+sub_c 0 0.25
+rsub_c 0 2.0
+mul_c 0 1.5
+div_c 0 2.0
+rdiv_c 8 1.0
+add 2 3
+add 27 4
+add 28 5
+add 29 6
+add 30 9
+add 31 10
+add 32 11
+add 33 12
+add 34 13
+add 35 14
+add 36 15
+add 37 16
+add 38 17
+add 39 18
+add 40 19
+add 41 20
+add 42 21
+add 43 22
+add 44 23
+add 45 24
+add 46 25
+add 47 26
+root 48
+";
+    let program = tapewasm_codegen::tape_text::parse(src).expect("every instruction parses");
+    let mut tape = program.tape;
+    // Both re-roll modes, because the straight-line and loop emitters select
+    // instructions separately and only the tape is shared.
+    for mode in [Reroll::Never, Reroll::Always] {
+        let c = compile_tape(&tape, 2, program.root, mode).unwrap();
+        let params = [0.4, 0.7];
+        let (lp, grads) =
+            run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+        let (want_lp, want_grads) = tape_oracle(&mut tape, program.root, &params);
+        assert!(close(lp, want_lp, 1e-12), "{mode:?}: lp {lp} vs {want_lp}");
+        for (i, (a, w)) in grads.iter().zip(want_grads.iter()).enumerate() {
+            assert!(close(*a, *w, 1e-12), "{mode:?}: grad[{i}] {a} vs {w}");
+        }
+    }
+}
