@@ -164,6 +164,39 @@ console.log(
   `final step ${stats.stepSize[total - 1].toPrecision(3)}`,
 );
 
+// A higher target acceptance adapts a smaller step during warmup.
+const meanStep = (r) => r.stepSize.subarray(meta.warmup).reduce((a, b) => a + b, 0) / meta.draws;
+const strict = new AotSampler(
+  meta.nParams, new Float64Array(meta.scratchInit), meta.layoutId, meta.paramNames,
+);
+strict.setTargetAccept(0.95);
+const tight = strict.sampleWithStats(
+  new Float64Array(meta.init), meta.warmup, meta.draws, BigInt(meta.seed), 0,
+);
+if (!(meanStep(tight) < meanStep(withStats))) {
+  throw new Error(`target 0.95 adapted step ${meanStep(tight)}, not below 0.8's ${meanStep(withStats)}`);
+}
+for (const bad of [0, 1, NaN]) {
+  let rejected = false;
+  try { strict.setTargetAccept(bad); } catch { rejected = true; }
+  if (!rejected) throw new Error(`setTargetAccept(${bad}) was accepted`);
+}
+// The gradient-based metric estimate is a different adaptation, so different draws.
+const gradBased = new AotSampler(
+  meta.nParams, new Float64Array(meta.scratchInit), meta.layoutId, meta.paramNames,
+);
+gradBased.setGradBasedEstimate(true);
+const gradDraws = gradBased.sample(
+  new Float64Array(meta.init), meta.warmup, meta.draws, BigInt(meta.seed),
+);
+if (gradDraws.every((v, i) => v === flat[i])) {
+  throw new Error("setGradBasedEstimate(true) drew exactly what the default did");
+}
+console.log(
+  `settings: mean step ${meanStep(withStats).toPrecision(3)} at 0.8, ` +
+  `${meanStep(tight).toPrecision(3)} at 0.95`,
+);
+
 // A fixture for `advi()`: two conjugate normal means, whose posterior is exactly
 // Gaussian, so mean-field ADVI has a closed-form answer to recover.
 const adviGroups = [
