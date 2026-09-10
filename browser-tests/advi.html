@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>advi</title>
+<pre id="out">running…</pre>
+<script type="module">
+import init, { AotSampler, setAotExports, sharedMemory } from "/pkg/tapewasm.js";
+
+// `window.result` is what the test reads; a thrown error lands there too, so a
+// failure names itself rather than timing out.
+async function run() {
+  await init({ module_or_path: "/pkg/tapewasm_bg.wasm" });
+  const meta = await (await fetch("/fixtures/advi_meta.json")).json();
+  const bytes = await (await fetch("/fixtures/advi_model.wasm")).arrayBuffer();
+
+  const aot = await WebAssembly.instantiate(bytes, {
+    tapewasm: { memory: sharedMemory() },
+    Math: {
+      exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+      tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
+      lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
+    },
+  });
+  setAotExports(aot.instance.exports);
+
+  const sampler = new AotSampler(
+    meta.nParams, new Float64Array(meta.scratchInit), meta.layoutId, meta.paramNames,
+  );
+  const t0 = performance.now();
+  const result = sampler.advi(
+    new Float64Array(meta.init), meta.numIters, meta.mcSamples, meta.learningRate,
+    BigInt(meta.seed), 0,
+  );
+  const ms = performance.now() - t0;
+
+  return {
+    ok: true,
+    mu: Array.from(result.mu),
+    sigma: Array.from(result.sigma),
+    ms,
+    moduleBytes: bytes.byteLength,
+  };
+}
+
+run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; })
+  .finally(() => { document.getElementById("out").textContent = JSON.stringify(window.result); });
+</script>

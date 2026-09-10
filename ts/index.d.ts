@@ -1,6 +1,7 @@
 // Types for `index.js`; the shapes come from `pkg/`, which `make wasm` writes.
 export {
   AotSampler,
+  AdviResult,
   CompiledTape,
   compileTape,
   tapewasmVersion,

@@ -12,12 +12,13 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::f64::consts::{E, PI};
 
 use nuts_rs::{
     sample_sequentially, CpuLogpFunc, CpuMath, CpuMathError, DiagNutsSettings, HasDims, LogpError,
 };
 
-use rand::{rngs::ChaCha8Rng, SeedableRng};
+use rand::{rngs::ChaCha8Rng, Rng, RngExt, SeedableRng};
 
 use thiserror::Error;
 
@@ -445,6 +446,217 @@ impl AotSampler {
             out[i * n..(i + 1) * n].copy_from_slice(pos.as_ref());
         }
         Ok(out)
+    }
+
+    /// Mean-field ADVI: fits `q(θ) = N(μ, diag(σ²))` to the log density by
+    /// Adam-ascending the ELBO under the reparameterization trick
+    /// `θ = μ + σ·η`, `η ~ N(0, I)`. `init` seeds `μ`; `ω = log σ` starts at
+    /// `0` (`σ = 1`).
+    ///
+    /// The ELBO gradient combines the tape's `∂logp/∂θ` (from `log_prob_grad`)
+    /// with the reparameterization's own Jacobian and the mean-field Gaussian
+    /// entropy's gradient, both exact rather than estimated:
+    /// `∂ELBO/∂μ_i = ∂logp/∂θ_i`, `∂ELBO/∂ω_i = ∂logp/∂θ_i · σ_i · η_i + 1`.
+    /// Each is averaged over `mc_samples` reparameterized draws per iteration.
+    ///
+    /// `AdviResult::mu`/`sigma` average `(μ, ω)` over the second half of
+    /// `num_iters` (Polyak averaging): a constant Adam step size never settles
+    /// on one point, so the plain last iterate keeps wandering a "noise ball"
+    /// around the optimum. `elbo_trace` still reports the raw iterate's ELBO
+    /// per step, for diagnosing convergence rather than for the fitted result.
+    ///
+    /// `snapshot_every` (0 disables it) additionally copies the raw iterate
+    /// `μ` every that-many iterations into `AdviResult::muSnapshots` — a film
+    /// strip of the one training run, rather than several shorter ones
+    /// spliced together: restarting Adam's moment estimates partway through
+    /// measurably converges to a worse optimum, so this is the only way to
+    /// watch a run progress without paying for that.
+    pub fn advi(
+        &self,
+        init: &[f64],
+        num_iters: u32,
+        mc_samples: u32,
+        learning_rate: f64,
+        seed: u64,
+        snapshot_every: u32,
+    ) -> Result<AdviResult, JsError> {
+        let n = self.n_params;
+        if init.len() != n {
+            return Err(JsError::new(&format!(
+                "init length {} != n_params {n}",
+                init.len()
+            )));
+        }
+        if num_iters == 0 {
+            return Err(JsError::new("num_iters must be at least 1"));
+        }
+        if mc_samples == 0 {
+            return Err(JsError::new("mc_samples must be at least 1"));
+        }
+        if learning_rate.is_nan() || learning_rate <= 0.0 {
+            return Err(JsError::new("learning_rate must be positive"));
+        }
+        check_aot_binding(self.layout_id)?;
+
+        const BETA1: f64 = 0.9;
+        const BETA2: f64 = 0.999;
+        const EPS: f64 = 1e-8;
+
+        let mut logp_fn = self.logp_fn();
+        let mut mu = init.to_vec();
+        let mut omega = vec![0.0_f64; n];
+        let (mut m_mu, mut v_mu) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+        let (mut m_omega, mut v_omega) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut elbo_trace = Vec::with_capacity(num_iters as usize);
+
+        let mut eta = vec![0.0_f64; n];
+        let mut theta = vec![0.0_f64; n];
+        let mut grad = vec![0.0_f64; n];
+        let mut grad_mu = vec![0.0_f64; n];
+        let mut grad_omega = vec![0.0_f64; n];
+
+        let burn_in = num_iters / 2;
+        let mut sum_mu = vec![0.0_f64; n];
+        let mut sum_omega = vec![0.0_f64; n];
+        let mut avg_count: u32 = 0;
+
+        let mut mu_snapshots = Vec::new();
+        let mut snapshot_iters = Vec::new();
+
+        for t in 1..=num_iters {
+            grad_mu.iter_mut().for_each(|g| *g = 0.0);
+            grad_omega.iter_mut().for_each(|g| *g = 0.0);
+            let mut lp_sum = 0.0;
+
+            for _ in 0..mc_samples {
+                fill_standard_normal(&mut rng, &mut eta);
+                for i in 0..n {
+                    theta[i] = mu[i] + omega[i].exp() * eta[i];
+                }
+                let lp = logp_fn
+                    .logp(&theta, &mut grad)
+                    .map_err(|e| JsError::new(&format!("advi: {e} at iteration {t}")))?;
+                if !lp.is_finite() {
+                    return Err(JsError::new(&format!(
+                        "advi: log density is non-finite at iteration {t}; \
+                         lower the learning rate or check the model at \
+                         extreme unconstrained values"
+                    )));
+                }
+                lp_sum += lp;
+                for i in 0..n {
+                    grad_mu[i] += grad[i];
+                    grad_omega[i] += grad[i] * omega[i].exp() * eta[i];
+                }
+            }
+
+            let s = mc_samples as f64;
+            let bias1 = 1.0 - BETA1.powi(t as i32);
+            let bias2 = 1.0 - BETA2.powi(t as i32);
+            for i in 0..n {
+                let g_mu = grad_mu[i] / s;
+                let g_omega = grad_omega[i] / s + 1.0;
+
+                m_mu[i] = BETA1 * m_mu[i] + (1.0 - BETA1) * g_mu;
+                v_mu[i] = BETA2 * v_mu[i] + (1.0 - BETA2) * g_mu * g_mu;
+                mu[i] += learning_rate * (m_mu[i] / bias1) / ((v_mu[i] / bias2).sqrt() + EPS);
+
+                m_omega[i] = BETA1 * m_omega[i] + (1.0 - BETA1) * g_omega;
+                v_omega[i] = BETA2 * v_omega[i] + (1.0 - BETA2) * g_omega * g_omega;
+                omega[i] +=
+                    learning_rate * (m_omega[i] / bias1) / ((v_omega[i] / bias2).sqrt() + EPS);
+            }
+
+            let entropy = omega.iter().sum::<f64>() + 0.5 * n as f64 * (2.0 * PI * E).ln();
+            elbo_trace.push(lp_sum / s + entropy);
+
+            if t > burn_in {
+                avg_count += 1;
+                for i in 0..n {
+                    sum_mu[i] += mu[i];
+                    sum_omega[i] += omega[i];
+                }
+            }
+
+            if snapshot_every > 0 && (t % snapshot_every == 0 || t == num_iters) {
+                mu_snapshots.extend_from_slice(&mu);
+                snapshot_iters.push(t as f64);
+            }
+        }
+
+        let count = avg_count as f64;
+        Ok(AdviResult {
+            mu: sum_mu.iter().map(|s| s / count).collect(),
+            sigma: sum_omega.iter().map(|s| (s / count).exp()).collect(),
+            elbo_trace,
+            mu_snapshots,
+            snapshot_iters,
+        })
+    }
+}
+
+/// The fitted mean-field variational distribution and its ELBO trajectory.
+#[wasm_bindgen]
+pub struct AdviResult {
+    mu: Vec<f64>,
+    sigma: Vec<f64>,
+    elbo_trace: Vec<f64>,
+    mu_snapshots: Vec<f64>,
+    snapshot_iters: Vec<f64>,
+}
+
+#[wasm_bindgen]
+impl AdviResult {
+    #[wasm_bindgen(getter)]
+    pub fn mu(&self) -> Vec<f64> {
+        self.mu.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn sigma(&self) -> Vec<f64> {
+        self.sigma.clone()
+    }
+
+    /// The ELBO estimate after each iteration, in order.
+    #[wasm_bindgen(getter, js_name = elboTrace)]
+    pub fn elbo_trace(&self) -> Vec<f64> {
+        self.elbo_trace.clone()
+    }
+
+    /// The raw (pre-averaging) iterate `μ` every `snapshot_every` iterations,
+    /// one snapshot's `n_params` values after another. Empty unless `advi`
+    /// was called with `snapshot_every > 0`.
+    #[wasm_bindgen(getter, js_name = muSnapshots)]
+    pub fn mu_snapshots(&self) -> Vec<f64> {
+        self.mu_snapshots.clone()
+    }
+
+    /// The iteration number each entry of `muSnapshots` was taken at.
+    #[wasm_bindgen(getter, js_name = snapshotIters)]
+    pub fn snapshot_iters(&self) -> Vec<f64> {
+        self.snapshot_iters.clone()
+    }
+}
+
+/// Standard normal draws by Box-Muller, so one distribution does not pull in
+/// `rand_distr`; seeded like `sample()`, a run is reproducible.
+fn fill_standard_normal<R: Rng>(rng: &mut R, out: &mut [f64]) {
+    let mut pairs = out.chunks_exact_mut(2);
+    for pair in &mut pairs {
+        let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+        let u2: f64 = rng.random();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * PI * u2;
+        pair[0] = r * theta.cos();
+        pair[1] = r * theta.sin();
+    }
+    let rest = pairs.into_remainder();
+    if let Some(last) = rest.first_mut() {
+        let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+        let u2: f64 = rng.random();
+        *last = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
     }
 }
 

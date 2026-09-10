@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`AotSampler::advi`, mean-field ADVI over the same AOT path `sample`
+  uses.** Fits `q(θ) = N(μ, diag(σ²))` by Adam-ascending the ELBO under the
+  reparameterization trick, calling `log_prob_grad` per draw rather than
+  adding anything to the tape or the emitter — the primitive it needs already
+  existed. `AdviResult::mu`/`sigma` average the second half of the run
+  (Polyak averaging), since a constant Adam step size never settles on one
+  point. Phase 1 of the ADVI plan; not gated behind `codegen`, so it also
+  runs against a module compiled ahead of time. Optional `snapshot_every`
+  records the raw iterate `μ` periodically through the run
+  (`AdviResult::muSnapshots`/`snapshotIters`), for watching one training run
+  progress rather than splicing several shorter ones together.
 - **`tan`, `asin`, `acos` and `atan` in the tape text format.** The emitter has
   always been able to emit them; no front end outside this crate could ask for
   them, because the only test that reached them built the tape directly. The
