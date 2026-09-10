@@ -543,6 +543,19 @@ mod tests {
             inside * 10 >= total * 9,
             "only {inside}/{total} reductions are in a block"
         );
+        // Its products are read in their own iteration, so only the accumulator needs an address.
+        let flags = local_positions(&tape, &blocks, acc);
+        let (bi, b) = blocks
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, b)| b.reps)
+            .unwrap();
+        let local = flags[bi].iter().filter(|f| **f).count();
+        assert!(
+            local + 1 >= b.len as usize,
+            "only {local}/{} positions are local",
+            b.len
+        );
     }
 
     #[test]
@@ -591,15 +604,24 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
         }
     };
 
-    // A contraction or a reduction reads a whole run, not one node, and the
-    // emitter addresses every element of it.
+    // A run is addressed element by element, except a reduction's elements from its
+    // own iteration: with the base moving by `len`, those stay locals, as an argument would.
     for k in 0..n {
-        if !matches!(tape.op_at(k), Op::DotC | Op::Sum) {
+        let op = tape.op_at(k);
+        if !matches!(op, Op::DotC | Op::Sum) {
             continue;
         }
         let e = tape.extent_at(k);
+        let reader = owner(k);
         for c in 0..e.len {
-            demote(e.base + c * e.stride, &mut out);
+            let t = e.base + c * e.stride;
+            match (op, owner(t), reader) {
+                (Op::Sum, Some((tb, ti, _)), Some((kb, ki, kj)))
+                    if tb == kb
+                        && ti == ki
+                        && blocks[kb].args[kj as usize].run == blocks[kb].len => {}
+                _ => demote(t, &mut out),
+            }
         }
     }
 

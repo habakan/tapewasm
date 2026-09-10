@@ -40,8 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-output `sum_run` — fell out of every loop with everything around it: a
   decoder of 6,272 sums of 20 covered 71.5% of its tape and emitted 5,285 KB,
   against 688 KB written elementwise. It now joins its statement's block,
-  unrolled once in the body (97.1%, 573 KB); a run longer than `MAX_BLOCK`
-  keeps its own loop outside.
+  unrolled once in the body (97.1%, 566 KB), with the elements it reads from
+  its own iteration kept in locals: 472 µs per gradient, against 386 µs for
+  the elementwise chain. A run longer than `MAX_BLOCK` keeps its own loop
+  outside.
 
 ## [0.1.1] — 2026-09-10 (npm only)
 
