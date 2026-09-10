@@ -580,7 +580,7 @@ struct PosRel {
     out: SlotRel,
     arg1: Option<SlotRel>,
     arg2i: Option<SlotRel>,
-    /// Every element of a contraction's operand run; empty for other opcodes.
+    /// Every element of a contraction's or a reduction's run; empty for other opcodes.
     elems: Vec<SlotRel>,
 }
 
@@ -689,13 +689,10 @@ impl Slots {
                     reroll::ArgRel::Tabled(_) => Some(None),
                 };
                 let mut elems = Vec::new();
-                if tape.op_at(k0) == Op::DotC {
-                    let e = tape.extent_at(k0);
-                    let reroll::ArgRel::Affine(t) = b.args[j as usize].arg1 else {
-                        return None;
-                    };
+                if matches!(tape.op_at(k0), Op::DotC | Op::Sum) {
+                    let (e, t) = (tape.extent_at(k0), b.args[j as usize].run);
                     for c in 0..e.len {
-                        elems.push(self.rel(tape.arg1_at(k0) + c * e.stride, t, b.reps)?);
+                        elems.push(self.rel(e.base + c * e.stride, t, b.reps)?);
                     }
                 }
                 Some(PosRel {
@@ -1487,6 +1484,17 @@ fn emit_block_forward(
             Some(t) => bl.prim(t).expect("checked local"),
             None => block_arg(f, sp, r.arg1, nt.arg1, tmp1),
         };
+        if tape.op_at(k0) == Op::Sum {
+            let w = bl.prim(j).unwrap_or(sp.addr(r.out.base, r.out.stride));
+            astore_addr(f, w);
+            aload(f, a1);
+            for e in &r.elems {
+                aload(f, sp.addr(e.base, e.stride));
+                f.instruction(&Instruction::F64Add);
+            }
+            astore_end(f, w);
+            continue;
+        }
         let a2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
             Some(t) => bl.prim(t).expect("checked local"),
             None => block_arg(f, sp, r.arg2i, nt.arg2i, tmp2),
@@ -1542,6 +1550,18 @@ fn emit_block_backward(
             Some(t) => bl.prim(t).expect("checked local"),
             None => block_arg(f, sp, r.arg1, nt.arg1, tmp1),
         };
+        if tape.op_at(k0) == Op::Sum {
+            let dk = bl.adj(j).unwrap_or(sp.addr(adj + r.out.base, r.out.stride));
+            let da1 = match bl.arg(b, &ar.arg1, tape.arg1_at(k0)) {
+                Some(t) => bl.adj(t).expect("checked local"),
+                None => adj_of(r.arg1, pa1, adj, sp),
+            };
+            adj_incr(f, da1, dk);
+            for e in &r.elems {
+                adj_incr(f, sp.addr(adj + e.base, e.stride), dk);
+            }
+            continue;
+        }
         let pa2 = match bl.arg(b, &ar.arg2i, tape.arg2i_at(k0)) {
             Some(t) => bl.prim(t).expect("checked local"),
             None => block_arg(f, sp, r.arg2i, nt.arg2i, tmp2),

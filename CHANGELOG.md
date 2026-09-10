@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   larger than the same sum written elementwise: 64 contractions of 196 went
   from 1,052 KB (688 KB elementwise) to 410 KB, and of 784 from 3,051 KB to
   452 KB.
+- **A reduction can sit inside a re-rolled block.** Detection refused any
+  block holding a `Sum`, so a statement that repeats one — a dense layer's
+  per-output `sum_run` — fell out of every loop with everything around it: a
+  decoder of 6,272 sums of 20 covered 71.5% of its tape and emitted 5,285 KB,
+  against 688 KB written elementwise. It now joins its statement's block,
+  unrolled once in the body (97.1%, 573 KB); a run longer than `MAX_BLOCK`
+  keeps its own loop outside.
 
 ## [0.1.1] — 2026-09-10 (npm only)
 

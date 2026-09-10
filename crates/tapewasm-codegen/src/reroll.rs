@@ -91,6 +91,8 @@ impl ArgRel {
 pub struct ArgRels {
     pub arg1: ArgRel,
     pub arg2i: ArgRel,
+    /// How a `DotC`'s or a `Sum`'s run base moves per repeat; 0 for other opcodes.
+    pub run: u32,
 }
 
 /// Which arguments an opcode actually reads. Unused slots hold stale values on
@@ -140,14 +142,17 @@ fn probe(tape: &Tape, start: u32, len: u32, max_reps: u32) -> Option<Probe> {
     // Three shapes the emitter has no form for, rejected before the argument walk
     // below: that walk costs `len * reps` reads and most candidates die here.
     for j in 0..len {
-        // A leaf reads the parameter buffer by absolute index; a reduction is already
-        // one node for a whole vectorised statement.
+        // A leaf reads the parameter buffer by absolute index.
         match tape.op_at(start + j) {
-            Op::Leaf | Op::Sum => return None,
-            // A contraction is emitted unrolled, so every repeat has to
-            // contract the same number of elements the same distance apart.
-            Op::DotC => {
+            Op::Leaf => return None,
+            // A run is emitted unrolled in the body, so every repeat has to walk
+            // the same number of elements the same distance apart.
+            op @ (Op::DotC | Op::Sum) => {
                 let e0 = tape.extent_at(start + j);
+                // A long reduction keeps the loop it gets outside a block.
+                if op == Op::Sum && e0.len > MAX_BLOCK {
+                    return None;
+                }
                 if (1..reps).any(|i| {
                     let e = tape.extent_at(start + i * len + j);
                     (e.len, e.stride) != (e0.len, e0.stride)
@@ -191,7 +196,16 @@ fn probe(tape: &Tape, start: u32, len: u32, max_reps: u32) -> Option<Probe> {
         if tabled > MAX_TABLED {
             return None;
         }
-        args.push(ArgRels { arg1, arg2i });
+        // A run's elements move with its base, which has to be affine to be addressed.
+        let run = if matches!(tape.op_at(k0), Op::DotC | Op::Sum) {
+            match classify(&|base| tape.extent_at(base + j).base) {
+                ArgRel::Affine(t) => t,
+                ArgRel::Tabled(_) => return None,
+            }
+        } else {
+            0
+        };
+        args.push(ArgRels { arg1, arg2i, run });
     }
 
     // A constant that moves needs a table; one that does not folds into the
@@ -503,6 +517,32 @@ mod tests {
         );
         let flags = local_positions(&tape, &blocks, acc);
         assert_eq!(flags[0], vec![true, false], "the product should stay local");
+    }
+
+    /// A dense layer's per-output sum repeats with its statement, so it has to
+    /// join that block rather than cut the statement out of every loop.
+    #[test]
+    fn a_reduction_joins_the_block_of_its_statement() {
+        let mut tape = Tape::new();
+        let x: Vec<u32> = (0..5).map(|i| tape.new_var(i as f64)).collect();
+        let w: Vec<u32> = (0..150).map(|i| tape.new_var(i as f64)).collect();
+        let b: Vec<u32> = (0..30).map(|j| tape.new_var(j as f64)).collect();
+        let mut acc = tape.mul_c(x[0], 0.5);
+        for j in 0..30 {
+            let p: Vec<u32> = (0..5).map(|i| tape.mul(x[i], w[j * 5 + i])).collect();
+            let s = tape.sum_run(b[j], p[0], 1, 5);
+            let sq = tape.mul(s, s);
+            acc = tape.add(acc, sq);
+        }
+        let blocks = detect(&tape);
+        check_args_reproduce_tape(&tape, &blocks);
+        let in_block = |k: u32| blocks.iter().any(|b| b.start <= k && k < b.end());
+        let sums = (0..tape.len() as u32).filter(|&k| tape.op_at(k) == Op::Sum);
+        let (inside, total) = sums.fold((0, 0), |(i, t), k| (i + in_block(k) as u32, t + 1));
+        assert!(
+            inside * 10 >= total * 9,
+            "only {inside}/{total} reductions are in a block"
+        );
     }
 
     #[test]
