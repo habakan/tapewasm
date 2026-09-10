@@ -5,6 +5,7 @@
 import init from "./pkg/tapewasm.js";
 export {
   AotSampler,
+  AdviResult,
   CompiledTape,
   compileTape,
   tapewasmVersion,

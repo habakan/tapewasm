@@ -104,3 +104,71 @@ await writeFile(
   JSON.stringify({ mean, sd: sd.map(Math.sqrt) }),
 );
 console.log(`fixtures: ${built.wasm.length} byte module, mean beta ${mean[1].toFixed(4)}`);
+
+// A fixture for `advi()`: two conjugate normal means, whose posterior is exactly
+// Gaussian, so mean-field ADVI has a closed-form answer to recover.
+const adviGroups = [
+  { n: 15, sumY: 12.3 },
+  { n: 25, sumY: -8.7 },
+];
+const priorVar = 100.0;
+const coef = (n) => -(0.5 * n + 0.5 / priorVar);
+
+const adviLines = [];
+let adviNext = 0;
+const adviOp = (text) => (adviLines.push(text), adviNext++);
+adviLines.push(`n_params ${adviGroups.length}`);
+const thetas = adviGroups.map(() => adviOp(`new_var 0.0`));
+let adviAcc = null;
+adviGroups.forEach(({ n, sumY }, k) => {
+  const linear = adviOp(`mul_c ${thetas[k]} ${sumY}`);
+  const quad = adviOp(`mul_c ${adviOp(`mul ${thetas[k]} ${thetas[k]}`)} ${coef(n)}`);
+  const term = adviOp(`add ${linear} ${quad}`);
+  adviAcc = adviAcc === null ? term : adviOp(`add ${adviAcc} ${term}`);
+});
+adviLines.push(`root ${adviAcc}`);
+
+const adviBuilt = compileTape(adviLines.join("\n"));
+const adviMeta = {
+  nParams: adviBuilt.nParams,
+  scratchInit: Array.from(adviBuilt.scratchInit),
+  paramNames: adviGroups.map((_, k) => `theta${k}`),
+  init: adviGroups.map(() => 0.0),
+  numIters: 4000,
+  mcSamples: 4,
+  learningRate: 0.05,
+  seed: 42,
+  layoutId: adviBuilt.layoutId,
+};
+
+await writeFile(resolve(fixtures, "advi_model.wasm"), adviBuilt.wasm);
+
+const adviExpected = {
+  mean: adviGroups.map(({ n, sumY }) => (sumY / (1 / priorVar + n))),
+  sd: adviGroups.map(({ n }) => Math.sqrt(1 / (1 / priorVar + n))),
+};
+
+await writeFile(resolve(fixtures, "advi_meta.json"), JSON.stringify(adviMeta));
+await writeFile(resolve(fixtures, "advi_expected.json"), JSON.stringify(adviExpected));
+
+// A dry run in Node, so a hyperparameter change that stops converging is
+// caught here rather than only inside a browser.
+const adviAot = await WebAssembly.instantiate(adviBuilt.wasm, {
+  tapewasm: { memory: sharedMemory() },
+  Math: {
+    exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+    tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
+    lgamma: () => NaN, digamma: () => NaN, phi: () => NaN,
+  },
+});
+setAotExports(adviAot.instance.exports);
+const adviSampler = new AotSampler(
+  adviMeta.nParams, new Float64Array(adviMeta.scratchInit), adviMeta.layoutId, adviMeta.paramNames,
+);
+const adviResult = adviSampler.advi(
+  new Float64Array(adviMeta.init), adviMeta.numIters, adviMeta.mcSamples,
+  adviMeta.learningRate, BigInt(adviMeta.seed), 0,
+);
+console.log(
+  `advi fixture: ${adviBuilt.wasm.length} byte module, mu ${Array.from(adviResult.mu).map((v) => v.toFixed(4))}`,
+);
