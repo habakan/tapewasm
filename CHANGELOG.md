@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stride` to the tape — an uneven run is a parse error naming the gap it
   found, not a silently wrong module.
 
+### Changed
+
+- **A contraction outside every re-rolled block runs as a loop** over its run,
+  its coefficients staged in the constant table beside the block tables,
+  rather than unrolled at ~54 B of code per element. A `dot_c` repeated too few
+  times to join a block — an encoder's `X @ W` per image — made the module
+  larger than the same sum written elementwise: 64 contractions of 196 went
+  from 1,052 KB (688 KB elementwise) to 410 KB, and of 784 from 3,051 KB to
+  452 KB.
+
 ## [0.1.1] — 2026-09-10 (npm only)
 
 ### Changed
