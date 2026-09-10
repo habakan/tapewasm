@@ -329,6 +329,8 @@ pub struct AotSampler {
     scratch_init: Vec<f64>,
     layout_id: u32,
     param_names: Vec<String>,
+    target_accept: Option<f64>,
+    grad_based_estimate: Option<bool>,
 }
 
 #[wasm_bindgen]
@@ -369,12 +371,50 @@ impl AotSampler {
             scratch_init,
             layout_id,
             param_names,
+            target_accept: None,
+            grad_based_estimate: None,
         })
     }
 
     #[wasm_bindgen(getter, js_name = nParams)]
     pub fn n_params(&self) -> usize {
         self.n_params
+    }
+
+    /// Aim warmup's step-size adaptation at this acceptance rate instead of
+    /// nuts-rs's 0.8. Higher adapts a smaller step: fewer divergences on a hard
+    /// geometry, more gradients per draw.
+    #[wasm_bindgen(js_name = setTargetAccept)]
+    pub fn set_target_accept(&mut self, target: f64) -> Result<(), JsError> {
+        if !(target > 0.0 && target < 1.0) {
+            return Err(JsError::new(&format!(
+                "target_accept must lie strictly between 0 and 1, not {target}"
+            )));
+        }
+        self.target_accept = Some(target);
+        Ok(())
+    }
+
+    /// Estimate the diagonal metric from the gradients as well as the draws, as
+    /// nuts-rs does by default. Off unless set, to match the reference
+    /// posteriors; see [`nuts_settings`].
+    #[wasm_bindgen(js_name = setGradBasedEstimate)]
+    pub fn set_grad_based_estimate(&mut self, on: bool) {
+        self.grad_based_estimate = Some(on);
+    }
+
+    fn settings(&self, num_warmup: u32, num_draws: u32) -> DiagNutsSettings {
+        let mut settings = nuts_settings(num_warmup, num_draws);
+        if let Some(target) = self.target_accept {
+            settings.adapt_options.step_size_settings.target_accept = target;
+        }
+        if let Some(on) = self.grad_based_estimate {
+            settings
+                .adapt_options
+                .mass_matrix_options
+                .use_grad_based_estimate = on;
+        }
+        settings
     }
 
     fn logp_fn(&self) -> AotLogp {
@@ -462,7 +502,7 @@ impl AotSampler {
         // silently becomes a different (possibly enormous) run length.
         let total = num_warmup as u64 + num_draws as u64;
         let math = CpuMath::new(self.logp_fn());
-        let settings = nuts_settings(num_warmup, num_draws);
+        let settings = self.settings(num_warmup, num_draws);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let iter = sample_sequentially(math, settings, init, total, chain as u64, &mut rng)
             .map_err(|e| JsError::new(&format!("nuts-rs init: {e}")))?;

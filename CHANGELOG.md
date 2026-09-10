@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sample` returns for the same seed, with each draw's `diverging`, `tuning`,
   `stepSize`, `numSteps` and `lp` beside them — what ArviZ keeps as
   `sample_stats` — and a `chain` label for assembling several runs.
+- **`AotSampler::setTargetAccept` and `setGradBasedEstimate`.** Neither could
+  be set from outside: warmup aimed at nuts-rs's 0.8 acceptance, and the metric
+  came from the draws alone — the reference posteriors' choice, and still the
+  default. On the MMM above the sampler took about twice nutpie's gradient
+  evaluations at the same target.
 
 ## [0.2.0] — 2026-09-11 (npm only)
 
