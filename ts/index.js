@@ -7,6 +7,7 @@ export {
   AotSampler,
   AdviResult,
   CompiledTape,
+  SampleResult,
   compileTape,
   tapewasmVersion,
   setAotExports,
