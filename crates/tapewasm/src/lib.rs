@@ -643,8 +643,8 @@ impl AdviResult {
 /// Standard normal draws by Box-Muller, so one distribution does not pull in
 /// `rand_distr`; seeded like `sample()`, a run is reproducible.
 fn fill_standard_normal<R: Rng>(rng: &mut R, out: &mut [f64]) {
-    let mut pairs = out.chunks_exact_mut(2);
-    for pair in &mut pairs {
+    let (pairs, rest) = out.as_chunks_mut::<2>();
+    for pair in pairs {
         let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
         let u2: f64 = rng.random();
         let r = (-2.0 * u1.ln()).sqrt();
@@ -652,7 +652,6 @@ fn fill_standard_normal<R: Rng>(rng: &mut R, out: &mut [f64]) {
         pair[0] = r * theta.cos();
         pair[1] = r * theta.sin();
     }
-    let rest = pairs.into_remainder();
     if let Some(last) = rest.first_mut() {
         let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
         let u2: f64 = rng.random();
