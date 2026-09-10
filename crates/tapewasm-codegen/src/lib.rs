@@ -1486,10 +1486,15 @@ fn emit_block_forward(
         };
         if tape.op_at(k0) == Op::Sum {
             let w = bl.prim(j).unwrap_or(sp.addr(r.out.base, r.out.stride));
+            let (e0, run) = (tape.extent_at(k0), reroll::ArgRel::Affine(ar.run));
             astore_addr(f, w);
             aload(f, a1);
-            for e in &r.elems {
-                aload(f, sp.addr(e.base, e.stride));
+            for (c, e) in r.elems.iter().enumerate() {
+                let a = match bl.arg(b, &run, e0.base + c as u32 * e0.stride) {
+                    Some(t) => bl.prim(t).expect("checked local"),
+                    None => sp.addr(e.base, e.stride),
+                };
+                aload(f, a);
                 f.instruction(&Instruction::F64Add);
             }
             astore_end(f, w);
@@ -1557,8 +1562,13 @@ fn emit_block_backward(
                 None => adj_of(r.arg1, pa1, adj, sp),
             };
             adj_incr(f, da1, dk);
-            for e in &r.elems {
-                adj_incr(f, sp.addr(adj + e.base, e.stride), dk);
+            let (e0, run) = (tape.extent_at(k0), reroll::ArgRel::Affine(ar.run));
+            for (c, e) in r.elems.iter().enumerate() {
+                let da = match bl.arg(b, &run, e0.base + c as u32 * e0.stride) {
+                    Some(t) => bl.adj(t).expect("checked local"),
+                    None => sp.addr(adj + e.base, e.stride),
+                };
+                adj_incr(f, da, dk);
             }
             continue;
         }
