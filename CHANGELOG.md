@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`compileTape(tape, reroll)`** — `"auto"` (the default, unchanged),
+  `"always"` or `"never"`. The caller could not choose before, and the choice
+  is an engine's rather than the model's: on pymcwasm's PyMC-Marketing MMM
+  (9,342 nodes, straight-line under `"auto"`) a gradient took 15.7 / 44.0 /
+  53.1 µs in Chromium / Firefox / WebKit straight-line and 28.2 / 36.3 / 30.6
+  re-rolled, from a 319 KB module against 13 KB.
+
 ## [0.2.0] — 2026-09-11 (npm only)
 
 crates.io still waits on a nuts-rs release that carries
