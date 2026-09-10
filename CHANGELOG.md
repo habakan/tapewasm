@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-11 (npm only)
+
+crates.io still waits on a nuts-rs release that carries
+[nuts-rs#76](https://github.com/pymc-devs/nuts-rs/pull/76); see 0.1.0.
+
 ### Added
 
 - **`AotSampler::advi`, mean-field ADVI over the same AOT path `sample`
@@ -89,6 +94,7 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/habakan/tapewasm/releases/tag/v0.2.0
 [0.1.1]: https://github.com/habakan/tapewasm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/habakan/tapewasm/releases/tag/v0.1.0
