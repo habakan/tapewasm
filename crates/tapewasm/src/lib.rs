@@ -414,6 +414,33 @@ impl AotSampler {
         num_draws: u32,
         seed: u64,
     ) -> Result<Vec<f64>, JsError> {
+        Ok(self.run(init, num_warmup, num_draws, seed, 0, false)?.draws)
+    }
+
+    /// [`sample`](Self::sample) with each draw's sampler statistics beside it —
+    /// what ArviZ keeps as `sample_stats`. `chain` only labels the run: a
+    /// different seed is what keeps two chains apart.
+    #[wasm_bindgen(js_name = sampleWithStats)]
+    pub fn sample_with_stats(
+        &self,
+        init: &[f64],
+        num_warmup: u32,
+        num_draws: u32,
+        seed: u64,
+        chain: u32,
+    ) -> Result<SampleResult, JsError> {
+        self.run(init, num_warmup, num_draws, seed, chain, true)
+    }
+
+    fn run(
+        &self,
+        init: &[f64],
+        num_warmup: u32,
+        num_draws: u32,
+        seed: u64,
+        chain: u32,
+        stats: bool,
+    ) -> Result<SampleResult, JsError> {
         let n = self.n_params;
         if init.len() != n {
             return Err(JsError::new(&format!(
@@ -437,13 +464,28 @@ impl AotSampler {
         let math = CpuMath::new(self.logp_fn());
         let settings = nuts_settings(num_warmup, num_draws);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let iter = sample_sequentially(math, settings, init, total, 0, &mut rng)
+        let iter = sample_sequentially(math, settings, init, total, chain as u64, &mut rng)
             .map_err(|e| JsError::new(&format!("nuts-rs init: {e}")))?;
 
-        let mut out = vec![0.0_f64; n * total as usize];
+        let mut out = SampleResult {
+            draws: vec![0.0_f64; n * total as usize],
+            ..SampleResult::default()
+        };
+        // The log density at a draw costs one more evaluation, so only when asked for.
+        let mut lp_fn = stats.then(|| self.logp_fn());
         for (i, draw) in iter.enumerate() {
-            let (pos, _progress) = draw.map_err(|e| JsError::new(&format!("nuts-rs draw: {e}")))?;
-            out[i * n..(i + 1) * n].copy_from_slice(pos.as_ref());
+            let (pos, progress) = draw.map_err(|e| JsError::new(&format!("nuts-rs draw: {e}")))?;
+            out.draws[i * n..(i + 1) * n].copy_from_slice(pos.as_ref());
+            if let Some(f) = lp_fn.as_mut() {
+                out.diverging.push(progress.diverging as u8);
+                out.tuning.push(progress.tuning as u8);
+                out.step_size.push(progress.step_size);
+                out.num_steps.push(progress.num_steps as u32);
+                let lp = f
+                    .logp(&pos, &mut grad)
+                    .map_err(|e| JsError::new(&format!("{e}")))?;
+                out.lp.push(lp);
+            }
         }
         Ok(out)
     }
@@ -594,6 +636,57 @@ impl AotSampler {
             mu_snapshots,
             snapshot_iters,
         })
+    }
+}
+
+/// Draws and, beside each, the sampler's statistics — warmup first, as
+/// [`AotSampler::sample`] returns them.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct SampleResult {
+    draws: Vec<f64>,
+    diverging: Vec<u8>,
+    tuning: Vec<u8>,
+    step_size: Vec<f64>,
+    num_steps: Vec<u32>,
+    lp: Vec<f64>,
+}
+
+#[wasm_bindgen]
+impl SampleResult {
+    /// `num_warmup + num_draws` draws, row-major, `n_params` wide.
+    #[wasm_bindgen(getter)]
+    pub fn draws(&self) -> Vec<f64> {
+        self.draws.clone()
+    }
+
+    /// 1 where the draw's trajectory diverged.
+    #[wasm_bindgen(getter)]
+    pub fn diverging(&self) -> Vec<u8> {
+        self.diverging.clone()
+    }
+
+    /// 1 for the warmup draws.
+    #[wasm_bindgen(getter)]
+    pub fn tuning(&self) -> Vec<u8> {
+        self.tuning.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = stepSize)]
+    pub fn step_size(&self) -> Vec<f64> {
+        self.step_size.clone()
+    }
+
+    /// Leapfrog steps the draw's trajectory took.
+    #[wasm_bindgen(getter, js_name = numSteps)]
+    pub fn num_steps(&self) -> Vec<u32> {
+        self.num_steps.clone()
+    }
+
+    /// The log density at each draw.
+    #[wasm_bindgen(getter)]
+    pub fn lp(&self) -> Vec<f64> {
+        self.lp.clone()
     }
 }
 

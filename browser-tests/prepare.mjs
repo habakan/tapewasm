@@ -136,6 +136,34 @@ lpRolled.forEach((v, i) => {
 });
 console.log(`reroll: ${built.wasm.length} byte module straight-line, ${rolled.wasm.length} re-rolled`);
 
+// sampleWithStats is sample() with each draw's statistics: the same seed draws the same.
+const withStats = sampler.sampleWithStats(
+  new Float64Array(meta.init), meta.warmup, meta.draws, BigInt(meta.seed), 0,
+);
+const total = meta.warmup + meta.draws;
+const draws = withStats.draws;
+if (draws.some((v, i) => v !== flat[i])) {
+  throw new Error("sampleWithStats drew differently from sample() on the same seed");
+}
+const stats = {
+  diverging: withStats.diverging, tuning: withStats.tuning, stepSize: withStats.stepSize,
+  numSteps: withStats.numSteps, lp: withStats.lp,
+};
+for (const [name, xs] of Object.entries(stats)) {
+  if (xs.length !== total) throw new Error(`${name} has ${xs.length} entries, not ${total}`);
+}
+if (stats.tuning.some((t, i) => t !== (i < meta.warmup ? 1 : 0))) {
+  throw new Error("tuning does not mark exactly the warmup draws");
+}
+const lastLp = sampler.logProbGrad(draws.subarray((total - 1) * meta.nParams))[0];
+if (lastLp !== stats.lp[total - 1]) {
+  throw new Error(`lp ${stats.lp[total - 1]} is not the log density at the draw, ${lastLp}`);
+}
+console.log(
+  `stats: ${stats.diverging.reduce((a, b) => a + b, 0)} divergent, ` +
+  `final step ${stats.stepSize[total - 1].toPrecision(3)}`,
+);
+
 // A fixture for `advi()`: two conjugate normal means, whose posterior is exactly
 // Gaussian, so mean-field ADVI has a closed-form answer to recover.
 const adviGroups = [

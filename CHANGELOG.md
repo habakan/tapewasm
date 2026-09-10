@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (9,342 nodes, straight-line under `"auto"`) a gradient took 15.7 / 44.0 /
   53.1 µs in Chromium / Firefox / WebKit straight-line and 28.2 / 36.3 / 30.6
   re-rolled, from a 319 KB module against 13 KB.
+- **`AotSampler::sampleWithStats`**, returning a `SampleResult`: the draws
+  `sample` returns for the same seed, with each draw's `diverging`, `tuning`,
+  `stepSize`, `numSteps` and `lp` beside them — what ArviZ keeps as
+  `sample_stats` — and a `chain` label for assembling several runs.
 
 ## [0.2.0] — 2026-09-11 (npm only)
 
