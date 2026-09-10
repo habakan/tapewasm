@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-10 (npm only)
+
+### Changed
+
+- **Dual licensed: MIT OR Apache-2.0, at your option.** 0.1.0 offered Apache-2.0
+  alone. Nobody loses a right — this only adds one — but a project that is
+  itself MIT no longer has to carry a second licence's notice obligations to
+  use any of this. Apache-2.0 stays available for its patent grant.
+
 ## [0.1.0] — 2026-09-10 (npm only)
 
 crates.io waits on a nuts-rs release carrying
@@ -31,5 +40,6 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/habakan/tapewasm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/habakan/tapewasm/releases/tag/v0.1.0
