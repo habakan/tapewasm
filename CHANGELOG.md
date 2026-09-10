@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   came from the draws alone — the reference posteriors' choice, and still the
   default. On the MMM above the sampler took about twice nutpie's gradient
   evaluations at the same target.
+- `REROLL=always|never` for the `tape_from_text` example, the same choice for
+  a build step that emits ahead of time rather than in the page.
 
 ## [0.2.0] — 2026-09-11 (npm only)
 

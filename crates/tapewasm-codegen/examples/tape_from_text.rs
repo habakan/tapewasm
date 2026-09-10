@@ -7,6 +7,9 @@
 //! check them against its own. Given a second
 //! argument it also writes the module there and prints the buffer sizes a host
 //! needs to call it, so the caller can drive the module itself.
+//!
+//! `REROLL=always` or `REROLL=never` overrides when loops are re-rolled, as
+//! `compileTape`'s `reroll` does in the browser; unset or `auto` keeps the default.
 
 use tapewasm_codegen::{compile_tape, tape_text, Reroll};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module, Store};
@@ -92,7 +95,13 @@ fn main() {
     let p = tape_text::parse(&src).expect("parse");
     eprintln!("replayed {} nodes, {} params", p.tape.len(), p.n_params);
 
-    let compiled = compile_tape(&p.tape, p.n_params, p.root, Reroll::default()).expect("compile");
+    let reroll = match std::env::var("REROLL").as_deref() {
+        Err(_) | Ok("auto") => Reroll::Auto,
+        Ok("always") => Reroll::Always,
+        Ok("never") => Reroll::Never,
+        Ok(other) => panic!("REROLL must be auto, always or never, not {other:?}"),
+    };
+    let compiled = compile_tape(&p.tape, p.n_params, p.root, reroll).expect("compile");
     eprintln!("emitted {} bytes", compiled.wasm.len());
 
     let params = if p.test_params.is_empty() {
