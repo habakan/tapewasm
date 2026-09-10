@@ -207,6 +207,32 @@ fn a_contraction_matches_the_tape_in_every_reroll_mode() {
     }
 }
 
+/// A contraction repeated too few times to join a block, in a module that
+/// re-rolls something else, walks its run in a loop against a staged column.
+#[test]
+fn a_contraction_outside_every_block_matches_the_tape() {
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let p: Vec<u32> = (0..40).map(|i| tape.new_var(0.1 * i as f64)).collect();
+    let c0: Vec<f64> = (0..40).map(|i| (i as f64 * 0.7).sin()).collect();
+    let c1: Vec<f64> = (0..20).map(|i| 1.0 - i as f64 * 0.03).collect();
+    let d0 = tape.dot_c(p[0], 1, &c0);
+    let d1 = tape.dot_c(p[1], 2, &c1);
+    let mut acc = tape.mul(d0, d1);
+    for &v in &p {
+        let sq = tape.mul(v, v);
+        acc = tape.add(acc, sq);
+    }
+    let c = compile_tape(&tape, 40, acc, Reroll::Always).unwrap();
+    assert!(
+        c.const_table.windows(40).any(|w| w == c0.as_slice()),
+        "the straight-line contraction's coefficients were not staged"
+    );
+    let params: Vec<f64> = (0..40).map(|i| 0.3 - i as f64 * 0.02).collect();
+    for mode in [Reroll::Auto, Reroll::Always, Reroll::Never] {
+        agrees(&mut tape, acc, &params, mode, 1e-12);
+    }
+}
+
 /// `Always` and `Never` on one tape is the only place the loop and
 /// straight-line emitters can be compared directly.
 #[test]
