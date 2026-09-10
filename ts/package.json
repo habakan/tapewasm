@@ -1,6 +1,6 @@
 {
   "name": "tapewasm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Compile an autodiff tape to a WebAssembly module and sample it with nuts-rs, in the browser.",
   "type": "module",
   "main": "./index.js",
@@ -13,7 +13,7 @@
     },
     "./pkg/*": "./pkg/*"
   },
-  "files": ["index.js", "index.d.ts", "pkg/", "LICENSE", "README.md"],
+  "files": ["index.js", "index.d.ts", "pkg/", "LICENSE-APACHE", "LICENSE-MIT", "README.md"],
   "scripts": {
     "build:wasm": "make -C .. wasm"
   },
@@ -23,5 +23,5 @@
   },
   "homepage": "https://github.com/habakan/tapewasm#readme",
   "keywords": ["autodiff", "gradient", "bayesian", "mcmc", "nuts", "webassembly", "wasm"],
-  "license": "Apache-2.0"
+  "license": "MIT OR Apache-2.0"
 }

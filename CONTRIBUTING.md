@@ -40,4 +40,6 @@ than with every commit — so run it when codegen or the sampler moves.
   number, what breaks without the line. Not a restatement of the code below it.
 - One concern per PR, and a `CHANGELOG.md` bullet under `[Unreleased]`
 
-Apache-2.0. By contributing you agree your work is licensed the same way.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
+at your option. Unless you state otherwise, any contribution you submit shall be
+dual licensed as above, with no additional terms.

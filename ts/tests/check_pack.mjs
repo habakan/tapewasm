@@ -3,7 +3,7 @@
 //   npm pack --dry-run --json > pack.json && node tests/check_pack.mjs pack.json
 //
 // Two failures a published version cannot be taken back from: `npm pack` collects
-// only files under `ts/`, so the repo-root LICENSE reaches no tarball on its own,
+// only files under `ts/`, so the repo-root licences reach no tarball on their own,
 // and `wasm-pack` writes a `.gitignore` of `*` into `ts/pkg/` that npm honours.
 
 import { readFileSync } from "node:fs";
@@ -20,11 +20,13 @@ const fail = (msg) => {
   process.exit(1);
 };
 
-if (!files.some((p) => p === "LICENSE")) fail("npm tarball ships no LICENSE");
+for (const l of ["LICENSE-APACHE", "LICENSE-MIT"]) {
+  if (!files.some((p) => p === l)) fail(`npm tarball ships no ${l}`);
+}
 
 const wasm = files.filter((p) => p.endsWith(".wasm"));
 if (wasm.length !== 1) {
   fail(`expected exactly one .wasm in the npm tarball, got ${wasm.length}`);
 }
 
-console.log(`npm tarball ok: ${files.length} files, LICENSE, ${wasm[0]}`);
+console.log(`npm tarball ok: ${files.length} files, both licences, ${wasm[0]}`);

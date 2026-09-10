@@ -19,6 +19,9 @@ It appears in three places, and nothing keeps them in sync automatically:
 | `Cargo.toml` | `version = "…"` on both internal deps under `[workspace.dependencies]` |
 | `ts/package.json` | `version` |
 
+Both `LICENSE-APACHE` and `LICENSE-MIT` have to sit beside every crate manifest
+and in `ts/`; `make package` fails if either is missing from a tarball.
+
 Cargo does not accept `version.workspace` inside `[workspace.dependencies]`,
 which is why the two requirements are written out by hand.
 

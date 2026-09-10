@@ -7,4 +7,4 @@ See the [repository](https://github.com/habakan/tapewasm) for what this is for
 and how a front end uses it. The npm package of the same name is this crate
 built with `wasm-pack`.
 
-Licensed under Apache-2.0.
+Licensed under either of Apache-2.0 or MIT, at your option.

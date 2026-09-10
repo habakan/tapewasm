@@ -20,4 +20,4 @@ disabled, so the target stays every browser rather than the newest one.
 You probably want [`tapewasm`](https://crates.io/crates/tapewasm), or the
 `tapewasm` npm package, rather than this crate directly.
 
-Licensed under Apache-2.0.
+Licensed under either of Apache-2.0 or MIT, at your option.

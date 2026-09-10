@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "tapewasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "console_error_panic_hook",
  "getrandom",
@@ -742,11 +742,11 @@ dependencies = [
 
 [[package]]
 name = "tapewasm-autodiff"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "tapewasm-codegen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tapewasm-autodiff",
  "thiserror",
