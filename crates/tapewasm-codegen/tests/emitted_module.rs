@@ -233,6 +233,33 @@ fn a_contraction_outside_every_block_matches_the_tape() {
     }
 }
 
+/// A reduction inside a repeating statement — a dense layer's per-output sum —
+/// is re-rolled with the rest of its statement, seed and run both moving.
+#[test]
+fn a_reduction_inside_a_block_matches_the_tape() {
+    let (h, k) = (5, 30);
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let x: Vec<u32> = (0..h).map(|i| tape.new_var(0.2 * i as f64 - 0.3)).collect();
+    let w: Vec<u32> = (0..h * k)
+        .map(|i| tape.new_var((i as f64 * 0.37).sin()))
+        .collect();
+    let b: Vec<u32> = (0..k).map(|j| tape.new_var(0.1 * j as f64)).collect();
+    let mut acc = tape.mul_c(x[0], 0.5);
+    for j in 0..k {
+        let p: Vec<u32> = (0..h).map(|i| tape.mul(x[i], w[j * h + i])).collect();
+        let s = tape.sum_run(b[j], p[0], 1, h as u32);
+        let e = tape.exp(s);
+        let sq = tape.mul(e, s);
+        acc = tape.add(acc, sq);
+    }
+    let params: Vec<f64> = (0..h + h * k + k)
+        .map(|i| 0.1 + (i as f64 * 0.53).cos() * 0.3)
+        .collect();
+    for mode in [Reroll::Auto, Reroll::Always, Reroll::Never] {
+        agrees(&mut tape, acc, &params, mode, 1e-12);
+    }
+}
+
 /// `Always` and `Never` on one tape is the only place the loop and
 /// straight-line emitters can be compared directly.
 #[test]
