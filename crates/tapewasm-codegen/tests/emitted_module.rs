@@ -320,7 +320,9 @@ fn compile_tape_rejects_a_param_count_the_tape_does_not_open_with() {
 /// unwritable for as long as the format existed, because the only test that
 /// reached them built the tape directly. Adding an op to the emitter without
 /// adding it here now leaves a listed instruction untested rather than an
-/// unreachable one unnoticed.
+/// unreachable one unnoticed. `dot_c`/`sum_run` close the same hole for the
+/// contraction and the reduction — this exercises them through the emitter
+/// (both re-roll modes), where `tape_text`'s own tests only check parsing.
 #[test]
 fn every_instruction_in_the_text_format_reaches_the_emitter() {
     // One line per instruction, arranged so nothing lands outside a domain:
@@ -376,7 +378,11 @@ add 44 23
 add 45 24
 add 46 25
 add 47 26
-root 48
+dot_c 3 2 1.0 3 2.0 4 3.0
+sum_run 0 3 5 6 7
+add 48 49
+add 51 50
+root 52
 ";
     let program = tapewasm_codegen::tape_text::parse(src).expect("every instruction parses");
     let mut tape = program.tape;

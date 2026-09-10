@@ -12,11 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tan`, `asin`, `acos` and `atan` in the tape text format.** The emitter has
   always been able to emit them; no front end outside this crate could ask for
   them, because the only test that reached them built the tape directly. The
-  module doc now lists every instruction the format accepts, and says why
-  `dot_c` and `sum_run` are not among them — both take a stride in node indices,
-  which a caller counting instructions cannot supply.
+  module doc now lists every instruction the format accepts.
 - `every_instruction_in_the_text_format_reaches_the_emitter` runs the whole
   instruction set through both re-roll modes against the tape's reverse pass.
+- **`dot_c` and `sum_run` in the tape text format** — the contraction and the
+  reduction, the two ops a matrix model needs to stay compact rather than
+  writing a contraction as an elementwise chain. Both take a stride measured
+  in *node* indices, which a caller counting instructions has no way to
+  supply directly (value numbering can merge two written instructions into
+  one node), so the text instead names every element by its own instruction
+  (`dot_c LEN A0 C0 A1 C1 ...`, `sum_run SEED LEN A0 A1 ...`) and `parse`
+  checks the nodes behind them land evenly spaced before handing `base`/
+  `stride` to the tape — an uneven run is a parse error naming the gap it
+  found, not a silently wrong module.
 
 ## [0.1.1] — 2026-09-10 (npm only)
 
