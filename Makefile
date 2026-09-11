@@ -84,6 +84,10 @@ $(SAMPLER_OUT): $(WASM_SRC)
 browser-test: wasm ## Run a compiled module in Chromium, Firefox and WebKit
 	cd browser-tests && npm test
 
+.PHONY: bench
+bench: wasm ## Time a gradient per engine, straight-line against re-rolled (not in CI)
+	cd browser-tests && node bench.mjs
+
 .PHONY: package
 package: wasm ## Dry-run packaging every crate + the npm tarball
 	cargo package --workspace --no-verify
