@@ -29,3 +29,20 @@ test("mean-field ADVI recovers a closed-form posterior in this engine", async ({
     expect(sigmaGap, `sigma[${k}]: ${result.sigma[k]} vs ${expected.sd[k]}`).toBeLessThan(0.05);
   }
 });
+
+test("advi's on_snapshot reports each snapshot without changing the fit", async ({ page }) => {
+  await page.goto("/advi.html");
+  const r = await page.waitForFunction(() => (window as any).result, null, {
+    timeout: 60_000,
+  }).then((h) => h.jsonValue() as any);
+  expect(r.error ?? null).toBeNull();
+
+  expect(r.hookedMu).toEqual(r.mu);
+  expect(r.calls.map((c: any) => c.iter)).toEqual(r.snapshotIters);
+  const n = r.mu.length;
+  r.calls.forEach((c: any, s: number) => {
+    expect(c.mu).toEqual(r.muSnapshots.slice(s * n, (s + 1) * n));
+  });
+  // Each call carries only the trace since the one before, so together they are all of it.
+  expect(r.calls.reduce((a: number, c: any) => a + c.elboLen, 0)).toBe(r.elboLen);
+});
