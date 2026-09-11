@@ -159,6 +159,27 @@ fn a_rerolled_module_matches_the_tape() {
     agrees(&mut tape, root, &[0.4, 1.1, 0.3], Reroll::Auto, 1e-12);
 }
 
+/// |x| at a zero parameter, where a Laplace prior starts: the slope is PyTensor's
+/// sign(x), 0 there, in the loop emitter as well as the straight-line one.
+#[test]
+fn abs_backward_is_zero_at_the_cusp() {
+    let params = [-2.0, 0.0, -0.0, 3.0, 0.0, -1.5, 0.5, -0.0];
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let xs: Vec<u32> = params.iter().map(|&p| tape.new_var(p)).collect();
+    let abs: Vec<u32> = xs.iter().map(|&x| tape.abs(x)).collect();
+    let root = abs[1..].iter().fold(abs[0], |acc, &a| tape.add(acc, a));
+    for mode in [Reroll::Never, Reroll::Always] {
+        let c = compile_tape(&tape, params.len(), root, mode).unwrap();
+        let (_, grads) =
+            run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+        let want: Vec<f64> = params
+            .iter()
+            .map(|&p| if p == 0.0 { 0.0 } else { p.signum() })
+            .collect();
+        assert_eq!(grads, want, "{mode:?}");
+    }
+}
+
 /// Calling twice must give the same answer: the scratch buffer is reused, so a
 /// stale adjoint or a clobbered constant table would only show on the second
 /// call.
