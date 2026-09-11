@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-11 (npm only)
+
+crates.io still waits on a nuts-rs release that carries
+[nuts-rs#76](https://github.com/pymc-devs/nuts-rs/pull/76): 0.18.3, the latest,
+predates it.
+
 ### Added
 
 - **`compileTape(tape, reroll)`** — `"auto"` (the default, unchanged),
   `"always"` or `"never"`. The caller could not choose before, and the choice
   is an engine's rather than the model's: on pymcwasm's PyMC-Marketing MMM
-  (9,342 nodes, straight-line under `"auto"`) a gradient took 15.7 / 44.0 /
+  (9,342 nodes, which `"auto"` now re-rolls) a gradient took 15.7 / 44.0 /
   53.1 µs in Chromium / Firefox / WebKit straight-line and 28.2 / 36.3 / 30.6
   re-rolled, from a 319 KB module against 13 KB.
 - **`AotSampler::sampleWithStats`**, returning a `SampleResult`: the draws
@@ -141,7 +147,8 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/habakan/tapewasm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/habakan/tapewasm/releases/tag/v0.2.0
 [0.1.1]: https://github.com/habakan/tapewasm/releases/tag/v0.1.1
 [0.1.0]: https://github.com/habakan/tapewasm/releases/tag/v0.1.0
