@@ -161,7 +161,7 @@ pub fn compile_tape(
         if matches!(
             op,
             // No emitter arm; listed so a new op fails loudly rather than trapping.
-            Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf
+            Op::Erf | Op::Erfc | Op::StudentTLccdf
         ) {
             return Err(CodegenError::UnsupportedOp {
                 op: format!("{op:?}"),
@@ -305,6 +305,9 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
             math_idx.digamma = Some(define(math::digamma(log), &mut functions));
         }
     }
+    if needs.trigamma {
+        math_idx.trigamma = Some(define(math::trigamma(), &mut functions));
+    }
 
     // ---- global section ----------------------------------------------------
     let id = layout_id(tape, n_params, &const_table);
@@ -363,6 +366,7 @@ struct ImportNeeds {
     pow: bool,
     lgamma: bool,
     digamma: bool,
+    trigamma: bool,
     phi: bool,
 }
 
@@ -379,6 +383,7 @@ struct MathImportIndex {
     pow: Option<u32>,
     lgamma: Option<u32>,
     digamma: Option<u32>,
+    trigamma: Option<u32>,
     phi: Option<u32>,
     /// Running counter of function imports added so far. Memory imports
     /// occupy a different index space and do NOT advance this.
@@ -428,6 +433,10 @@ fn scan_imports(tape: &Tape) -> ImportNeeds {
             Op::Lgamma => {
                 needs.lgamma = true;
                 needs.digamma = true; // backward
+            }
+            Op::Digamma => {
+                needs.digamma = true;
+                needs.trigamma = true; // backward
             }
             Op::Phi => {
                 needs.phi = true;
@@ -2129,7 +2138,11 @@ fn emit_forward(
             aload(f, a1);
             f.instruction(&Instruction::Call(m.phi.expect("phi import missing")));
         }
-        Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf => {
+        Op::Digamma => {
+            aload(f, a1);
+            f.instruction(&Instruction::Call(m.digamma.expect("digamma is defined")));
+        }
+        Op::Erf | Op::Erfc | Op::StudentTLccdf => {
             unimplemented!("codegen for op {op:?}");
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
@@ -2237,7 +2250,10 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Phi => {
             adj_incr_phi(f, da1, dk, pa1, m.exp.unwrap());
         }
-        Op::Erf | Op::Erfc | Op::Digamma | Op::StudentTLccdf => {
+        Op::Digamma => {
+            adj_incr_fn1(f, da1, dk, pa1, m.trigamma.unwrap());
+        }
+        Op::Erf | Op::Erfc | Op::StudentTLccdf => {
             unimplemented!("backward for op {op:?}");
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),

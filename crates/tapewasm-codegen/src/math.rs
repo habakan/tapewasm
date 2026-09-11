@@ -1,4 +1,4 @@
-//! `lgamma` and `digamma` as functions inside the emitted module.
+//! `lgamma`, `digamma` and `trigamma` as functions inside the emitted module.
 //!
 //! What the host does well stays imported. `exp` and `log` were written out
 //! here too and measured: a logistic regression at N=5000 went from 132 to 255
@@ -215,6 +215,78 @@ pub fn digamma(log_idx: u32) -> Function {
     f
 }
 
+/// Asymptotic-series trigamma, `digamma`'s derivative. No `log` in it.
+pub fn trigamma() -> Function {
+    const X: u32 = 0;
+    const Z: u32 = 1;
+    const R: u32 = 2;
+    const INV: u32 = 3;
+    const SQ: u32 = 4;
+    let mut f = Function::new([(4, ValType::F64)]);
+
+    for i in [
+        Instruction::LocalGet(X),
+        Instruction::LocalSet(Z),
+        f64c(0.0),
+        Instruction::LocalSet(R),
+    ] {
+        f.instruction(&i);
+    }
+    shift_loop(
+        &mut f,
+        Z,
+        &[
+            Instruction::LocalGet(R),
+            f64c(1.0),
+            Instruction::LocalGet(Z),
+            Instruction::LocalGet(Z),
+            Instruction::F64Mul,
+            Instruction::F64Div,
+            Instruction::F64Add,
+            Instruction::LocalSet(R),
+        ],
+    );
+
+    for i in [
+        f64c(1.0),
+        Instruction::LocalGet(Z),
+        Instruction::F64Div,
+        Instruction::LocalTee(INV),
+        Instruction::LocalGet(INV),
+        Instruction::F64Mul,
+        Instruction::LocalSet(SQ),
+        // r + 1/z + z⁻²/2 + z⁻³ · series
+        Instruction::LocalGet(R),
+        Instruction::LocalGet(INV),
+        Instruction::F64Add,
+        f64c(0.5),
+        Instruction::LocalGet(SQ),
+        Instruction::F64Mul,
+        Instruction::F64Add,
+        Instruction::LocalGet(SQ),
+        Instruction::LocalGet(INV),
+        Instruction::F64Mul,
+    ] {
+        f.instruction(&i);
+    }
+    alternating_horner(
+        &mut f,
+        SQ,
+        &[
+            691.0 / 2730.0,
+            5.0 / 66.0,
+            1.0 / 30.0,
+            1.0 / 42.0,
+            1.0 / 30.0,
+            1.0 / 6.0,
+        ],
+    );
+    f.instruction(&Instruction::F64Mul);
+    f.instruction(&Instruction::F64Add);
+    f.instruction(&Instruction::End);
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +296,7 @@ mod tests {
     };
     use wasmi::{Caller, Engine, Func, Linker, Store};
 
-    /// A module exporting just the two, over an imported `log`.
+    /// A module exporting just the three, over an imported `log`.
     fn instantiate() -> (Store<()>, wasmi::Instance) {
         let mut types = TypeSection::new();
         types.ty().function([ValType::F64], [ValType::F64]);
@@ -233,12 +305,15 @@ mod tests {
         let mut functions = FunctionSection::new();
         functions.function(0);
         functions.function(0);
+        functions.function(0);
         let mut exports = ExportSection::new();
         exports.export("lgamma", ExportKind::Func, 1);
         exports.export("digamma", ExportKind::Func, 2);
+        exports.export("trigamma", ExportKind::Func, 3);
         let mut codes = CodeSection::new();
         codes.function(&lgamma(0));
         codes.function(&digamma(0));
+        codes.function(&trigamma());
         let mut m = Module::new();
         m.section(&types);
         m.section(&imports);
@@ -290,11 +365,16 @@ mod tests {
         check("digamma", tapewasm_autodiff::digamma);
     }
 
+    #[test]
+    fn trigamma_matches_the_recorded_tape() {
+        check("trigamma", tapewasm_autodiff::trigamma);
+    }
+
     /// A NaN has to leave the shifting loop rather than sit in it.
     #[test]
     fn a_nan_terminates() {
         let (mut store, instance) = instantiate();
-        for name in ["lgamma", "digamma"] {
+        for name in ["lgamma", "digamma", "trigamma"] {
             let f = instance.get_typed_func::<f64, f64>(&store, name).unwrap();
             assert!(f.call(&mut store, f64::NAN).unwrap().is_nan(), "{name}");
         }

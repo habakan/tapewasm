@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluations at the same target.
 - `REROLL=always|never` for the `tape_from_text` example, the same choice for
   a build step that emits ahead of time rather than in the page.
+- **`digamma` compiles.** The tape recorded it and `compile_tape` refused it
+  with `UnsupportedOp`; the module now carries `trigamma` beside `digamma` for
+  its derivative, mirroring `tapewasm_autodiff`'s to 1e-15, and the text
+  format has a `digamma` instruction.
 
 ## [0.2.0] — 2026-09-11 (npm only)
 
