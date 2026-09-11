@@ -30,7 +30,7 @@
 //! sin A      cos A      tan A
 //! asin A     acos A     atan A
 //! sqrt A     abs A      lgamma A
-//! phi A
+//! phi A      digamma A
 //! pow A C                               one operand and a constant
 //! add_c A C  sub_c A C  rsub_c A C      `rsub_c` is `C - A`
 //! mul_c A C  div_c A C  rdiv_c A C      `rdiv_c` is `C / A`
@@ -38,8 +38,8 @@
 //! sum_run SEED LEN A0 A1 ... A(LEN-1)           a reduction (see below)
 //! ```
 //!
-//! `Tape` records four more — `student_t_lccdf`, `erf`, `erfc` and `digamma` —
-//! which the emitter has no instruction sequence for, so writing them here
+//! `Tape` records three more — `student_t_lccdf`, `erf` and `erfc` — which
+//! the emitter has no instruction sequence for, so writing them here
 //! would only move where the refusal happens.
 //!
 //! **Operands are instruction numbers, not node indices.** The tape numbers
@@ -194,6 +194,7 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
             "acos" => tape.acos(idx(1)?),
             "atan" => tape.atan(idx(1)?),
             "lgamma" => tape.lgamma(idx(1)?),
+            "digamma" => tape.digamma(idx(1)?),
             "phi" => tape.phi(idx(1)?),
             "pow" => tape.pow(idx(1)?, num(2)?),
             "add_c" => tape.add_c(idx(1)?, num(2)?),

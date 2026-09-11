@@ -260,6 +260,25 @@ fn a_reduction_inside_a_block_matches_the_tape() {
     }
 }
 
+/// `digamma` straight-line and in a re-rolled loop, against the tape: its
+/// derivative is the module's own `trigamma`.
+#[test]
+fn digamma_matches_the_tape_in_every_reroll_mode() {
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let a = tape.new_var(0.8);
+    let mut acc = tape.mul_c(a, 0.0);
+    for i in 0..300 {
+        let s = tape.mul_c(a, 1.0 + i as f64 * 0.01);
+        let z = tape.add_c(s, 0.5);
+        let d = tape.digamma(z);
+        acc = tape.add(acc, d);
+    }
+    for mode in [Reroll::Auto, Reroll::Always, Reroll::Never] {
+        agrees(&mut tape, acc, &[0.8], mode, 1e-12);
+        agrees(&mut tape, acc, &[0.3], mode, 1e-12);
+    }
+}
+
 /// `Always` and `Never` on one tape is the only place the loop and
 /// straight-line emitters can be compared directly.
 #[test]
@@ -379,7 +398,7 @@ fn compile_tape_rejects_a_param_count_the_tape_does_not_open_with() {
 #[test]
 fn every_instruction_in_the_text_format_reaches_the_emitter() {
     // One line per instruction, arranged so nothing lands outside a domain:
-    // `asin`/`acos` want |x| <= 1, `log`/`lgamma`/`sqrt` want x > 0.
+    // `asin`/`acos` want |x| <= 1, `log`/`lgamma`/`digamma`/`sqrt` want x > 0.
     let src = "\
 n_params 2
 new_var 0.4
@@ -435,7 +454,9 @@ dot_c 3 2 1.0 3 2.0 4 3.0
 sum_run 0 3 5 6 7
 add 48 49
 add 51 50
-root 52
+digamma 8
+add 52 53
+root 54
 ";
     let program = tapewasm_codegen::tape_text::parse(src).expect("every instruction parses");
     let mut tape = program.tape;
