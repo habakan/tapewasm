@@ -26,10 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluations at the same target.
 - `REROLL=always|never` for the `tape_from_text` example, the same choice for
   a build step that emits ahead of time rather than in the page.
+- `make bench` times a gradient in Chromium, Firefox and WebKit, straight-line
+  against re-rolled, over tapes either side of the re-roll threshold. Not in CI.
 - **`digamma` compiles.** The tape recorded it and `compile_tape` refused it
   with `UnsupportedOp`; the module now carries `trigamma` beside `digamma` for
   its derivative, mirroring `tapewasm_autodiff`'s to 1e-15, and the text
   format has a `digamma` instruction.
+
+### Changed
+
+- **`Reroll::Auto` re-rolls past 2,000 nodes, not 12,000, and counts a
+  contraction or reduction by its run.** `make bench` put straight-line's cliff
+  at about 2k nodes on SpiderMonkey, 4k on JavaScriptCore and 10k on V8, so
+  12,000 left Firefox and Safari up to eight times slower in between — linreg
+  at 7k nodes took 23.6 / 37.9 µs straight-line against 5.5 / 4.6 re-rolled —
+  and a `dot_c` tape counted one node per row, so 2.5k nodes stayed
+  straight-line where it lost on all three. Tapes under 2,000, pymcwasm's
+  seven committed models among them, emit exactly as before.
 
 ## [0.2.0] — 2026-09-11 (npm only)
 

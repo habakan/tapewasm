@@ -279,6 +279,20 @@ fn digamma_matches_the_tape_in_every_reroll_mode() {
     }
 }
 
+/// `Auto` counts a contraction by its run: rows of ten are few nodes but emit
+/// ten elements each, and a tape of them re-rolls before its node count says so.
+#[test]
+fn auto_weighs_a_contraction_by_its_run() {
+    let (tape, root) = shapes::matvec(300, 10);
+    assert!(
+        tape.len() < 2_000,
+        "{} nodes is past the threshold unweighted",
+        tape.len()
+    );
+    let c = compile_tape(&tape, 11, root, Reroll::Auto).unwrap();
+    assert!(!c.const_table.is_empty(), "the rows stayed straight-line");
+}
+
 /// `Always` and `Never` on one tape is the only place the loop and
 /// straight-line emitters can be compared directly.
 #[test]
