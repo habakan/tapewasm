@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>bench</title>
+<pre id="out">loading…</pre>
+<script type="module">
+import init, { compileTape } from "/pkg/tapewasm.js";
+import * as tapes from "./bench-tapes.mjs";
+
+const MATH = {
+  exp: Math.exp, log: Math.log, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+  tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan, phi: () => NaN,
+};
+
+// One gradient's time: the module in its own memory, called directly, warmed past
+// tier-up, then the median of five rounds each sized to about 100 ms.
+async function timeOne(text, reroll) {
+  const built = compileTape(text, reroll);
+  const n = built.nParams;
+  const scratch = built.scratchInit;
+  const memory = new WebAssembly.Memory({ initial: Math.ceil((2 * n + scratch.length) * 8 / 65536) + 1 });
+  const f64 = new Float64Array(memory.buffer);
+  for (let i = 0; i < n; i++) f64[i] = 0.1 * Math.sin(i + 1);
+  f64.set(scratch, 2 * n);
+  const { instance } = await WebAssembly.instantiate(built.wasm, { tapewasm: { memory }, Math: MATH });
+  const lpg = instance.exports.log_prob_grad;
+  const call = () => lpg(0, n * 8, n, 2 * n * 8);
+
+  let calls = 0;
+  const t0 = performance.now();
+  while (performance.now() - t0 < 300) { call(); calls++; }
+  await new Promise((r) => setTimeout(r, 300));
+  const per = Math.max(1, Math.round(calls / 3));
+  const rounds = [];
+  for (let r = 0; r < 5; r++) {
+    const s = performance.now();
+    for (let c = 0; c < per; c++) call();
+    rounds.push((performance.now() - s) / per * 1000);
+  }
+  rounds.sort((a, b) => a - b);
+  return { bytes: built.wasm.length, us: rounds[2] };
+}
+
+window.runBench = async (cases) => {
+  await init({ module_or_path: "/pkg/tapewasm_bg.wasm" });
+  const out = [];
+  for (const c of cases) {
+    const text = tapes[c.shape](...c.args);
+    const lines = text.split("\n").length - 2;
+    for (const mode of ["never", "always"]) {
+      document.getElementById("out").textContent = `${c.shape}(${c.args}) ${mode}`;
+      out.push({ ...c, lines, mode, ...(await timeOne(text, mode)) });
+    }
+  }
+  return out;
+};
+window.ready = true;
+document.getElementById("out").textContent = "ready";
+</script>
