@@ -83,16 +83,15 @@ pub const ABI_VERSION: u32 = 1;
 /// When to re-roll a vectorised statement into a wasm loop.
 ///
 /// Which is faster is an engine preference, not a property of the model.
-/// Measured per gradient at N=200 (linear regression, then the same for
-/// logistic and student_t): V8 2.20 straight-line vs 2.63 looped, SpiderMonkey
-/// 14.0 vs 20.3, JavaScriptCore 4.33 vs 2.33. The first two keep optimising a
-/// large straight-line function; the third gives up on it. Past a few tens of
-/// thousands of nodes every engine prefers the loop, which is what `Auto`
-/// falls back on.
+/// `make bench` times a gradient per engine: straight-line wins everywhere on
+/// a small trace (0.3 against 1.0 µs at 1.4k nodes), then falls off a cliff at
+/// a size of each engine's own — past about 2k nodes on SpiderMonkey, 4k on
+/// JavaScriptCore and 10k on V8 — after which the loop is up to ten times
+/// faster. `Auto` re-rolls past where the three, summed, cross over.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Reroll {
-    /// Straight-line until the trace is large enough that no engine keeps
-    /// optimising it.
+    /// Straight-line for a small trace, where every engine prefers it; loops
+    /// past about 2,000 nodes, a contraction or reduction counting its run.
     #[default]
     Auto,
     /// Always loop: smallest module, and what JavaScriptCore prefers.
@@ -102,9 +101,20 @@ pub enum Reroll {
     Never,
 }
 
-/// Node count past which `Auto` re-rolls. Straight-line wins below it on V8 and
-/// SpiderMonkey by keeping every value in a register-allocated local.
-const RE_ROLL_ABOVE: usize = 12_000;
+/// Size past which `Auto` re-rolls, as [`weighted_len`] counts it. `make bench`:
+/// straight-line loses past ~2k on SpiderMonkey, ~4k on JSC, ~10k on V8.
+const RE_ROLL_ABOVE: usize = 2_000;
+
+/// A tape's size as straight-line code sees it: a contraction or reduction is
+/// one node emitting its whole run, so it counts its run's length.
+fn weighted_len(tape: &Tape) -> usize {
+    (0..tape.len() as u32)
+        .map(|k| match tape.op_at(k) {
+            Op::DotC | Op::Sum => tape.extent_at(k).len as usize,
+            _ => 1,
+        })
+        .sum()
+}
 
 /// Function parameter holding the scratch base address, used only by
 /// [`Layout::Memory`]. Primals and adjoints live there, two f64 per tape node.
@@ -206,7 +216,7 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     let blocks = match reroll {
         Reroll::Never => Vec::new(),
         Reroll::Always => reroll::detect(tape),
-        Reroll::Auto if tape.len() > RE_ROLL_ABOVE => reroll::detect(tape),
+        Reroll::Auto if weighted_len(tape) > RE_ROLL_ABOVE => reroll::detect(tape),
         Reroll::Auto => Vec::new(),
     };
     // Loop-index-dependent constants live past the adjoints, in block then node order.
