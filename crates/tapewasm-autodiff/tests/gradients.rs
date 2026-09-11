@@ -60,6 +60,15 @@ fn pow_rule() {
 }
 
 #[test]
+fn abs_rule_is_zero_at_the_cusp() {
+    // PyTensor differentiates |x| as sign(x), so 0 at x = 0 whatever the zero's sign.
+    for (x, want) in [(-2.0, -1.0), (0.0, 0.0), (-0.0, 0.0), (3.0, 1.0)] {
+        let (_, g) = log_prob_grad(&[x], |t, xs| t.abs(xs[0]));
+        assert_eq!(g[0], want, "d|x|/dx at {x}");
+    }
+}
+
+#[test]
 fn negative_log_likelihood_normal() {
     // -0.5·((x-mu)/sigma)² - log(sigma), constants dropped. At x=2, mu=0, sigma=1:
     // d/dmu = (x-mu)/sigma² = 2; d/dsigma = (x-mu)²/sigma³ - 1/sigma = 3.

@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   straight-line where it lost on all three. Tapes under 2,000, pymcwasm's
   seven committed models among them, emit exactly as before.
 
+### Fixed
+
+- **`abs` differentiates to 0 at 0**, as PyTensor's `sign` does, in the tape's
+  reverse pass and in the emitted module. Both gave ±1 there, so a Laplace
+  prior started at its mode had a gradient off by 1.
+
 ## [0.2.0] — 2026-09-11 (npm only)
 
 crates.io still waits on a nuts-rs release that carries

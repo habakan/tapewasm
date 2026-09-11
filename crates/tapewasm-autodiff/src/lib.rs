@@ -543,8 +543,11 @@ impl Tape {
                     }
                 }
                 Op::Abs => {
-                    let sign = if self.val[a1] >= 0.0 { 1.0 } else { -1.0 };
-                    self.grad[a1] += g * sign;
+                    // Zero at the cusp, as PyTensor's `sign`: a Laplace prior often starts at 0.
+                    let va = self.val[a1];
+                    if va != 0.0 {
+                        self.grad[a1] += g * 1f64.copysign(va);
+                    }
                 }
                 Op::Lgamma => {
                     self.grad[a1] += g * digamma(self.val[a1]);

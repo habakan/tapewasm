@@ -2668,7 +2668,7 @@ fn adj_incr_pow(f: &mut Function, da: Addr, dk: Addr, tv: Addr, exponent: f64, p
     astore_end(f, da);
 }
 
-// d[da] += d[dk] * copysign(1.0, t[ta])  (ABS backward)
+// d[da] += t[ta] != 0 ? d[dk] * copysign(1.0, t[ta]) : 0  (ABS backward)
 fn adj_incr_sign(f: &mut Function, da: Addr, dk: Addr, ta: Addr) {
     astore_addr(f, da);
     aload(f, da);
@@ -2677,6 +2677,12 @@ fn adj_incr_sign(f: &mut Function, da: Addr, dk: Addr, ta: Addr) {
     aload(f, ta);
     f.instruction(&Instruction::F64Copysign);
     f.instruction(&Instruction::F64Mul);
+    // Zero at the cusp, -0.0 included. Same as the tape's backward.
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    aload(f, ta);
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    f.instruction(&Instruction::F64Ne);
+    f.instruction(&Instruction::Select);
     f.instruction(&Instruction::F64Add);
     astore_end(f, da);
 }
