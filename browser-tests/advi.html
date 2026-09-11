@@ -32,12 +32,25 @@ async function run() {
   );
   const ms = performance.now() - t0;
 
+  // The same run again with the progress hook: it must not change the fit.
+  const calls = [];
+  const hooked = sampler.advi(
+    new Float64Array(meta.init), meta.numIters, meta.mcSamples, meta.learningRate,
+    BigInt(meta.seed), Math.ceil(meta.numIters / 10),
+    (iter, mu, elbo) => calls.push({ iter, mu: Array.from(mu), elboLen: elbo.length }),
+  );
+
   return {
     ok: true,
     mu: Array.from(result.mu),
     sigma: Array.from(result.sigma),
     ms,
     moduleBytes: bytes.byteLength,
+    hookedMu: Array.from(hooked.mu),
+    snapshotIters: Array.from(hooked.snapshotIters),
+    muSnapshots: Array.from(hooked.muSnapshots),
+    elboLen: hooked.elboTrace.length,
+    calls,
   };
 }
 

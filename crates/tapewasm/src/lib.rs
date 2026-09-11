@@ -174,6 +174,24 @@ extern "C" {
     fn aot_abi_version() -> f64;
 }
 
+#[wasm_bindgen]
+extern "C" {
+    /// `advi`'s progress hook, called as `(iter, mu, elbo)`.
+    #[wasm_bindgen(
+        typescript_type = "((iter: number, mu: Float64Array, elbo: Float64Array) => void)"
+    )]
+    pub type AdviSnapshotCallback;
+
+    #[wasm_bindgen(method, catch, js_name = call)]
+    fn call3(
+        this: &AdviSnapshotCallback,
+        ctx: &JsValue,
+        iter: f64,
+        mu: Vec<f64>,
+        elbo: Vec<f64>,
+    ) -> Result<JsValue, JsValue>;
+}
+
 /// The module shape this build knows how to run.
 ///
 /// Kept here rather than read from `tapewasm-codegen`, which the sampler-only
@@ -553,6 +571,12 @@ impl AotSampler {
     /// spliced together: restarting Adam's moment estimates partway through
     /// measurably converges to a worse optimum, so this is the only way to
     /// watch a run progress without paying for that.
+    ///
+    /// `on_snapshot`, if given, is also called at each snapshot with the
+    /// iteration, a copy of that `μ`, and the ELBO trace since the previous
+    /// call — so a run inside a Worker can report as it goes rather than only
+    /// once it returns.
+    #[allow(clippy::too_many_arguments)] // positional, as JS calls it
     pub fn advi(
         &self,
         init: &[f64],
@@ -561,6 +585,7 @@ impl AotSampler {
         learning_rate: f64,
         seed: u64,
         snapshot_every: u32,
+        on_snapshot: Option<AdviSnapshotCallback>,
     ) -> Result<AdviResult, JsError> {
         let n = self.n_params;
         if init.len() != n {
@@ -606,6 +631,7 @@ impl AotSampler {
 
         let mut mu_snapshots = Vec::new();
         let mut snapshot_iters = Vec::new();
+        let mut elbo_reported = 0;
 
         for t in 1..=num_iters {
             grad_mu.iter_mut().for_each(|g| *g = 0.0);
@@ -665,6 +691,12 @@ impl AotSampler {
             if snapshot_every > 0 && (t % snapshot_every == 0 || t == num_iters) {
                 mu_snapshots.extend_from_slice(&mu);
                 snapshot_iters.push(t as f64);
+                if let Some(f) = &on_snapshot {
+                    let elbo = elbo_trace[elbo_reported..].to_vec();
+                    elbo_reported = elbo_trace.len();
+                    f.call3(&JsValue::UNDEFINED, t as f64, mu.clone(), elbo)
+                        .map_err(|e| JsError::new(&format!("advi: on_snapshot threw: {e:?}")))?;
+                }
             }
         }
 

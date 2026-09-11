@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sample` returns for the same seed, with each draw's `diverging`, `tuning`,
   `stepSize`, `numSteps` and `lp` beside them — what ArviZ keeps as
   `sample_stats` — and a `chain` label for assembling several runs.
+- **`advi(..., on_snapshot)`**, an optional last argument called at each
+  snapshot with the iteration, that `μ` and the ELBO trace since the last call.
+  Run from a Worker, a page can draw the fit as it goes instead of replaying
+  `muSnapshots` once the one blocking call returns. The fit is unchanged.
 - **`AotSampler::setTargetAccept` and `setGradBasedEstimate`.** Neither could
   be set from outside: warmup aimed at nuts-rs's 0.8 acceptance, and the metric
   came from the draws alone — the reference posteriors' choice, and still the
