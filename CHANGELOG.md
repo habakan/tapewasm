@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] — 2026-09-11 (npm only)
+## [0.3.0] — 2026-09-12 (npm only)
 
 crates.io still waits on a nuts-rs release that carries
 [nuts-rs#76](https://github.com/pymc-devs/nuts-rs/pull/76): 0.18.3, the latest,
