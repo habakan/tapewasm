@@ -619,6 +619,7 @@ impl AotSampler {
         let mut elbo_trace = Vec::with_capacity(num_iters as usize);
 
         let mut eta = vec![0.0_f64; n];
+        let mut sigma = vec![0.0_f64; n];
         let mut theta = vec![0.0_f64; n];
         let mut grad = vec![0.0_f64; n];
         let mut grad_mu = vec![0.0_f64; n];
@@ -637,11 +638,16 @@ impl AotSampler {
             grad_mu.iter_mut().for_each(|g| *g = 0.0);
             grad_omega.iter_mut().for_each(|g| *g = 0.0);
             let mut lp_sum = 0.0;
+            // `omega` only moves with Adam, below, so every MC sample in this
+            // iteration shares one exponential per parameter.
+            for i in 0..n {
+                sigma[i] = omega[i].exp();
+            }
 
             for _ in 0..mc_samples {
                 fill_standard_normal(&mut rng, &mut eta);
                 for i in 0..n {
-                    theta[i] = mu[i] + omega[i].exp() * eta[i];
+                    theta[i] = mu[i] + sigma[i] * eta[i];
                 }
                 let lp = logp_fn
                     .logp(&theta, &mut grad)
@@ -656,7 +662,7 @@ impl AotSampler {
                 lp_sum += lp;
                 for i in 0..n {
                     grad_mu[i] += grad[i];
-                    grad_omega[i] += grad[i] * omega[i].exp() * eta[i];
+                    grad_omega[i] += grad[i] * sigma[i] * eta[i];
                 }
             }
 

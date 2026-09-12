@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **ADVI exponentiates each `omega` once an iteration**, not once per Monte
+  Carlo sample and again per gradient — `n_params` calls where it took
+  `2 × mc_samples × n_params`. `omega` only moves once an iteration, so the
+  fit is the same to the bit at the same seed; the browser test's 4,000
+  iterations at 4 samples take 0.77x the time in Node, a 50-parameter model
+  0.94x.
+
 ## [0.3.0] — 2026-09-12 (npm only)
 
 crates.io still waits on a nuts-rs release that carries
