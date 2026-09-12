@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A root of zero contributes nothing to the gradient** rather than an
+  infinity, in the tape's reverse pass and in both emitters. `pow` and `abs`
+  already did this, and a front end that lowered `sqrt` as `pow(x, 0.5)` only
+  to inherit the guard was paying a host `pow` call in each direction: 398 of
+  them per gradient on posteriordb's `garch11`, which is 200 time steps.
+
 ## [0.3.0] — 2026-09-12 (npm only)
 
 crates.io still waits on a nuts-rs release that carries
