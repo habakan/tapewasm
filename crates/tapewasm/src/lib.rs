@@ -126,8 +126,9 @@ pub fn init_gradient_check(names: &[String], lp: f64, grad: &[f64]) -> Result<()
     Err(format!(
         "the log density does not move with {} of the {} parameters at the \
          starting point ({shown}{rest}), and the sampler cannot begin from \
-         there. `randomInit(seed)` finds one, or drop the parameters the data \
-         says nothing about",
+         there. Start somewhere else — a random point moves every parameter \
+         a flat one does not — or drop the parameters the data says nothing \
+         about",
         bad.len(),
         grad.len(),
     ))

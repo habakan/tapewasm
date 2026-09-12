@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The rejected-starting-point message no longer names a function that is not
+  here.** It pointed at `randomInit(seed)`, which belongs to a front end rather
+  than to this crate, so the one reader who most needed the advice — someone
+  driving `AotSampler` directly — was sent to an API they do not have.
+
 ## [0.3.0] — 2026-09-12 (npm only)
 
 crates.io still waits on a nuts-rs release that carries
