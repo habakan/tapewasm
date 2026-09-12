@@ -57,7 +57,7 @@ The emitter and the sampler are separate, so a page can carry either or both.
 
 | | **compile in the page** | **compile beforehand** |
 | --- | --- | --- |
-| the page loads | the full bundle, 339 KB | the sampler alone, 164 KB, and a module |
+| the page loads | the full bundle, 368 KB | the sampler alone, 176 KB, and a module |
 | the model | anything, recompiled live | fixed when the page was built |
 | build with | `make wasm` | `make wasm-sampler` |
 
