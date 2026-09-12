@@ -69,7 +69,11 @@ Check that `release.yml` is enabled before tagging (`gh workflow list --all`).
 A disabled workflow does not fail on its trigger — the tag lands and nothing
 runs at all.
 
-## 4. Publish to npm
+## 4. Stage on npm, then approve
+
+Staged, not published directly: `npm stage publish` needs no 2FA, so whoever
+builds the release (an agent included) can stage it, and nothing is public
+until the maintainer approves with 2FA. Needs npm 11.15 or later.
 
 From a checkout of the tag, with nothing uncommitted — `make wasm` bakes the
 working tree into the bundle, so a stray edit ships as the release:
@@ -78,13 +82,24 @@ working tree into the bundle, so a stray edit ships as the release:
 git status --short          # must be clean
 git rev-parse HEAD          # must be the tagged commit
 make wasm
-cd ts && npm publish --access public
+cd ts && npm stage publish --access public
 ```
 
 No `--provenance`: a tarball published from a laptop cannot carry an
 attestation, and passing the flag fails rather than being ignored.
 
-**This spends the version.** Confirm with `npm view tapewasm version`.
+Then the maintainer checks what was staged and approves it:
+
+```bash
+npm stage list tapewasm
+npm stage view <stage-id>       # version, file list, integrity
+npm stage approve <stage-id>    # 2FA; `npm stage reject <stage-id>` drops it instead
+```
+
+**A staged version already holds its number** — the registry refuses a
+publish of a version that is staged. Approval waits on the registry's malware
+scan, and the version shows up a few minutes after; confirm with
+`npm view tapewasm version --prefer-online`.
 
 ## 5. Publish to crates.io
 
