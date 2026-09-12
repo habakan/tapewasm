@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::{E, PI};
 
@@ -271,10 +272,6 @@ pub fn shared_memory() -> JsValue {
 /// nuts-rs' log density, answered by the bound module rather than in Rust.
 pub struct AotLogp {
     n_params: usize,
-    /// Persistent scratch buffer for params (params_ptr) inside our memory.
-    params_buf: Vec<f64>,
-    /// Persistent scratch buffer for grads (grads_ptr) inside our memory.
-    grads_buf: Vec<f64>,
     /// Primal and adjoint storage the AOT module works in, two f64 per node.
     scratch_buf: Vec<f64>,
 }
@@ -285,8 +282,6 @@ impl AotLogp {
     pub fn new(n_params: usize, scratch_buf: Vec<f64>) -> Self {
         Self {
             n_params,
-            params_buf: vec![0.0; n_params],
-            grads_buf: vec![0.0; n_params],
             scratch_buf,
         }
     }
@@ -314,13 +309,13 @@ impl CpuLogpFunc for AotLogp {
     }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SamplerError> {
-        // Copy position into the persistent params buffer; capture pointers.
-        self.params_buf.copy_from_slice(position);
-        let params_ptr = self.params_buf.as_ptr() as u32;
-        let grads_ptr = self.grads_buf.as_mut_ptr() as u32;
+        // The caller's own slices are already in the memory the module imports,
+        // and the ABI reads every parameter before it stores any gradient, so
+        // handing over their addresses is what a relaying buffer would do.
+        let params_ptr = position.as_ptr() as u32;
+        let grads_ptr = gradient.as_mut_ptr() as u32;
         let scratch_ptr = self.scratch_buf.as_mut_ptr() as u32;
         let lp = aot_logp(params_ptr, grads_ptr, self.n_params as u32, scratch_ptr);
-        gradient.copy_from_slice(&self.grads_buf);
         if lp.is_finite() {
             Ok(lp)
         } else {
@@ -349,6 +344,11 @@ pub struct AotSampler {
     param_names: Vec<String>,
     target_accept: Option<f64>,
     grad_based_estimate: Option<bool>,
+    /// `logProbGrad`'s evaluator, kept so a run of calls copies `scratch_init`
+    /// once rather than once each. A cell rather than `&mut self`, so the
+    /// method stays a shared borrow and a snapshot callback can still call it
+    /// while `advi` runs.
+    evaluator: RefCell<Option<AotLogp>>,
 }
 
 #[wasm_bindgen]
@@ -391,6 +391,7 @@ impl AotSampler {
             param_names,
             target_accept: None,
             grad_based_estimate: None,
+            evaluator: RefCell::new(None),
         })
     }
 
@@ -438,13 +439,15 @@ impl AotSampler {
     fn logp_fn(&self) -> AotLogp {
         AotLogp {
             n_params: self.n_params,
-            params_buf: vec![0.0; self.n_params],
-            grads_buf: vec![0.0; self.n_params],
             scratch_buf: self.scratch_init.clone(),
         }
     }
 
     /// `[log_prob, d/dparam...]`.
+    ///
+    /// The evaluator behind it is built on the first call and reused, so
+    /// calling this in a row costs one `scratch_init` copy rather than one per
+    /// call — the same evaluator `sample` and `advi` keep for a whole run.
     #[wasm_bindgen(js_name = logProbGrad)]
     pub fn log_prob_grad(&self, params: &[f64]) -> Result<Vec<f64>, JsError> {
         if params.len() != self.n_params {
@@ -456,11 +459,11 @@ impl AotSampler {
         }
         check_aot_binding(self.layout_id)?;
         let mut out = vec![0.0_f64; self.n_params + 1];
-        let lp = self
-            .logp_fn()
+        let mut held = self.evaluator.borrow_mut();
+        let logp_fn = held.get_or_insert_with(|| self.logp_fn());
+        out[0] = logp_fn
             .logp(params, &mut out[1..])
             .map_err(|e| JsError::new(&format!("{e}")))?;
-        out[0] = lp;
         Ok(out)
     }
 
