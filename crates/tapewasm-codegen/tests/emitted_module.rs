@@ -180,6 +180,28 @@ fn abs_backward_is_zero_at_the_cusp() {
     }
 }
 
+/// √x at a zero parameter, where the slope is infinite: the node contributes
+/// nothing rather than an infinity, in both emitters and in the tape.
+#[test]
+fn sqrt_backward_is_zero_at_zero() {
+    let params = [4.0, 0.0, 2.25, 0.0, 9.0, 1.0, 0.0, 0.25];
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let xs: Vec<u32> = params.iter().map(|&p| tape.new_var(p)).collect();
+    let roots: Vec<u32> = xs.iter().map(|&x| tape.sqrt(x)).collect();
+    let root = roots[1..].iter().fold(roots[0], |acc, &a| tape.add(acc, a));
+    let want: Vec<f64> = params
+        .iter()
+        .map(|&p| if p == 0.0 { 0.0 } else { 0.5 / p.sqrt() })
+        .collect();
+    assert_eq!(tape_oracle(&mut tape, root, &params).1, want, "tape");
+    for mode in [Reroll::Never, Reroll::Always] {
+        let c = compile_tape(&tape, params.len(), root, mode).unwrap();
+        let (_, grads) =
+            run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+        assert_eq!(grads, want, "{mode:?}");
+    }
+}
+
 /// Calling twice must give the same answer: the scratch buffer is reused, so a
 /// stale adjoint or a clobbered constant table would only show on the second
 /// call.

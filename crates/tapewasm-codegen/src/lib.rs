@@ -2531,6 +2531,12 @@ fn adj_incr_div2(f: &mut Function, da: Addr, dk: Addr, tk: Addr) {
     aload(f, tk);
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::F64Div);
+    // Zero at zero, where the slope is infinite. Same as the tape's backward.
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    aload(f, tk);
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    f.instruction(&Instruction::F64Ne);
+    f.instruction(&Instruction::Select);
     f.instruction(&Instruction::F64Add);
     astore_end(f, da);
 }
