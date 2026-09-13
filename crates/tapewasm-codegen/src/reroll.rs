@@ -658,9 +658,41 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
         }
     }
 
+    // A value the host computes is kept rather than made twice. The backward pass
+    // recomputes a block's locals to get this iteration's values back; a call out
+    // to the host costs about 6.6 ns there (3.3 boundary, 3.3 arithmetic, measured
+    // on `wells_dist100ars_model`), where a slot costs a store and one load per
+    // reader in the same iteration. Arithmetic stays recomputed: it is cheaper
+    // than the memory traffic, which is what put these in locals to begin with.
+    for k in 0..n {
+        if calls_out(tape.op_at(k)) {
+            demote(k, &mut out);
+        }
+    }
+
     // The log density is read after the loops have run.
     demote(root, &mut out);
     out
+}
+
+/// Whether emitting this op calls an imported function rather than a wasm
+/// instruction. `sqrt` and `abs` are instructions; the arithmetic is inline.
+fn calls_out(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Exp
+            | Op::Log
+            | Op::Sin
+            | Op::Cos
+            | Op::Tan
+            | Op::Asin
+            | Op::Acos
+            | Op::Atan
+            | Op::Pow
+            | Op::Lgamma
+            | Op::Digamma
+            | Op::Phi
+    )
 }
 
 #[cfg(test)]

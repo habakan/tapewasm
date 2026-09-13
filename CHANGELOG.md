@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A re-rolled loop keeps what the host computed, rather than making it
+  twice.** The backward pass recomputes a block's iteration to get its locals
+  back, and that was calling out to `exp`, `log`, `lgamma` and the rest a
+  second time. Those results now live in the scratch slot the tape already
+  reserved for them, so the backward pass reads instead of calls. Arithmetic
+  stays recomputed — it is cheaper than the memory traffic, which is why it
+  went into locals to begin with.
+
+  Host calls per gradient halve, and so does the time they were buying
+  (wasmtime, both builds interleaved in one process, Apple M3):
+
+  | model | host calls | ns per gradient |
+  | --- | --- | --- |
+  | `wells_dist100ars_model` | 12,080 → 6,040 | 156,979 → 103,597 |
+  | `low_dim_gauss_mix` | 6,004 → 3,010 | 75,568 → 49,551 |
+  | `lsat_model` | 20,001 → 10,001 | 215,697 → 162,445 |
+  | `garch11` | 405 → 207 | 13,135 → 9,872 |
+  | `dogs` | 482 → 342 | 8,757 → 7,602 |
+
+  Scratch does not grow — the slot was already reserved — and the emitted
+  module grows by 0-2%. Models with no host call inside a loop are unchanged,
+  byte for byte.
+
+### Changed
+
 - **A root of zero contributes nothing to the gradient** rather than an
   infinity, in the tape's reverse pass and in both emitters. `pow` and `abs`
   already did this, and a front end that lowered `sqrt` as `pow(x, 0.5)` only
