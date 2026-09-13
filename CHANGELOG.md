@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-13
+
 ### Changed
 
 - **A re-rolled loop keeps what the host computed, rather than making it

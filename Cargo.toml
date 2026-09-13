@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tapewasm-autodiff", "crates/tapewasm-codegen", "crates/tapewasm"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Floor set by nuts-rs 0.18 (edition 2024 + let-chains).
 rust-version = "1.88"
@@ -13,8 +13,8 @@ repository = "https://github.com/habakan/tapewasm"
 [workspace.dependencies]
 # Each internal dep carries `path` (what local builds resolve) and `version` (what
 # `cargo publish` rewrites to).
-tapewasm-autodiff = { path = "crates/tapewasm-autodiff", version = "0.3.0" }
-tapewasm-codegen = { path = "crates/tapewasm-codegen", version = "0.3.0" }
+tapewasm-autodiff = { path = "crates/tapewasm-autodiff", version = "0.4.0" }
+tapewasm-codegen = { path = "crates/tapewasm-codegen", version = "0.4.0" }
 
 nuts-rs = { version = "0.18.1", default-features = false }
 wasm-bindgen = "0.2"
