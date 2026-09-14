@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`calibrateReroll()`** — measures which shape this engine prefers and returns
+  a threshold to hand `compileTape`. It compiles one probe tape both ways,
+  instantiates each and times them interleaved, then answers 30,000 for an
+  engine that prefers straight-line and the built-in 2,000 for one that prefers
+  loops. Cached after the first call, because it is a property of the engine
+  rather than of the model, and it never throws — a failed measurement returns
+  the built-in threshold.
+
+  Measured through the three engines `browser-tests` uses:
+
+  | engine | threshold | straight-line | re-rolled |
+  | --- | --- | --- | --- |
+  | Chromium 1243 | 30,000 | 0.87 µs | 2.60 µs |
+  | Firefox 1543 | 2,000 | 8.81 µs | 2.80 µs |
+  | WebKit 2359 | 2,000 | 16.30 µs | 1.68 µs |
+
+  About 130 ms, once. The probe tape is arithmetic only, so the module it
+  compiles to imports nothing but memory and a caller needs to supply no maths.
+
+  **What it cannot do.** A node count settles V8 — straight-line wins there up
+  to 10,104 nodes and loses from 60,721, so any threshold between them is
+  optimal on the models measured. It does not settle the other two, where the
+  two sides overlap: `dogs` at 2,734 nodes prefers straight-line on Firefox
+  while `arma11` at 2,341 prefers loops. The overlap is narrow — the loss
+  against picking per-model is 1.02x and 1.15x in the geometric mean — and
+  closing it needs a per-model measurement, not a better threshold.
+
 - **`Reroll::Above(n)`, and a node count where `compileTape` takes a mode** —
   re-roll past `n` nodes instead of the built-in threshold.
 
