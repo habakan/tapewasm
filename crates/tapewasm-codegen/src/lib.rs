@@ -90,8 +90,8 @@ pub const ABI_VERSION: u32 = 1;
 /// faster. `Auto` re-rolls past where the three, summed, cross over.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Reroll {
-    /// Straight-line for a small trace, where every engine prefers it; loops
-    /// past about 2,000 nodes, a contraction or reduction counting its run.
+    /// Straight-line for a small trace; loops past [`RE_ROLL_ABOVE`].
+    /// `Above(RE_ROLL_ABOVE)` by another name.
     #[default]
     Auto,
     /// Always loop: smallest module, and what JavaScriptCore prefers.
@@ -99,11 +99,25 @@ pub enum Reroll {
     /// Never loop. Diagnostic only — a large model exceeds what an engine will
     /// optimise, and eventually what it will hold in locals.
     Never,
+    /// Loop past this many nodes, as [`weighted_len`] counts them.
+    ///
+    /// For a caller that knows which engine will run the module. **No single
+    /// value serves every engine**: measured across three, straight-line and
+    /// re-rolled cross over around 60,000 nodes in V8 and around 2,000 in
+    /// SpiderMonkey and JavaScriptCore — thirty times apart. [`Auto`] takes the
+    /// lower one, which is near-optimal for two of the three and costs V8 up to
+    /// 7.6x on a trace between them.
+    ///
+    /// [`Auto`]: Reroll::Auto
+    Above(usize),
 }
 
-/// Size past which `Auto` re-rolls, as [`weighted_len`] counts it. `make bench`:
-/// straight-line loses past ~2k on SpiderMonkey, ~4k on JSC, ~10k on V8.
-const RE_ROLL_ABOVE: usize = 2_000;
+/// Size past which [`Reroll::Auto`] re-rolls, as [`weighted_len`] counts it.
+///
+/// Tuned for the engines that cross over earliest. A V8-only caller wants
+/// [`Reroll::Above`] with something nearer 60,000; see its documentation for
+/// why one number cannot serve all three.
+pub const RE_ROLL_ABOVE: usize = 2_000;
 
 /// A tape's size as straight-line code sees it: a contraction or reduction is
 /// one node emitting its whole run, so it counts its run's length.
@@ -216,8 +230,17 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     let blocks = match reroll {
         Reroll::Never => Vec::new(),
         Reroll::Always => reroll::detect(tape),
-        Reroll::Auto if weighted_len(tape) > RE_ROLL_ABOVE => reroll::detect(tape),
-        Reroll::Auto => Vec::new(),
+        Reroll::Auto | Reroll::Above(_) => {
+            let above = match reroll {
+                Reroll::Above(n) => n,
+                _ => RE_ROLL_ABOVE,
+            };
+            if weighted_len(tape) > above {
+                reroll::detect(tape)
+            } else {
+                Vec::new()
+            }
+        }
     };
     // Loop-index-dependent constants live past the adjoints, in block then node order.
     let const_base = 2 * n;

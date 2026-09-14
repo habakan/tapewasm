@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Reroll::Above(n)`, and a node count where `compileTape` takes a mode** —
+  re-roll past `n` nodes instead of the built-in threshold.
+
+  For a caller that knows which engine will run the module. **No single value
+  serves every engine**: measured across Chromium, Firefox and WebKit,
+  straight-line and re-rolled cross over around 60,000 nodes in V8 and around
+  2,000 in SpiderMonkey and JavaScriptCore — thirty times apart. `"auto"` takes
+  the lower one, which is near-optimal for two of the three (the loss against
+  picking per-model is 1.02x and 1.15x in the geometric mean) and costs V8 up
+  to 7.6x on a trace between them (1.85x in the mean). Raising the constant
+  would only move the loss onto the other two, so the threshold became a value
+  rather than a better number.
+
+  `RE_ROLL_ABOVE` is now public, so `Above(RE_ROLL_ABOVE)` names what `Auto`
+  does.
+
 ## [0.3.1] — 2026-09-13
 
 ### Changed
