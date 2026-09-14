@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Releases are staged by CI.** Pushing a `v*` tag now runs `npm stage publish`
+  from the tagged tree; the version still goes public only when the maintainer
+  approves it with 2FA. The job authenticates through npm trusted publishing
+  rather than a stored token, so published tarballs carry provenance.
+
 ## [0.3.2] — 2026-09-14
 
 ### Added
