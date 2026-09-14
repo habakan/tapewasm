@@ -871,24 +871,36 @@ impl CompiledTape {
 /// is written and consumed inside one call.
 ///
 /// `reroll` says when a vectorised statement becomes a wasm loop: `"auto"`
-/// (the default, straight-line below a size threshold), `"always"` or
-/// `"never"`. Which is faster is an engine's preference, not the model's —
-/// on one real model straight-line was faster on V8 and slower on
-/// SpiderMonkey and JavaScriptCore — and `"always"` is also the smallest
-/// module, often by an order of magnitude.
+/// (the default, straight-line below a size threshold), `"always"`, `"never"`,
+/// or a node count to re-roll past, written as a number.
+///
+/// **Which is faster is an engine's preference, not the model's.** Measured
+/// across three engines, straight-line and re-rolled cross over around 60,000
+/// nodes in V8 and around 2,000 in SpiderMonkey and JavaScriptCore — thirty
+/// times apart, so no single threshold serves all three. `"auto"` takes the
+/// lower one: near-optimal for two of the three, and up to 7.6x off on V8 for
+/// a trace between them. A caller that knows its engine passes the number.
+///
+/// `"always"` is also the smallest module, often by an order of magnitude.
 #[cfg(feature = "codegen")]
 #[wasm_bindgen(js_name = compileTape)]
 pub fn compile_tape(tape: &str, reroll: Option<String>) -> Result<CompiledTape, JsError> {
     use tapewasm_codegen::Reroll;
+    // A number is a node count to re-roll past — what a caller uses when it
+    // knows which engine will run the module. The three named modes stay.
     let reroll = match reroll.as_deref() {
         None | Some("auto") => Reroll::Auto,
         Some("always") => Reroll::Always,
         Some("never") => Reroll::Never,
-        Some(other) => {
-            return Err(JsError::new(&format!(
-                "reroll must be \"auto\", \"always\" or \"never\", not {other:?}"
-            )))
-        }
+        Some(other) => match other.parse::<usize>() {
+            Ok(n) => Reroll::Above(n),
+            Err(_) => {
+                return Err(JsError::new(&format!(
+                    "reroll must be \"auto\", \"always\", \"never\" or a node count, \
+                     not {other:?}"
+                )))
+            }
+        },
     };
     let program = tapewasm_codegen::tape_text::parse(tape).map_err(jserr)?;
     let compiled =

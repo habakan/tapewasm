@@ -7,7 +7,7 @@
 //! implementation.
 
 use tapewasm_codegen::shapes;
-use tapewasm_codegen::{compile_tape, Reroll};
+use tapewasm_codegen::{compile_tape, Reroll, RE_ROLL_ABOVE};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module, Store};
 
 fn lgamma(x: f64) -> f64 {
@@ -334,6 +334,38 @@ fn auto_weighs_a_contraction_by_its_run() {
     );
     let c = compile_tape(&tape, 11, root, Reroll::Auto).unwrap();
     assert!(!c.const_table.is_empty(), "the rows stayed straight-line");
+}
+
+/// The threshold is a value, because no one value serves every engine:
+/// straight-line and re-rolled cross over around 60,000 nodes in V8 and around
+/// 2,000 in the other two. A caller that knows its engine names the number.
+#[test]
+fn above_moves_the_threshold_auto_fixes() {
+    let (tape, root) = shapes::linreg(3_000);
+    let weighted = tape.len();
+    assert!(weighted > RE_ROLL_ABOVE, "{weighted} nodes is below the default");
+
+    // Auto re-rolls this; a threshold past it leaves the same tape straight-line.
+    let auto = compile_tape(&tape, 3, root, Reroll::Auto).unwrap();
+    let high = compile_tape(&tape, 3, root, Reroll::Above(weighted + 1)).unwrap();
+    let never = compile_tape(&tape, 3, root, Reroll::Never).unwrap();
+    assert!(auto.wasm.len() < never.wasm.len(), "Auto did not re-roll");
+    assert_eq!(high.wasm, never.wasm, "a threshold past the tape should not loop");
+
+    // And the default is that threshold by another name.
+    let same = compile_tape(&tape, 3, root, Reroll::Above(RE_ROLL_ABOVE)).unwrap();
+    assert_eq!(auto.wasm, same.wasm, "Auto is Above(RE_ROLL_ABOVE)");
+}
+
+/// Moving the threshold changes which code runs, never what it computes.
+/// Small enough that the straight-line side still fits what wasmi will take.
+#[test]
+fn a_moved_threshold_gives_the_same_gradient() {
+    let (mut tape, root) = shapes::linreg(400);
+    let p = [0.4, 1.1, 0.3];
+    for mode in [Reroll::Above(0), Reroll::Above(usize::MAX)] {
+        agrees(&mut tape, root, &p, mode, 1e-12);
+    }
 }
 
 /// `Always` and `Never` on one tape is the only place the loop and
