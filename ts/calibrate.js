@@ -17,10 +17,14 @@ import { compileTape } from "./pkg/tapewasm.js";
 /// What `"auto"` uses. Right for SpiderMonkey and JavaScriptCore.
 export const RE_ROLL_ABOVE = 2_000;
 
-/// For an engine that prefers straight-line. Measured across twelve models,
-/// V8's crossover sits between 10,104 and 60,721 nodes; anything in there is
-/// optimal on that set, and the middle is the least committed to its edges.
-export const V8_RE_ROLL_ABOVE = 30_000;
+/// For an engine that prefers straight-line, as V8 does.
+///
+/// Bracketed by measurement rather than picked: on eleven posteriordb models,
+/// straight-line still wins at 8,026 nodes and has lost by 24,564. A threshold
+/// of 24,000 already costs `low_dim_gauss_mix` 1.21x, so this sits clear of
+/// that edge. At 20,000 the five models whose shape changes get 2.54x in the
+/// geometric mean and none is slower.
+export const V8_RE_ROLL_ABOVE = 20_000;
 
 /// Where the two engine families disagree most clearly. At this size V8 prefers
 /// straight-line on every model measured, and the other two prefer loops on all
