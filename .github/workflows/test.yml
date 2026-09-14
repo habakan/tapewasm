@@ -111,6 +111,9 @@ jobs:
         with:
           node-version: "22"
       - run: make wasm
+      # The JS facade: a binding can ship in the wasm and be unreachable
+      # through the package with every Rust test still green.
+      - run: make smoke
       - run: npm ci
         working-directory: browser-tests
       - run: npx playwright install --with-deps chromium firefox webkit

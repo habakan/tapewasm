@@ -80,6 +80,13 @@ $(SAMPLER_OUT): $(WASM_SRC)
 	  "$$(wc -c < $(SAMPLER_OUT) | tr -d ' ')" \
 	  "$$(gzip -c $(SAMPLER_OUT) | wc -c | tr -d ' ')"
 
+.PHONY: smoke
+smoke: wasm ## Exercise the JS facade in Node
+# `check` is Rust only, so nothing there loads `ts/`. A binding can ship in the
+# wasm and be unreachable through the package, or a facade helper can break,
+# with every Rust test still green.
+	node ts/tests/calibrate.mjs
+
 .PHONY: browser-test
 browser-test: wasm ## Run a compiled module in Chromium, Firefox and WebKit
 	cd browser-tests && npm test
