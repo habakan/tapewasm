@@ -7,15 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Releases are staged by CI.** Pushing a `v*` tag now runs `npm stage publish`
-  from the tagged tree; the version still goes public only when the maintainer
-  approves it with 2FA. The job authenticates through npm trusted publishing
-  rather than a stored token, so published tarballs carry provenance.
-
-## [0.3.2] — 2026-09-14
-
 ### Added
 
 - **`calibrateReroll()`** — measures which shape this engine prefers and returns
@@ -65,8 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RE_ROLL_ABOVE` is now public, so `Above(RE_ROLL_ABOVE)` names what `Auto`
   does.
 
-## [0.3.1] — 2026-09-13
-
 ### Changed
 
 - **A re-rolled loop keeps what the host computed, rather than making it
@@ -99,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already did this, and a front end that lowered `sqrt` as `pow(x, 0.5)` only
   to inherit the guard was paying a host `pow` call in each direction: 398 of
   them per gradient on posteriordb's `garch11`, which is 200 time steps.
+
+- **Releases are staged by CI.** Pushing a `v*` tag now runs `npm stage publish`
+  from the tagged tree; the version still goes public only when the maintainer
+  approves it with 2FA. The job authenticates through npm trusted publishing
+  rather than a stored token, so published tarballs carry provenance.
 
 ## [0.3.0] — 2026-09-12 (npm only)
 

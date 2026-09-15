@@ -1,6 +1,6 @@
 {
   "name": "tapewasm",
-  "version": "0.3.2",
+  "version": "0.3.1",
   "description": "Compile an autodiff tape to a WebAssembly module and sample it with nuts-rs, in the browser.",
   "type": "module",
   "main": "./index.js",
