@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to inherit the guard was paying a host `pow` call in each direction: 398 of
   them per gradient on posteriordb's `garch11`, which is 200 time steps.
 
+- **Releases are staged by CI.** Pushing a `v*` tag now runs `npm stage publish`
+  from the tagged tree; the version still goes public only when the maintainer
+  approves it with 2FA. The job authenticates through npm trusted publishing
+  rather than a stored token, so published tarballs carry provenance.
+
 ## [0.3.0] — 2026-09-12 (npm only)
 
 crates.io still waits on a nuts-rs release that carries
