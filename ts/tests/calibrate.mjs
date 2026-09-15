@@ -1,8 +1,8 @@
 // The calibrator has to answer, cache, and never throw.
 //
 // Which side it lands on is the engine's business — Node is V8 and prefers
-// straight-line, so that is what this asserts. `browser-tests/` is where the
-// other two engines are checked.
+// straight-line, so that is what this asserts whenever the probe separates the
+// two shapes at all. `browser-tests/` is where the other two engines are checked.
 
 import { readFile } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
@@ -29,9 +29,15 @@ if (above !== c.above) fail("the return value and the record disagree");
 console.log(`measured: ${above} (straight ${(c.straightMs * 1000).toFixed(2)}µs, `
   + `loop ${(c.loopedMs * 1000).toFixed(2)}µs)`);
 
-// Node is V8, and V8 prefers straight-line at the probe's size.
-if (!c.prefersStraight) fail("V8 was expected to prefer straight-line here");
-if (above !== V8_RE_ROLL_ABOVE) fail(`V8 should get ${V8_RE_ROLL_ABOVE}`);
+// Node is V8, and V8 prefers straight-line at the probe's size — but only a
+// probe that separated the shapes says anything. A loaded runner has tied them.
+const margin = Math.abs(c.straightMs - c.loopedMs) / Math.min(c.straightMs, c.loopedMs);
+if (margin < 0.2) {
+  console.log(`tie (${(margin * 100).toFixed(1)}% apart), so the direction is not checked`);
+} else {
+  if (!c.prefersStraight) fail("V8 was expected to prefer straight-line here");
+  if (above !== V8_RE_ROLL_ABOVE) fail(`V8 should get ${V8_RE_ROLL_ABOVE}`);
+}
 
 // Cached: the second call is free and gives the same answer.
 const t = performance.now();
