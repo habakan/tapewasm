@@ -81,8 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module grows by 0-2%. Models with no host call inside a loop are unchanged,
   byte for byte.
 
-### Changed
-
 - **A root of zero contributes nothing to the gradient** rather than an
   infinity, in the tape's reverse pass and in both emitters. `pow` and `abs`
   already did this, and a front end that lowered `sqrt` as `pow(x, 0.5)` only
