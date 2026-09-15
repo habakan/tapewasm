@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.2] — 2026-09-14
-
 ### Added
 
 - **`calibrateReroll()`** — measures which shape this engine prefers and returns
@@ -57,8 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `RE_ROLL_ABOVE` is now public, so `Above(RE_ROLL_ABOVE)` names what `Auto`
   does.
-
-## [0.3.1] — 2026-09-13
 
 ### Changed
 
