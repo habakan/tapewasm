@@ -343,14 +343,20 @@ fn auto_weighs_a_contraction_by_its_run() {
 fn above_moves_the_threshold_auto_fixes() {
     let (tape, root) = shapes::linreg(3_000);
     let weighted = tape.len();
-    assert!(weighted > RE_ROLL_ABOVE, "{weighted} nodes is below the default");
+    assert!(
+        weighted > RE_ROLL_ABOVE,
+        "{weighted} nodes is below the default"
+    );
 
     // Auto re-rolls this; a threshold past it leaves the same tape straight-line.
     let auto = compile_tape(&tape, 3, root, Reroll::Auto).unwrap();
     let high = compile_tape(&tape, 3, root, Reroll::Above(weighted + 1)).unwrap();
     let never = compile_tape(&tape, 3, root, Reroll::Never).unwrap();
     assert!(auto.wasm.len() < never.wasm.len(), "Auto did not re-roll");
-    assert_eq!(high.wasm, never.wasm, "a threshold past the tape should not loop");
+    assert_eq!(
+        high.wasm, never.wasm,
+        "a threshold past the tape should not loop"
+    );
 
     // And the default is that threshold by another name.
     let same = compile_tape(&tape, 3, root, Reroll::Above(RE_ROLL_ABOVE)).unwrap();
