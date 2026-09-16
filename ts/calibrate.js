@@ -125,3 +125,17 @@ export async function calibrateReroll({ force = false, rounds = 7 } = {}) {
 export function lastCalibration() {
   return cached;
 }
+
+/**
+ * `compileTape` at the threshold this engine prefers, measured once.
+ *
+ * The plain `compileTape` is synchronous and cannot wait for a measurement, so
+ * its `"auto"` is the built-in 2,000 — right for SpiderMonkey and
+ * JavaScriptCore, and low for V8. On posteriordb's 23 models in Node, that
+ * default loses on thirteen of them, by up to 12x. This is the same call with
+ * the measured number, and the measurement happens once per process.
+ */
+export async function compileTapeCalibrated(text, opts) {
+  const above = await calibrateReroll(opts);
+  return compileTape(text, String(above));
+}
