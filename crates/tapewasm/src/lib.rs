@@ -885,9 +885,9 @@ impl CompiledTape {
 /// or a node count to re-roll past, written as a number.
 ///
 /// **Which is faster is an engine's preference, not the model's.** Measured
-/// across three engines, straight-line and re-rolled cross over around 60,000
-/// nodes in V8 and around 2,000 in SpiderMonkey and JavaScriptCore — thirty
-/// times apart, so no single threshold serves all three. `"auto"` takes the
+/// across three engines, straight-line and re-rolled cross over between 8,026
+/// and 24,564 nodes in V8 and around 2,000 in SpiderMonkey and JavaScriptCore
+/// — an order of magnitude apart, so no single threshold serves all three. `"auto"` takes the
 /// lower one: near-optimal for two of the three, and up to 7.6x off on V8 for
 /// a trace between them. A caller that knows its engine passes the number.
 ///
