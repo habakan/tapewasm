@@ -61,34 +61,34 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-Nothing is published by this. A tag that fails `guard` or `verify` can be
-deleted with `git push --delete origin vX.Y.Z`. The registries are steps 4 and
-5, and those are what cannot be taken back.
+Nothing becomes public from this. A tag that fails `guard` or `verify` can be
+deleted with `git push --delete origin vX.Y.Z`, and nothing is staged, because
+`stage-npm` waits on both. Once they pass, the tag does spend the npm version
+number — `npm stage reject` is what frees it again.
 
 Check that `release.yml` is enabled before tagging (`gh workflow list --all`).
 A disabled workflow does not fail on its trigger — the tag lands and nothing
 runs at all.
 
-## 4. Stage on npm, then approve
+## 4. Approve what CI staged
 
-Staged, not published directly: `npm stage publish` needs no 2FA, so whoever
-builds the release (an agent included) can stage it, and nothing is public
-until the maintainer approves with 2FA. Needs npm 11.15 or later.
+Pushing the tag stages the release: `release.yml`'s `stage-npm` job builds the
+bundle from the tagged tree and runs `npm stage publish`. Staging needs no 2FA,
+which is why it can run unattended — and nothing is public until the maintainer
+approves with 2FA. Needs npm 11.15 or later, which is why the job installs its
+own npm rather than using the one Node ships.
 
-From a checkout of the tag, with nothing uncommitted — `make wasm` bakes the
-working tree into the bundle, so a stray edit ships as the release:
+The job holds no stored token. It exchanges GitHub's OIDC identity for a
+short-lived npm one, so npm has to know which workflow is allowed to speak for
+the package: on npmjs.com, **Settings → Trusted publisher → GitHub Actions**,
+with this repository and the workflow file `release.yml`. Without that the job
+fails with `ENEEDAUTH`, having published nothing.
 
-```bash
-git status --short          # must be clean
-git rev-parse HEAD          # must be the tagged commit
-make wasm
-cd ts && npm stage publish --access public
-```
+Building in CI also gets the release something a laptop cannot produce: npm
+enables provenance automatically over a trusted-publisher token, so the tarball
+carries an attestation tying it to this commit and this workflow run.
 
-No `--provenance`: a tarball published from a laptop cannot carry an
-attestation, and passing the flag fails rather than being ignored.
-
-Then the maintainer checks what was staged and approves it:
+Then check what was staged and approve it:
 
 ```bash
 npm stage list tapewasm
@@ -100,6 +100,20 @@ npm stage approve <stage-id>    # 2FA; `npm stage reject <stage-id>` drops it in
 publish of a version that is staged. Approval waits on the registry's malware
 scan, and the version shows up a few minutes after; confirm with
 `npm view tapewasm version --prefer-online`.
+
+To stage by hand instead — the job is broken, or the tag is already spent — the
+steps it replaced still work from a clean checkout of the tag, where `make wasm`
+bakes the working tree into the bundle:
+
+```bash
+git status --short          # must be clean
+git rev-parse HEAD          # must be the tagged commit
+make wasm
+cd ts && npm stage publish --access public
+```
+
+Pass no `--provenance` there: a tarball staged from a laptop cannot carry an
+attestation, and the flag fails rather than being ignored.
 
 ## 5. Publish to crates.io
 

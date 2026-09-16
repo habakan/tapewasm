@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`calibrateReroll()`** — measures which shape this engine prefers and returns
+  a threshold to hand `compileTape`. It compiles one probe tape both ways,
+  instantiates each and times them interleaved, then answers 20,000 for an
+  engine that prefers straight-line and the built-in 2,000 for one that prefers
+  loops. Cached after the first call, because it is a property of the engine
+  rather than of the model, and it never throws — a failed measurement returns
+  the built-in threshold.
+
+  Measured through the three engines `browser-tests` uses:
+
+  | engine | threshold | straight-line | re-rolled |
+  | --- | --- | --- | --- |
+  | Chromium 1243 | 20,000 | 0.87 µs | 2.60 µs |
+  | Firefox 1543 | 2,000 | 8.81 µs | 2.80 µs |
+  | WebKit 2359 | 2,000 | 16.30 µs | 1.68 µs |
+
+  About 130 ms, once. The probe tape is arithmetic only, so the module it
+  compiles to imports nothing but memory and a caller needs to supply no maths.
+
+  The 20,000 is bracketed rather than picked: on eleven posteriordb models
+  straight-line still wins at 8,026 nodes and has lost by 24,564, and a
+  threshold of 24,000 already costs `low_dim_gauss_mix` 1.21x. At 20,000 the
+  five models whose shape changes get 2.54x in the geometric mean and none is
+  slower.
+
+  **What it cannot do.** A node count settles V8. It does not settle the other two, where the
+  two sides overlap: `dogs` at 2,734 nodes prefers straight-line on Firefox
+  while `arma11` at 2,341 prefers loops. The overlap is narrow — the loss
+  against picking per-model is 1.02x and 1.15x in the geometric mean — and
+  closing it needs a per-model measurement, not a better threshold.
+
+- **`Reroll::Above(n)`, and a node count where `compileTape` takes a mode** —
+  re-roll past `n` nodes instead of the built-in threshold.
+
+  For a caller that knows which engine will run the module. **No single value
+  serves every engine**: measured across Chromium, Firefox and WebKit,
+  straight-line and re-rolled cross over around 60,000 nodes in V8 and around
+  2,000 in SpiderMonkey and JavaScriptCore — thirty times apart. `"auto"` takes
+  the lower one, which is near-optimal for two of the three (the loss against
+  picking per-model is 1.02x and 1.15x in the geometric mean) and costs V8 up
+  to 7.6x on a trace between them (1.85x in the mean). Raising the constant
+  would only move the loss onto the other two, so the threshold became a value
+  rather than a better number.
+
+  `RE_ROLL_ABOVE` is now public, so `Above(RE_ROLL_ABOVE)` names what `Auto`
+  does.
+
+### Changed
+
+- **A re-rolled loop keeps what the host computed, rather than making it
+  twice.** The backward pass recomputes a block's iteration to get its locals
+  back, and that was calling out to `exp`, `log`, `lgamma` and the rest a
+  second time. Those results now live in the scratch slot the tape already
+  reserved for them, so the backward pass reads instead of calls. Arithmetic
+  stays recomputed — it is cheaper than the memory traffic, which is why it
+  went into locals to begin with.
+
+  Host calls per gradient halve, and so does the time they were buying
+  (wasmtime, both builds interleaved in one process, Apple M3):
+
+  | model | host calls | ns per gradient |
+  | --- | --- | --- |
+  | `wells_dist100ars_model` | 12,080 → 6,040 | 156,979 → 103,597 |
+  | `low_dim_gauss_mix` | 6,004 → 3,010 | 75,568 → 49,551 |
+  | `lsat_model` | 20,001 → 10,001 | 215,697 → 162,445 |
+  | `garch11` | 405 → 207 | 13,135 → 9,872 |
+  | `dogs` | 482 → 342 | 8,757 → 7,602 |
+
+  Scratch does not grow — the slot was already reserved — and the emitted
+  module grows by 0-2%. Models with no host call inside a loop are unchanged,
+  byte for byte.
+
+- **A root of zero contributes nothing to the gradient** rather than an
+  infinity, in the tape's reverse pass and in both emitters. `pow` and `abs`
+  already did this, and a front end that lowered `sqrt` as `pow(x, 0.5)` only
+  to inherit the guard was paying a host `pow` call in each direction: 398 of
+  them per gradient on posteriordb's `garch11`, which is 200 time steps.
+
+- **Releases are staged by CI.** Pushing a `v*` tag now runs `npm stage publish`
+  from the tagged tree; the version still goes public only when the maintainer
+  approves it with 2FA. The job authenticates through npm trusted publishing
+  rather than a stored token, so published tarballs carry provenance.
+
 ### Fixed
 
 - **The rejected-starting-point message no longer names a function that is not
