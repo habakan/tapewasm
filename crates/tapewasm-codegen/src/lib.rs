@@ -103,8 +103,8 @@ pub enum Reroll {
     ///
     /// For a caller that knows which engine will run the module. **No single
     /// value serves every engine**: measured across three, straight-line and
-    /// re-rolled cross over around 60,000 nodes in V8 and around 2,000 in
-    /// SpiderMonkey and JavaScriptCore — thirty times apart. [`Auto`] takes the
+    /// re-rolled cross over between 8,026 and 24,564 nodes in V8 and around
+    /// 2,000 in SpiderMonkey and JavaScriptCore — an order of magnitude apart. [`Auto`] takes the
     /// lower one, which is near-optimal for two of the three and costs V8 up to
     /// 7.6x on a trace between them.
     ///
@@ -115,8 +115,8 @@ pub enum Reroll {
 /// Size past which [`Reroll::Auto`] re-rolls, as [`weighted_len`] counts it.
 ///
 /// Tuned for the engines that cross over earliest. A V8-only caller wants
-/// [`Reroll::Above`] with something nearer 60,000; see its documentation for
-/// why one number cannot serve all three.
+/// [`Reroll::Above`] with 20,000, the value `calibrateReroll` returns for V8;
+/// see its documentation for why one number cannot serve all three.
 pub const RE_ROLL_ABOVE: usize = 2_000;
 
 /// A tape's size as straight-line code sees it: a contraction or reduction is

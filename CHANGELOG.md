@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   For a caller that knows which engine will run the module. **No single value
   serves every engine**: measured across Chromium, Firefox and WebKit,
-  straight-line and re-rolled cross over around 60,000 nodes in V8 and around
+  straight-line and re-rolled cross over between 8,026 and 24,564 nodes in V8
+  and around
   2,000 in SpiderMonkey and JavaScriptCore — thirty times apart. `"auto"` takes
   the lower one, which is near-optimal for two of the three (the loss against
   picking per-model is 1.02x and 1.15x in the geometric mean) and costs V8 up

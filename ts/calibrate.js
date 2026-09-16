@@ -1,8 +1,8 @@
 // Which shape this engine prefers, measured once.
 //
 // `compileTape`'s `"auto"` threshold cannot be right for every engine:
-// straight-line and re-rolled cross over around 60,000 nodes in V8 and around
-// 2,000 in SpiderMonkey and JavaScriptCore. The built-in value serves the
+// straight-line and re-rolled cross over between 8,026 and 24,564 nodes in V8
+// and around 2,000 in SpiderMonkey and JavaScriptCore. The built-in value serves the
 // latter two and costs V8 up to 7.6x on a trace between them. This measures
 // which side the engine is on and returns a threshold to pass to `compileTape`.
 //
