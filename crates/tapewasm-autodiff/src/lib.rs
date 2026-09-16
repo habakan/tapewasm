@@ -531,8 +531,13 @@ impl Tape {
                 Op::Cos => {
                     self.grad[a1] -= g * self.val[a1].sin();
                 }
+                // A zero contributes nothing: the slope is infinite there, and a front
+                // end reaching zero under a root is ordinary. Same as `Pow`.
                 Op::Sqrt => {
-                    self.grad[a1] += g / (2.0 * self.val[i]);
+                    let vk = self.val[i];
+                    if vk != 0.0 {
+                        self.grad[a1] += g / (2.0 * vk);
+                    }
                 }
                 // A zero base contributes nothing: `x^n` with `n < 1` has an infinite
                 // slope there, which one underflow would spread as NaN.

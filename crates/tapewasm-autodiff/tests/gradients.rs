@@ -60,6 +60,17 @@ fn pow_rule() {
 }
 
 #[test]
+fn sqrt_rule_is_zero_at_zero() {
+    // The slope is infinite at zero, and a front end reaching zero under a root is
+    // ordinary, so the node contributes nothing there rather than a NaN.
+    for (x, want) in [(4.0, 0.25), (0.0, 0.0)] {
+        let (v, g) = log_prob_grad(&[x], |t, xs| t.sqrt(xs[0]));
+        assert!(close(v, x.sqrt(), 1e-12), "sqrt({x})");
+        assert_eq!(g[0], want, "d sqrt/dx at {x}");
+    }
+}
+
+#[test]
 fn abs_rule_is_zero_at_the_cusp() {
     // PyTensor differentiates |x| as sign(x), so 0 at x = 0 whatever the zero's sign.
     for (x, want) in [(-2.0, -1.0), (0.0, 0.0), (-0.0, 0.0), (3.0, 1.0)] {

@@ -7,7 +7,7 @@
 //! implementation.
 
 use tapewasm_codegen::shapes;
-use tapewasm_codegen::{compile_tape, Reroll};
+use tapewasm_codegen::{compile_tape, Reroll, RE_ROLL_ABOVE};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module, Store};
 
 fn lgamma(x: f64) -> f64 {
@@ -180,6 +180,28 @@ fn abs_backward_is_zero_at_the_cusp() {
     }
 }
 
+/// √x at a zero parameter, where the slope is infinite: the node contributes
+/// nothing rather than an infinity, in both emitters and in the tape.
+#[test]
+fn sqrt_backward_is_zero_at_zero() {
+    let params = [4.0, 0.0, 2.25, 0.0, 9.0, 1.0, 0.0, 0.25];
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let xs: Vec<u32> = params.iter().map(|&p| tape.new_var(p)).collect();
+    let roots: Vec<u32> = xs.iter().map(|&x| tape.sqrt(x)).collect();
+    let root = roots[1..].iter().fold(roots[0], |acc, &a| tape.add(acc, a));
+    let want: Vec<f64> = params
+        .iter()
+        .map(|&p| if p == 0.0 { 0.0 } else { 0.5 / p.sqrt() })
+        .collect();
+    assert_eq!(tape_oracle(&mut tape, root, &params).1, want, "tape");
+    for mode in [Reroll::Never, Reroll::Always] {
+        let c = compile_tape(&tape, params.len(), root, mode).unwrap();
+        let (_, grads) =
+            run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+        assert_eq!(grads, want, "{mode:?}");
+    }
+}
+
 /// Calling twice must give the same answer: the scratch buffer is reused, so a
 /// stale adjoint or a clobbered constant table would only show on the second
 /// call.
@@ -312,6 +334,44 @@ fn auto_weighs_a_contraction_by_its_run() {
     );
     let c = compile_tape(&tape, 11, root, Reroll::Auto).unwrap();
     assert!(!c.const_table.is_empty(), "the rows stayed straight-line");
+}
+
+/// The threshold is a value, because no one value serves every engine:
+/// straight-line and re-rolled cross over around 60,000 nodes in V8 and around
+/// 2,000 in the other two. A caller that knows its engine names the number.
+#[test]
+fn above_moves_the_threshold_auto_fixes() {
+    let (tape, root) = shapes::linreg(3_000);
+    let weighted = tape.len();
+    assert!(
+        weighted > RE_ROLL_ABOVE,
+        "{weighted} nodes is below the default"
+    );
+
+    // Auto re-rolls this; a threshold past it leaves the same tape straight-line.
+    let auto = compile_tape(&tape, 3, root, Reroll::Auto).unwrap();
+    let high = compile_tape(&tape, 3, root, Reroll::Above(weighted + 1)).unwrap();
+    let never = compile_tape(&tape, 3, root, Reroll::Never).unwrap();
+    assert!(auto.wasm.len() < never.wasm.len(), "Auto did not re-roll");
+    assert_eq!(
+        high.wasm, never.wasm,
+        "a threshold past the tape should not loop"
+    );
+
+    // And the default is that threshold by another name.
+    let same = compile_tape(&tape, 3, root, Reroll::Above(RE_ROLL_ABOVE)).unwrap();
+    assert_eq!(auto.wasm, same.wasm, "Auto is Above(RE_ROLL_ABOVE)");
+}
+
+/// Moving the threshold changes which code runs, never what it computes.
+/// Small enough that the straight-line side still fits what wasmi will take.
+#[test]
+fn a_moved_threshold_gives_the_same_gradient() {
+    let (mut tape, root) = shapes::linreg(400);
+    let p = [0.4, 1.1, 0.3];
+    for mode in [Reroll::Above(0), Reroll::Above(usize::MAX)] {
+        agrees(&mut tape, root, &p, mode, 1e-12);
+    }
 }
 
 /// `Always` and `Never` on one tape is the only place the loop and
