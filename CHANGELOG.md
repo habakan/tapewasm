@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-17
+
 ### Added
 
 - **`calibrateReroll()`** — measures which shape this engine prefers and returns
@@ -258,7 +260,8 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/habakan/tapewasm/releases/tag/v0.3.1
 [0.3.0]: https://github.com/habakan/tapewasm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/habakan/tapewasm/releases/tag/v0.2.0
 [0.1.1]: https://github.com/habakan/tapewasm/releases/tag/v0.1.1
