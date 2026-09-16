@@ -91,6 +91,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the tagged tree; the version still goes public only when the maintainer
   approves it with 2FA. The job authenticates through npm trusted publishing
   rather than a stored token, so published tarballs carry provenance.
+- **ADVI exponentiates each `omega` once an iteration**, not once per Monte
+  Carlo sample and again per gradient — `n_params` calls where it took
+  `2 × mc_samples × n_params`. `omega` only moves once an iteration, so the
+  fit is the same to the bit at the same seed; the browser test's 4,000
+  iterations at 4 samples take 0.77x the time in Node, a 50-parameter model
+  0.94x.
+- **`logProbGrad` keeps its evaluator between calls.** It built one per call,
+  and building one copies the whole `scratch_init` — so a loop of calls paid
+  that copy every time, where `sample` and `advi` pay it once a run. Called in
+  a row on `linreg(200)` it takes 0.63x the time, on a 50-parameter `matvec`
+  0.86x. The same values, and the module clears what it reads, so nothing
+  carries between calls.
+- **The gradient call hands the module the sampler's own buffers.** nuts-rs'
+  `position` and `gradient` already sit in the memory the module imports, and
+  the ABI reads every parameter before it stores any gradient, so the two
+  relaying buffers and a copy each way are gone. Time is unchanged within the
+  noise on 3, 50 and 200 parameters — the copy was never the cost — but an
+  evaluator now allocates only its scratch.
 
 ### Fixed
 
