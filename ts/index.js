@@ -14,5 +14,11 @@ export {
   clearAotExports,
   sharedMemory,
 } from "./pkg/tapewasm.js";
-export { calibrateReroll, lastCalibration, RE_ROLL_ABOVE, V8_RE_ROLL_ABOVE } from "./calibrate.js";
+export {
+  calibrateReroll,
+  compileTapeCalibrated,
+  lastCalibration,
+  RE_ROLL_ABOVE,
+  V8_RE_ROLL_ABOVE,
+} from "./calibrate.js";
 export default init;

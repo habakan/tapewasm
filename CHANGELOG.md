@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`compileTapeCalibrated`** — `compileTape` at the threshold this engine
+  prefers, measured once. `compileTape` is synchronous and cannot wait for a
+  measurement, so its `"auto"` is the built-in 2,000: right for SpiderMonkey and
+  JavaScriptCore, and low for V8.
+
+  What that default costs, measured on posteriordb's 23 models in Node, one
+  subprocess each: **thirteen of them lose, by up to 12.11x** (`radon_pooled`),
+  with nine past 2x. Eleven are fastest fully expanded. Passing the measured
+  20,000 instead leaves **two** models off their best, and one of those by 1.13x.
+
+  `calibrateReroll()` has been there to produce that number and nothing called
+  it. The measurement is about 130 ms and caches, against a gradient a sampling
+  run calls tens of thousands of times.
+
 ## [0.3.1] — 2026-09-17
 
 ### Added

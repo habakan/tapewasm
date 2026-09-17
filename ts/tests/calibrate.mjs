@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import init, {
-  calibrateReroll, lastCalibration, compileTape,
+  calibrateReroll, compileTapeCalibrated, lastCalibration, compileTape,
   RE_ROLL_ABOVE, V8_RE_ROLL_ABOVE,
 } from "../index.js";
 
@@ -51,4 +51,15 @@ const tape = "n_params 2\nnew_var 0.5\nnew_var 0.5\nmul 0 1\nadd 2 0\nroot 3\n";
 if (compileTape(tape, String(above)).wasm.length === 0) fail("the threshold was refused");
 
 console.log(`cached call ${ms.toFixed(3)}ms`);
+
+// `compileTapeCalibrated` is the same compile at the measured threshold, and it
+// pays for the measurement once.
+const t2 = performance.now();
+const built = await compileTapeCalibrated(tape);
+if (performance.now() - t2 > 5) fail("a calibrated compile measured again");
+if (built.wasm.length === 0) fail("the calibrated compile produced no module");
+if (built.wasm.length !== compileTape(tape, String(above)).wasm.length) {
+  fail("the calibrated compile did not use the measured threshold");
+}
+
 console.log("OK");
