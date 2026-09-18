@@ -37,7 +37,11 @@ async function run() {
   for (let i = 0; i < meta.draws; i++) {
     for (let k = 0; k < n; k++) mean[k] += post[i * n + k] / meta.draws;
   }
-  return { ok: true, mean, ms, moduleBytes: bytes.byteLength };
+  // The pointwise log-likelihood the module reports, which is the other half of
+  // what a page hands ArviZ.
+  const pointwise = Array.from(sampler.evaluate(new Float64Array(meta.init)));
+
+  return { ok: true, mean, ms, moduleBytes: bytes.byteLength, pointwise };
 }
 
 run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; })

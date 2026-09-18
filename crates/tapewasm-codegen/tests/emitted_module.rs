@@ -7,7 +7,7 @@
 //! implementation.
 
 use tapewasm_codegen::shapes;
-use tapewasm_codegen::{compile_tape, Reroll, RE_ROLL_ABOVE};
+use tapewasm_codegen::{compile_tape, compile_tape_with_outputs, Reroll, RE_ROLL_ABOVE};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module, Store};
 
 fn lgamma(x: f64) -> f64 {
@@ -57,6 +57,29 @@ fn run_aot_log_prob_grad(
     scratch_len: usize,
     const_table: &[f64],
 ) -> (f64, Vec<f64>) {
+    run_export(
+        wasm,
+        "log_prob_grad",
+        n_params,
+        params,
+        n_params,
+        scratch_len,
+        const_table,
+    )
+}
+
+/// `log_prob_grad` or `evaluate`: the two take the same arguments and differ in
+/// what they write at the second one — `n_params` gradients, or `out_len`
+/// values.
+fn run_export(
+    wasm: &[u8],
+    name: &str,
+    n_params: usize,
+    params: &[f64],
+    out_len: usize,
+    scratch_len: usize,
+    const_table: &[f64],
+) -> (f64, Vec<f64>) {
     // The emitter widens a re-rolled loop to `f64x2` where it can, which wasmi
     // parses only with the proposal enabled.
     let mut config = wasmi::Config::default();
@@ -67,7 +90,9 @@ fn run_aot_log_prob_grad(
 
     // Host-allocated memory shared with the AOT module: params, grads, then the
     // module's primal/adjoint scratch.
-    let pages = ((n_params * 2 + scratch_len) * 8).div_ceil(65536).max(1) as u32;
+    let pages = ((n_params + out_len + scratch_len) * 8)
+        .div_ceil(65536)
+        .max(1) as u32;
     let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -79,13 +104,13 @@ fn run_aot_log_prob_grad(
         .expect("instantiate");
 
     let lpg = instance
-        .get_typed_func::<(i32, i32, i32, i32), f64>(&store, "log_prob_grad")
+        .get_typed_func::<(i32, i32, i32, i32), f64>(&store, name)
         .unwrap();
 
-    // Layout: params at offset 0, grads at offset n_params*8.
+    // Layout: params at offset 0, then the output buffer, then scratch.
     let params_ptr: i32 = 0;
     let grads_ptr: i32 = (n_params * 8) as i32;
-    let scratch_ptr: i32 = (n_params * 16) as i32;
+    let scratch_ptr: i32 = ((n_params + out_len) * 8) as i32;
     let bytes: Vec<u8> = params.iter().flat_map(|p| p.to_le_bytes()).collect();
     memory
         .write(&mut store, params_ptr as usize, &bytes)
@@ -104,7 +129,7 @@ fn run_aot_log_prob_grad(
         )
         .unwrap();
 
-    let mut grad_bytes = vec![0u8; n_params * 8];
+    let mut grad_bytes = vec![0u8; out_len * 8];
     memory
         .read(&store, grads_ptr as usize, &mut grad_bytes)
         .unwrap();
@@ -567,5 +592,148 @@ root 54
         for (i, (a, w)) in grads.iter().zip(want_grads.iter()).enumerate() {
             assert!(close(*a, *w, 1e-12), "{mode:?}: grad[{i}] {a} vs {w}");
         }
+    }
+}
+
+/// What `evaluate` writes, against the tape's own forward replay. The nodes are
+/// spread across the tape so at least one lands inside a re-rolled block, where
+/// the loop would otherwise keep it in a local and never store it.
+fn evaluates(
+    tape: &mut tapewasm_autodiff::Tape,
+    root: u32,
+    params: &[f64],
+    mode: Reroll,
+    outputs: &[u32],
+) {
+    let outputs: Vec<u32> = outputs.to_vec();
+    let c = compile_tape_with_outputs(tape, params.len(), root, &outputs, mode).unwrap();
+    assert_eq!(c.n_outputs, outputs.len());
+    let (lp, got) = run_export(
+        &c.wasm,
+        "evaluate",
+        c.n_params,
+        params,
+        outputs.len(),
+        c.scratch_len,
+        &c.const_table,
+    );
+    tape.forward_replay(params);
+    assert!(close(lp, tape.value(root), 1e-12), "{mode:?}: lp {lp}");
+    for (k, a) in outputs.iter().zip(&got) {
+        let want = tape.value(*k);
+        assert!(close(*a, want, 1e-12), "{mode:?}: node {k} {a} vs {want}");
+    }
+}
+
+#[test]
+fn evaluate_reports_the_named_nodes() {
+    let (mut tape, root) = shapes::linreg(20);
+    let n = tape.len() as u32;
+    let spread: Vec<u32> = [1, n / 3, n / 2, n - 2, root].into_iter().collect();
+    for mode in [Reroll::Never, Reroll::Always, Reroll::Auto] {
+        evaluates(&mut tape, root, &[0.4, 1.1, -0.3], mode, &spread);
+    }
+}
+
+/// A run of consecutive nodes from the middle of a re-rolled trace, which is
+/// where the values a loop would otherwise keep in locals are.
+#[test]
+fn evaluate_reports_a_node_a_loop_holds() {
+    let (mut tape, root) = shapes::linreg(2000);
+    let c = compile_tape(&tape, 3, root, Reroll::Auto).unwrap();
+    assert!(!c.const_table.is_empty(), "expected a re-rolled loop");
+    let n = tape.len() as u32;
+    let run: Vec<u32> = (n / 2..n / 2 + 40).collect();
+    evaluates(&mut tape, root, &[0.4, 1.1, 0.3], Reroll::Auto, &run);
+}
+
+/// Naming a node moves nothing on the density's own path: the two functions are
+/// emitted from the same plan, and `evaluate` is appended after it.
+#[test]
+fn naming_no_output_compiles_what_compile_tape_does() {
+    let (tape, root) = shapes::linreg(2000);
+    let plain = compile_tape(&tape, 3, root, Reroll::Auto).unwrap();
+    let with = compile_tape_with_outputs(&tape, 3, root, &[], Reroll::Auto).unwrap();
+    assert_eq!(plain.wasm, with.wasm);
+    assert_eq!(plain.layout_id, with.layout_id);
+}
+
+/// The gradient is the same whether or not the module also reports values.
+#[test]
+fn naming_an_output_leaves_the_gradient_alone() {
+    let (tape, root) = shapes::linreg(2000);
+    let params = [0.4, 1.1, 0.3];
+    let plain = compile_tape(&tape, 3, root, Reroll::Auto).unwrap();
+    let (want_lp, want_grads) = run_aot_log_prob_grad(
+        &plain.wasm,
+        plain.n_params,
+        &params,
+        plain.scratch_len,
+        &plain.const_table,
+    );
+    let c = compile_tape_with_outputs(&tape, 3, root, &[7, 500, root], Reroll::Auto).unwrap();
+    let (lp, grads) =
+        run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+    assert_eq!(lp, want_lp);
+    assert_eq!(grads, want_grads);
+}
+
+#[test]
+fn an_output_past_the_tape_is_refused() {
+    let (tape, root) = shapes::linreg(20);
+    let n = tape.len() as u32;
+    let err = compile_tape_with_outputs(&tape, 3, root, &[n], Reroll::Auto).unwrap_err();
+    assert!(format!("{err}").contains("past the tape"), "{err}");
+}
+
+/// One term per observation, which is what a pointwise log-likelihood is: the
+/// terms are one position of a re-rolled block, so they land evenly spaced in
+/// scratch and a loop writes them. A store each would undo the re-rolling —
+/// measured at 2,000 terms, 1,280 bytes of module become 34,266.
+#[test]
+fn evaluate_writes_an_evenly_spaced_run_in_a_loop() {
+    let n_obs = 2000;
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let mu = tape.new_var(0.3);
+    let log_sigma = tape.new_var(0.1);
+    let sigma = tape.exp(log_sigma);
+    let inv = tape.rdiv_c(sigma, 1.0);
+    let m2 = tape.mul(mu, mu);
+    let mut acc = tape.mul_c(m2, -0.005);
+    let mut terms = Vec::with_capacity(n_obs);
+    for i in 0..n_obs {
+        let y = i as f64 * 0.01 - 5.0;
+        let r = tape.rsub_c(mu, y);
+        let z = tape.mul(r, inv);
+        let zz = tape.mul(z, z);
+        let half = tape.mul_c(zz, -0.5);
+        let term = tape.sub(half, log_sigma);
+        terms.push(term);
+        acc = tape.add(acc, term);
+    }
+
+    let bare = compile_tape(&tape, 2, acc, Reroll::Always).unwrap();
+    let c = compile_tape_with_outputs(&tape, 2, acc, &terms, Reroll::Always).unwrap();
+    assert!(
+        c.wasm.len() < 2 * bare.wasm.len(),
+        "{} bytes against {} without the outputs — the run was not looped",
+        c.wasm.len(),
+        bare.wasm.len()
+    );
+
+    let params = [0.42, -0.2];
+    let (_, got) = run_export(
+        &c.wasm,
+        "evaluate",
+        2,
+        &params,
+        terms.len(),
+        c.scratch_len,
+        &c.const_table,
+    );
+    tape.forward_replay(&params);
+    for (k, a) in terms.iter().zip(&got) {
+        let want = tape.value(*k);
+        assert!(close(*a, want, 1e-12), "node {k}: {a} vs {want}");
     }
 }

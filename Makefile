@@ -86,6 +86,7 @@ smoke: wasm ## Exercise the JS facade in Node
 # wasm and be unreachable through the package, or a facade helper can break,
 # with every Rust test still green.
 	node ts/tests/calibrate.mjs
+	node ts/tests/evaluate.mjs
 
 .PHONY: browser-test
 browser-test: wasm ## Run a compiled module in Chromium, Firefox and WebKit

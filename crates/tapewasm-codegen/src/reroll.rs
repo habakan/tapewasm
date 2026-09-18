@@ -437,7 +437,7 @@ mod tests {
     fn most_of_a_density_block_is_iteration_local() {
         let (tape, root) = linreg_tape(64);
         let blocks = detect(&tape);
-        let flags = local_positions(&tape, &blocks, root);
+        let flags = local_positions(&tape, &blocks, &[root]);
         let biggest = blocks
             .iter()
             .enumerate()
@@ -457,7 +457,7 @@ mod tests {
     fn gather_targets_are_not_local() {
         let (tape, root) = gather_tape(200);
         let blocks = detect(&tape);
-        let flags = local_positions(&tape, &blocks, root);
+        let flags = local_positions(&tape, &blocks, &[root]);
         for (bi, b) in blocks.iter().enumerate() {
             for j in 0..b.len as usize {
                 if let ArgRel::Tabled(ix) = &b.args[j].arg1 {
@@ -515,7 +515,7 @@ mod tests {
             carried(&tape, found.start, found.len) < carried(&tape, found.start - 1, found.len),
             "the rotation did not reduce what straddles the boundary"
         );
-        let flags = local_positions(&tape, &blocks, acc);
+        let flags = local_positions(&tape, &blocks, &[acc]);
         assert_eq!(flags[0], vec![true, false], "the product should stay local");
     }
 
@@ -544,7 +544,7 @@ mod tests {
             "only {inside}/{total} reductions are in a block"
         );
         // Its products are read in their own iteration, so only the accumulator needs an address.
-        let flags = local_positions(&tape, &blocks, acc);
+        let flags = local_positions(&tape, &blocks, &[acc]);
         let (bi, b) = blocks
             .iter()
             .enumerate()
@@ -583,7 +583,7 @@ mod tests {
 /// Everything else — an accumulator carrying across iterations, a vector some
 /// later statement reads back, whatever a gather points at — has to stay
 /// addressable, and a local is not.
-pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool>> {
+pub fn local_positions(tape: &Tape, blocks: &[Block], kept: &[u32]) -> Vec<Vec<bool>> {
     let n = tape.len() as u32;
     let mut out: Vec<Vec<bool>> = blocks.iter().map(|b| vec![true; b.len as usize]).collect();
 
@@ -670,8 +670,11 @@ pub fn local_positions(tape: &Tape, blocks: &[Block], root: u32) -> Vec<Vec<bool
         }
     }
 
-    // The log density is read after the loops have run.
-    demote(root, &mut out);
+    // The log density, and anything `evaluate` reports, are read after the
+    // loops have run.
+    for &k in kept {
+        demote(k, &mut out);
+    }
     out
 }
 
