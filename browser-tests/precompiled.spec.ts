@@ -32,4 +32,13 @@ test("a module compiled ahead of time samples in this engine", async ({ page }) 
     expect(gap, `${meta.paramNames[k]}: ${result.mean[k]} vs ${expected.mean[k]}`)
       .toBeLessThan(0.3);
   }
+
+  // `evaluate` at one point, on the other hand, is one forward pass with no
+  // sampling in between, so every engine has to agree to near the last ulp.
+  expect(result.pointwise).toHaveLength(meta.nOutputs);
+  for (let i = 0; i < expected.pointwise.length; i++) {
+    const want = expected.pointwise[i];
+    expect(Math.abs(result.pointwise[i] - want) / Math.max(Math.abs(want), 1), `term ${i}`)
+      .toBeLessThan(1e-12);
+  }
 });

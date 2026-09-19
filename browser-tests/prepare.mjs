@@ -37,6 +37,8 @@ const y = Array.from({ length: N }, (_, i) => -1.4 + i * 0.18 + noise());
 
 // y ~ normal(alpha + beta * x, sigma), sampled in log sigma: normal(0,10) on
 // the coefficients, exponential(1) on sigma, and the Jacobian of the transform.
+// Each observation's own log-likelihood term is a node, named by `outputs`, so
+// the module reports the pointwise log-likelihood ArviZ asks for.
 const lines = [];
 let next = 0;
 const op = (text) => (lines.push(text), next++);
@@ -50,14 +52,19 @@ const invSigma = op(`rdiv_c ${sigma} 1.0`);
 const a2 = op(`mul ${alpha} ${alpha}`);
 const b2 = op(`mul ${beta} ${beta}`);
 const coefPrior = op(`mul_c ${op(`add ${a2} ${b2}`)} -0.005`);
+const HALF_LOG_2PI = 0.5 * Math.log(2 * Math.PI);
 let acc = op(`sub ${coefPrior} ${sigma}`);
-acc = op(`add ${acc} ${op(`mul_c ${logSigma} ${1 - N}`)}`);
+acc = op(`add ${acc} ${logSigma}`);
+const terms = [];
 for (let i = 0; i < N; i++) {
   const mu = op(`add ${alpha} ${op(`mul_c ${beta} ${x[i]}`)}`);
   const z = op(`mul ${op(`rsub_c ${mu} ${y[i]}`)} ${invSigma}`);
-  acc = op(`add ${acc} ${op(`mul_c ${op(`mul ${z} ${z}`)} -0.5`)}`);
+  const sq = op(`mul_c ${op(`mul ${z} ${z}`)} -0.5`);
+  terms.push(op(`add_c ${op(`sub ${sq} ${logSigma}`)} ${-HALF_LOG_2PI}`));
+  acc = op(`add ${acc} ${terms[i]}`);
 }
 lines.push(`root ${acc}`);
+lines.push(`outputs ${terms.join(" ")}`);
 
 const built = compileTape(lines.join("\n"));
 const meta = {
@@ -69,7 +76,9 @@ const meta = {
   draws: 500,
   seed: 42,
   layoutId: built.layoutId,
+  nOutputs: built.nOutputs,
 };
+if (meta.nOutputs !== N) throw new Error(`nOutputs ${meta.nOutputs}, not ${N}`);
 
 const fixtures = resolve(here, "fixtures");
 await mkdir(fixtures, { recursive: true });
@@ -100,12 +109,25 @@ for (let i = 0; i < meta.draws; i++) {
   }
 }
 
+// The pointwise log-likelihood at the starting point, for the page to be held
+// against — and a check here that the terms are the density they came from:
+// everything but the prior and the Jacobian is in them.
+const pointwise = Array.from(sampler.evaluate(new Float64Array(meta.init)));
+const lpAtInit = sampler.logProbGrad(new Float64Array(meta.init))[0];
+const [a0, b0, ls0] = meta.init;
+const priorPart = -0.005 * (a0 * a0 + b0 * b0) - Math.exp(ls0) + ls0;
+const fromTerms = pointwise.reduce((a, b) => a + b, priorPart);
+if (Math.abs(fromTerms - lpAtInit) > 1e-9 * Math.max(1, Math.abs(lpAtInit))) {
+  throw new Error(`the terms sum to ${fromTerms}, and the density is ${lpAtInit}`);
+}
+
 await writeFile(resolve(fixtures, "meta.json"), JSON.stringify(meta));
 await writeFile(
   resolve(fixtures, "expected.json"),
-  JSON.stringify({ mean, sd: sd.map(Math.sqrt) }),
+  JSON.stringify({ mean, sd: sd.map(Math.sqrt), pointwise }),
 );
-console.log(`fixtures: ${built.wasm.length} byte module, mean beta ${mean[1].toFixed(4)}`);
+console.log(`fixtures: ${built.wasm.length} byte module, mean beta ${mean[1].toFixed(4)}, `
+  + `${pointwise.length} log-likelihood terms`);
 
 // `reroll` reaches the emitter. This tape is under the size threshold, so the
 // default is straight-line ("never"), and "always" re-rolls it smaller.

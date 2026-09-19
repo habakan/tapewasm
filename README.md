@@ -51,6 +51,31 @@ const draws = sampler.sample(new Float64Array([0.1, 0.1]), 1000, 1000, 42n);
 `browser-tests/prepare.mjs` writes a linear regression this way and checks the
 result in Chromium, Firefox and WebKit.
 
+## Values the density does not return
+
+Draws alone leave out what ArviZ wants next: the pointwise log-likelihood LOO
+and `az.compare` are computed from, and whatever the model defines on the side.
+An `outputs` line names nodes of the same tape, and the module reports them at
+any point through `evaluate` — the forward pass alone, no gradient:
+
+```js
+const built = compileTape(`
+  ...
+  root 41
+  outputs 12 19 26 33     # one log-likelihood term per observation
+`);
+
+// One row per draw, which is the shape `log_likelihood` is assembled in.
+const rows = Array.from({ length: draws.length / built.nParams }, (_, i) =>
+  sampler.evaluate(draws.subarray(i * built.nParams, (i + 1) * built.nParams)));
+```
+
+Naming outputs costs about 1.35x the module, for the second forward pass it
+emits; how many are named barely matters, because a run of them evenly spaced
+is written by a loop. A call is the forward pass alone — 1.76 µs against
+`logProbGrad`'s 4.28 at 2,000 observations in Node — plus about 3.4 µs to hand
+2,000 values back across the boundary.
+
 ## Two shapes
 
 The emitter and the sampler are separate, so a page can carry either or both.

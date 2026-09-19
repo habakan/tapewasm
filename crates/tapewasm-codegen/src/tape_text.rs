@@ -13,12 +13,18 @@
 //! mul 0 1                     # instruction 2
 //! add_c 2 4.0                 # instruction 3
 //! root 3
+//! outputs 2 3                 # optional: what `evaluate` reports
 //! ```
 //!
 //! Blank lines and `#` comments are skipped. `n_params` is required and names
 //! the leading run of `new_var`s that are the parameters; a `new_var` after any
 //! other instruction is a constant. `root` names the instruction whose value
 //! the module returns.
+//!
+//! `outputs` names instructions the module's `evaluate` writes, in the order
+//! given — the per-observation terms of a pointwise log-likelihood, or a
+//! deterministic quantity. Several lines append. Without one the module has no
+//! `evaluate` and is what it always was.
 //!
 //! The instructions, all of them:
 //!
@@ -81,6 +87,9 @@ pub struct Program {
     pub tape: Tape,
     pub n_params: usize,
     pub root: u32,
+    /// What `evaluate` reports, in the order named. Empty when no `outputs`
+    /// line appeared.
+    pub outputs: Vec<u32>,
     /// Whatever `test_params` named, empty when the line was absent.
     pub test_params: Vec<f64>,
 }
@@ -90,6 +99,7 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
     let mut n_params = None;
     let mut root = None;
     let mut test_params = Vec::new();
+    let mut outputs: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = Vec::new();
 
     for (k, raw) in src.lines().enumerate() {
@@ -171,6 +181,12 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
             }
             "root" => {
                 root = Some(idx(1)?);
+                continue;
+            }
+            "outputs" => {
+                for k in 1..f.len() {
+                    outputs.push(idx(k)?);
+                }
                 continue;
             }
             _ => {}
@@ -260,6 +276,7 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
         tape,
         n_params: n_params.ok_or(TapeTextError::NoNParams)?,
         root: root.ok_or(TapeTextError::NoRoot)?,
+        outputs,
         test_params,
     })
 }
@@ -286,6 +303,24 @@ mod tests {
             Ok(_) => panic!("a forward reference parsed"),
         };
         assert!(e.to_string().contains("has not been written yet"), "{e}");
+    }
+
+    #[test]
+    fn outputs_name_nodes_and_several_lines_append() {
+        // Instruction 2 and 3 are the same node, so the two lines together name
+        // that node twice and then the root: order is the caller's, not the tape's.
+        let p = parse(
+            "n_params 2\nnew_var 0.5\nnew_var 2.0\nmul 0 1\nmul 0 1\n\
+             outputs 2 3\nroot 2\noutputs 0",
+        )
+        .unwrap();
+        assert_eq!(p.outputs, vec![p.root, p.root, 0]);
+    }
+
+    #[test]
+    fn a_tape_without_outputs_names_none() {
+        let p = parse("n_params 1\nnew_var 3.0\nroot 0").unwrap();
+        assert!(p.outputs.is_empty());
     }
 
     #[test]

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`evaluate`** — what a module reports besides its density. A tape's new
+  `outputs` line names nodes of the same tape, the module gains an `evaluate`
+  export beside `log_prob_grad`, and `AotSampler.evaluate(params)` returns
+  those values at a point: the forward pass alone, no gradient.
+
+  What it is for is the group ArviZ has been missing. A page can now assemble a
+  `log_likelihood` — one row per draw, one term per observation — which is what
+  `az.loo` and `az.compare` are computed from, and it reaches a deterministic
+  quantity the density does not return. Until now a pointwise log-likelihood
+  could only be had where PyMC itself was on the page to recompute it, which
+  ruled out every JavaScript-only page and the whole precompiled path.
+
+  It shares the scratch buffer with `logProbGrad`, which recomputes what it
+  needs, so the two interleave freely. `compileTape` reports `nOutputs`, and a
+  module compiled from a tape that named none refuses the call rather than
+  returning nothing.
+
+  **What it costs.** The module carries a second forward pass: about 1.35x its
+  bytes, straight-line or re-rolled. How many nodes are named barely enters —
+  an evenly spaced run of them, which is exactly one term per observation, is
+  written by a loop rather than a store each. Without that a 2,000-observation
+  model re-rolled to 1,280 bytes came back at 34,266, and 4,000 terms at
+  42.87x.
+
+  A call is the forward pass alone: 1.76 µs against `logProbGrad`'s 4.28 at
+  2,000 observations in Node, 3.25 against 11.54 re-rolled. Handing 2,000
+  values back adds about 3.4 µs, an allocation and a copy across the boundary.
+
 - **`compileTapeCalibrated`** — `compileTape` at the threshold this engine
   prefers, measured once. `compileTape` is synchronous and cannot wait for a
   measurement, so its `"auto"` is the built-in 2,000: right for SpiderMonkey and

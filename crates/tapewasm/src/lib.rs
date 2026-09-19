@@ -161,6 +161,19 @@ extern "C" {
     #[wasm_bindgen(js_name = aot_logp)]
     fn aot_logp(params_ptr: u32, grads_ptr: u32, n_params: u32, scratch_ptr: u32) -> f64;
 
+    /// The bound module's forward-only entry point. Throws when it exports none.
+    #[wasm_bindgen(js_name = aot_evaluate, catch)]
+    fn aot_evaluate(
+        params_ptr: u32,
+        out_ptr: u32,
+        n_params: u32,
+        scratch_ptr: u32,
+    ) -> Result<f64, JsValue>;
+
+    /// How many values the bound module's `evaluate` writes; 0 when it has none.
+    #[wasm_bindgen(js_name = aot_n_outputs)]
+    fn aot_n_outputs() -> u32;
+
     #[wasm_bindgen(js_name = set_aot_exports)]
     fn js_set_aot_exports(exports: JsValue);
 
@@ -442,6 +455,50 @@ impl AotSampler {
             n_params: self.n_params,
             scratch_buf: self.scratch_init.clone(),
         }
+    }
+
+    /// What the module's `outputs` named, at one point in the parameter space.
+    ///
+    /// The forward pass alone, so this is the way to a pointwise
+    /// log-likelihood — one call per draw, a term per observation — or to a
+    /// deterministic quantity the density does not return. It shares the
+    /// scratch buffer with `logProbGrad`, whose own call recomputes what it
+    /// needs, so the two interleave freely.
+    ///
+    /// Throws when the bound module was compiled from a tape that named no
+    /// outputs.
+    #[wasm_bindgen(js_name = evaluate)]
+    pub fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, JsError> {
+        if params.len() != self.n_params {
+            return Err(JsError::new(&format!(
+                "params length {} != n_params {}",
+                params.len(),
+                self.n_params
+            )));
+        }
+        check_aot_binding(self.layout_id)?;
+        let n_outputs = aot_n_outputs() as usize;
+        if n_outputs == 0 {
+            return Err(JsError::new(
+                "the bound module reports no outputs: compile the tape with an \
+                 `outputs` line naming the nodes evaluate() should report",
+            ));
+        }
+        let mut out = vec![0.0_f64; n_outputs];
+        let mut held = self.evaluator.borrow_mut();
+        let logp_fn = held.get_or_insert_with(|| self.logp_fn());
+        // The module reads every parameter before it writes any output, and the
+        // three buffers already live in the memory it imports. It returns the root.
+        aot_evaluate(
+            params.as_ptr() as u32,
+            out.as_mut_ptr() as u32,
+            self.n_params as u32,
+            logp_fn.scratch_buf.as_mut_ptr() as u32,
+        )
+        .map_err(|_| {
+            JsError::new("the bound module exports no evaluate, though it names outputs")
+        })?;
+        Ok(out)
     }
 
     /// `[log_prob, d/dparam...]`.
@@ -842,6 +899,7 @@ pub struct CompiledTape {
     n_params: usize,
     scratch_init: Vec<f64>,
     layout_id: u32,
+    n_outputs: usize,
 }
 
 #[cfg(feature = "codegen")]
@@ -868,6 +926,13 @@ impl CompiledTape {
     pub fn layout_id(&self) -> u32 {
         self.layout_id
     }
+
+    /// How many values `AotSampler.evaluate` returns — what the tape's
+    /// `outputs` line named, and 0 when it had none.
+    #[wasm_bindgen(getter, js_name = nOutputs)]
+    pub fn n_outputs(&self) -> usize {
+        self.n_outputs
+    }
 }
 
 /// Compile a tape written by another front end.
@@ -879,6 +944,10 @@ impl CompiledTape {
 ///
 /// The format is not an artifact and carries no compatibility promise: a tape
 /// is written and consumed inside one call.
+///
+/// An `outputs` line names nodes the module reports through
+/// `AotSampler.evaluate` — a pointwise log-likelihood's per-observation terms,
+/// or a deterministic quantity. Without one the module is what it always was.
 ///
 /// `reroll` says when a vectorised statement becomes a wasm loop: `"auto"`
 /// (the default, straight-line below a size threshold), `"always"`, `"never"`,
@@ -913,9 +982,14 @@ pub fn compile_tape(tape: &str, reroll: Option<String>) -> Result<CompiledTape, 
         },
     };
     let program = tapewasm_codegen::tape_text::parse(tape).map_err(jserr)?;
-    let compiled =
-        tapewasm_codegen::compile_tape(&program.tape, program.n_params, program.root, reroll)
-            .map_err(jserr)?;
+    let compiled = tapewasm_codegen::compile_tape_with_outputs(
+        &program.tape,
+        program.n_params,
+        program.root,
+        &program.outputs,
+        reroll,
+    )
+    .map_err(jserr)?;
 
     let mut scratch_init = vec![0.0_f64; compiled.scratch_len];
     let at = compiled.scratch_len - compiled.const_table.len();
@@ -926,5 +1000,6 @@ pub fn compile_tape(tape: &str, reroll: Option<String>) -> Result<CompiledTape, 
         n_params: compiled.n_params,
         scratch_init,
         layout_id: compiled.layout_id,
+        n_outputs: compiled.n_outputs,
     })
 }

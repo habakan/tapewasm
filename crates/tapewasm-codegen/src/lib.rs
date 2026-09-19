@@ -20,8 +20,14 @@
 //!     `scratch_ptr` is where the module works — `Compiled::scratch_len` f64
 //!     slots the caller owns, with the re-rolled loops' constants staged at
 //!     the end. Unused by a module that keeps every value in a local.
+//!   evaluate(params_ptr: i32, out_ptr: i32, n_params: i32,
+//!            scratch_ptr: i32) -> f64
+//!     the forward pass alone: writes one f64 per named output at `out_ptr`
+//!     and returns the same root. Only emitted when a caller named outputs —
+//!     see [`compile_tape_with_outputs`].
 //!   (global "tapewasm_layout_id" i32)             — see [`Compiled::layout_id`]
 //!   (global "tapewasm_abi_version" i32)           — see [`ABI_VERSION`]
+//!   (global "tapewasm_n_outputs" i32)             — how many `evaluate` writes
 //!
 //! The module uses the fixed-width SIMD proposal: a re-rolled loop whose every
 //! slot moves by one or not at all runs two repeats at a time. Every engine
@@ -152,6 +158,8 @@ pub struct Compiled {
     /// was never sized for, so a host that keeps the binding in one place
     /// compares the two before the first call.
     pub layout_id: u32,
+    /// How many values `evaluate` writes, and 0 when the module exports none.
+    pub n_outputs: usize,
 }
 
 /// Emit a module from a recorded tape.
@@ -168,6 +176,28 @@ pub fn compile_tape(
     tape: &Tape,
     n_params: usize,
     root: u32,
+    reroll: Reroll,
+) -> Result<Compiled, CodegenError> {
+    compile_tape_with_outputs(tape, n_params, root, &[], reroll)
+}
+
+/// [`compile_tape`], plus an `evaluate` export returning the named nodes.
+///
+/// `outputs` names nodes of the same tape — the per-observation terms a
+/// pointwise log-likelihood is made of, or a deterministic quantity — and the
+/// module gains `evaluate(params_ptr, out_ptr, n_params, scratch_ptr) -> f64`,
+/// which runs the forward pass alone, writes one f64 per name at `out_ptr` in
+/// the order given, and returns `root` as `log_prob_grad` does. It shares the
+/// caller's scratch buffer: only primals are touched, and the density's own
+/// call recomputes them.
+///
+/// An empty `outputs` compiles exactly what [`compile_tape`] does, down to the
+/// byte.
+pub fn compile_tape_with_outputs(
+    tape: &Tape,
+    n_params: usize,
+    root: u32,
+    outputs: &[u32],
     reroll: Reroll,
 ) -> Result<Compiled, CodegenError> {
     if tape.is_empty() {
@@ -192,13 +222,22 @@ pub fn compile_tape(
             });
         }
     }
-    let (wasm, const_table, layout_id) = emit(tape, n_params, root, reroll);
+    for &k in outputs {
+        if k as usize >= tape.len() {
+            return Err(CodegenError::Internal(format!(
+                "output names node {k}, past the tape's {} nodes",
+                tape.len()
+            )));
+        }
+    }
+    let (wasm, const_table, layout_id) = emit(tape, n_params, root, outputs, reroll);
     Ok(Compiled {
         wasm,
         n_params,
         scratch_len: 2 * tape.len() + const_table.len(),
         const_table,
         layout_id,
+        n_outputs: outputs.len(),
     })
 }
 
@@ -206,7 +245,7 @@ pub fn compile_tape(
 /// buffers it is handed: the recorded graph, the parameter count, and the
 /// constants staged past the adjoints. Deterministic, so recompiling the same
 /// model twice yields the same id.
-fn layout_id(tape: &Tape, n_params: usize, const_table: &[f64]) -> u32 {
+fn layout_id(tape: &Tape, n_params: usize, outputs: &[u32], const_table: &[f64]) -> u32 {
     use std::hash::Hasher;
     let mut h = tapewasm_autodiff::VnHasher::default();
     h.write_u32(n_params as u32);
@@ -221,11 +260,22 @@ fn layout_id(tape: &Tape, n_params: usize, const_table: &[f64]) -> u32 {
     for c in const_table {
         h.write_u64(c.to_bits());
     }
+    // An empty list writes nothing, so a module without `evaluate` keeps the id
+    // it had before outputs existed.
+    for k in outputs {
+        h.write_u32(*k);
+    }
     h.finish() as u32
 }
 
 /// Lower the recorded tape to a wasm module.
-fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Vec<f64>, u32) {
+fn emit(
+    tape: &Tape,
+    n_params: usize,
+    root: u32,
+    outputs: &[u32],
+    reroll: Reroll,
+) -> (Vec<u8>, Vec<f64>, u32) {
     let n = tape.len() as u32;
     let blocks = match reroll {
         Reroll::Never => Vec::new(),
@@ -341,9 +391,14 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     if needs.trigamma {
         math_idx.trigamma = Some(define(math::trigamma(), &mut functions));
     }
+    // Last, so naming outputs moves no other function's index.
+    let evaluate_idx = log_prob_grad_idx + 1 + inline.len() as u32;
+    if !outputs.is_empty() {
+        functions.function(0); // evaluate: type 0
+    }
 
     // ---- global section ----------------------------------------------------
-    let id = layout_id(tape, n_params, &const_table);
+    let id = layout_id(tape, n_params, outputs, &const_table);
     let mut globals = GlobalSection::new();
     let immutable_i32 = |v: i32, globals: &mut GlobalSection| {
         globals.global(
@@ -357,22 +412,42 @@ fn emit(tape: &Tape, n_params: usize, root: u32, reroll: Reroll) -> (Vec<u8>, Ve
     };
     immutable_i32(id as i32, &mut globals);
     immutable_i32(ABI_VERSION as i32, &mut globals);
+    immutable_i32(outputs.len() as i32, &mut globals);
 
     // ---- export section ----------------------------------------------------
     let mut exports = ExportSection::new();
     exports.export("log_prob_grad", ExportKind::Func, log_prob_grad_idx);
     exports.export("tapewasm_layout_id", ExportKind::Global, 0);
     exports.export("tapewasm_abi_version", ExportKind::Global, 1);
+    exports.export("tapewasm_n_outputs", ExportKind::Global, 2);
+    if !outputs.is_empty() {
+        exports.export("evaluate", ExportKind::Func, evaluate_idx);
+    }
 
     // ---- code section ------------------------------------------------------
     let mut codes = CodeSection::new();
 
-    let lpg = build_log_prob_grad(
-        tape, root, n, &math_idx, &blocks, const_base, &slots, lay, &runs,
+    let lpg = build_body(
+        tape, root, None, n, &math_idx, &blocks, const_base, &slots, lay, &runs,
     );
     codes.function(&lpg);
     for body in &inline {
         codes.function(body);
+    }
+    if !outputs.is_empty() {
+        let ev = build_body(
+            tape,
+            root,
+            Some(outputs),
+            n,
+            &math_idx,
+            &blocks,
+            const_base,
+            &slots,
+            lay,
+            &runs,
+        );
+        codes.function(&ev);
     }
 
     // ---- assemble ----------------------------------------------------------
@@ -1646,10 +1721,17 @@ fn emit_block_backward(
     }
 }
 
+/// The module's one function body, in either of its two shapes.
+///
+/// `outputs` is `None` for `log_prob_grad` — forward, backward, gradients at
+/// `grads_ptr` — and `Some` for `evaluate`, which stops after the forward pass
+/// and writes those nodes' values at the same parameter instead. Both return
+/// `root`.
 #[allow(clippy::too_many_arguments)]
-fn build_log_prob_grad(
+fn build_body(
     tape: &Tape,
     root: u32,
+    outputs: Option<&[u32]>,
     n: u32,
     m: &MathImportIndex,
     blocks: &[reroll::Block],
@@ -1658,13 +1740,15 @@ fn build_log_prob_grad(
     lay: Layout,
     runs: &[Option<SlotRel>],
 ) -> Function {
-    // Locals 0..4: params_ptr, grads_ptr, n_params (unused — the tape encodes it),
-    // scratch_ptr.
+    // Locals 0..4: params_ptr, grads_ptr (out_ptr in `evaluate`), n_params
+    // (unused — the tape encodes it), scratch_ptr.
     const GRADS_PTR: u32 = 1;
     let adj = n; // adjoint slots follow the primals
 
     // The widest block sizes the locals pool, and every block reuses it.
-    let block_local = reroll::local_positions(tape, blocks, root);
+    let mut kept = vec![root];
+    kept.extend(outputs.unwrap_or(&[]));
+    let block_local = reroll::local_positions(tape, blocks, &kept);
     let widest_locals = block_local
         .iter()
         .map(|f| f.iter().filter(|x| **x).count() as u32)
@@ -1687,8 +1771,11 @@ fn build_log_prob_grad(
         .map(|(b, r)| block_strides(b, r).len() as u32)
         .max()
         .unwrap_or(0);
+    // Outputs evenly spaced in scratch are written by a loop, which also needs
+    // the induction variable.
+    let out_run = outputs.and_then(|outs| store_run(outs, slots, lay));
     // One induction variable, then the base pointers, then one address per gather.
-    let i32_locals = if blocks.is_empty() && !has_run_loop {
+    let i32_locals = if blocks.is_empty() && !has_run_loop && out_run.is_none() {
         0
     } else {
         1 + widest + reroll::MAX_TABLED as u32
@@ -1739,7 +1826,7 @@ fn build_log_prob_grad(
 
     // ---- zero the adjoint half --------------------------------------------
     // Locals start at zero, but a caller-owned scratch buffer is reused across calls.
-    if let Layout::Memory = lay {
+    if let (Layout::Memory, None) = (lay, outputs) {
         f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
         f.instruction(&Instruction::I32Const((n * 8) as i32));
         f.instruction(&Instruction::I32Add);
@@ -1858,6 +1945,47 @@ fn build_log_prob_grad(
             straight_fwd(&mut f, k);
             k += 1;
         }
+    }
+
+    // ---- evaluate: report the named nodes and stop -------------------------
+    if let Some(outs) = outputs {
+        // out[i] = scratch[base + i * stride], as a loop or a store each.
+        if let Some((base, stride)) = out_run {
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(iv));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(GRADS_PTR));
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(SCRATCH_PTR));
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Const((stride * 8) as i32));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::F64Load(memarg(base)));
+            f.instruction(&Instruction::F64Store(memarg(0)));
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalTee(iv));
+            f.instruction(&Instruction::I32Const(outs.len() as i32));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::BrIf(0));
+            f.instruction(&Instruction::End);
+        } else {
+            for (i, &k) in outs.iter().enumerate() {
+                f.instruction(&Instruction::LocalGet(GRADS_PTR));
+                f.instruction(&Instruction::I32Const((i * 8) as i32));
+                f.instruction(&Instruction::I32Add);
+                aload(&mut f, lay.at(slots.at(k)));
+                f.instruction(&Instruction::F64Store(memarg(0)));
+            }
+        }
+        aload(&mut f, lay.at(slots.at(root)));
+        f.instruction(&Instruction::End);
+        return f;
     }
 
     // ---- initialize root adjoint = 1.0 ------------------------------------
@@ -2011,6 +2139,32 @@ fn build_log_prob_grad(
     aload(&mut f, lay.at(slots.at(root)));
     f.instruction(&Instruction::End);
     f
+}
+
+/// Where a loop can write the outputs instead of one store each: they sit in
+/// memory, evenly spaced and rising, and there are enough of them to pay for
+/// the loop. Returns the first slot and the stride between them.
+///
+/// This is the shape a pointwise log-likelihood has — one term per
+/// observation, one position of a re-rolled block — and without it a module
+/// that re-rolled to 1,604 bytes comes back at 68,768 for 4,000 terms.
+fn store_run(outs: &[u32], slots: &Slots, lay: Layout) -> Option<(u32, u32)> {
+    /// Below this the stores are shorter than the loop that would replace them.
+    const MIN_RUN: usize = 8;
+    if outs.len() < MIN_RUN || !matches!(lay, Layout::Memory) {
+        return None;
+    }
+    let base = slots.at(outs[0]);
+    let stride = slots.at(outs[1]).checked_sub(base)?;
+    if stride == 0 || stride > i32::MAX as u32 / 8 {
+        return None;
+    }
+    for w in outs.windows(2) {
+        if slots.at(w[1]).checked_sub(slots.at(w[0]))? != stride {
+            return None;
+        }
+    }
+    Some((base, stride))
 }
 
 fn leaf_count(tape: &Tape) -> u32 {

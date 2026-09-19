@@ -4,14 +4,15 @@
 //!
 //! The format is `tapewasm_codegen::tape_text`. Prints `lp` and the gradient
 //! the emitted module computes at `test_params`, for a caller that wants to
-//! check them against its own. Given a second
-//! argument it also writes the module there and prints the buffer sizes a host
-//! needs to call it, so the caller can drive the module itself.
+//! check them against its own, and `ll` per term when the tape names outputs.
+//! Given a second argument it also writes the module there and prints the
+//! buffer sizes a host needs to call it, so the caller can drive the module
+//! itself.
 //!
 //! `REROLL=always` or `REROLL=never` overrides when loops are re-rolled, as
 //! `compileTape`'s `reroll` does in the browser; unset or `auto` keeps the default.
 
-use tapewasm_codegen::{compile_tape, tape_text, Reroll};
+use tapewasm_codegen::{compile_tape_with_outputs, tape_text, Reroll};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module, Store};
 
 #[derive(Default)]
@@ -21,15 +22,18 @@ fn run(
     wasm: &[u8],
     n_params: usize,
     params: &[f64],
+    n_outputs: usize,
     scratch_len: usize,
     consts: &[f64],
-) -> (f64, Vec<f64>) {
+) -> (f64, Vec<f64>, Vec<f64>) {
     let mut config = wasmi::Config::default();
     config.wasm_simd(true);
     let engine = Engine::new(&config);
     let module = Module::new(&engine, wasm).expect("module parses");
     let mut store = Store::new(&engine, HostState);
-    let pages = ((n_params * 2 + scratch_len) * 8).div_ceil(65536).max(1) as u32;
+    let pages = ((n_params * 2 + n_outputs + scratch_len) * 8)
+        .div_ceil(65536)
+        .max(1) as u32;
     let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -67,7 +71,8 @@ fn run(
         .unwrap();
 
     let grads_ptr = (n_params * 8) as i32;
-    let scratch_ptr = (n_params * 16) as i32;
+    let out_ptr = (n_params * 16) as i32;
+    let scratch_ptr = ((n_params * 2 + n_outputs) * 8) as i32;
     let bytes: Vec<u8> = params.iter().flat_map(|p| p.to_le_bytes()).collect();
     memory.write(&mut store, 0, &bytes).unwrap();
     if !consts.is_empty() {
@@ -78,13 +83,25 @@ fn run(
     let lp = lpg
         .call(&mut store, (0, grads_ptr, n_params as i32, scratch_ptr))
         .unwrap();
-    let mut buf = vec![0u8; n_params * 8];
-    memory.read(&store, grads_ptr as usize, &mut buf).unwrap();
-    let grads = buf
-        .chunks(8)
-        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    (lp, grads)
+    let read = |store: &Store<HostState>, at: i32, n: usize| -> Vec<f64> {
+        let mut buf = vec![0u8; n * 8];
+        memory.read(store, at as usize, &mut buf).unwrap();
+        buf.chunks(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let grads = read(&store, grads_ptr, n_params);
+
+    let mut terms = Vec::new();
+    if n_outputs > 0 {
+        let ev = instance
+            .get_typed_func::<(i32, i32, i32, i32), f64>(&store, "evaluate")
+            .expect("a tape naming outputs compiles an evaluate");
+        ev.call(&mut store, (0, out_ptr, n_params as i32, scratch_ptr))
+            .unwrap();
+        terms = read(&store, out_ptr, n_outputs);
+    }
+    (lp, grads, terms)
 }
 
 fn main() {
@@ -101,7 +118,8 @@ fn main() {
         Ok("never") => Reroll::Never,
         Ok(other) => panic!("REROLL must be auto, always or never, not {other:?}"),
     };
-    let compiled = compile_tape(&p.tape, p.n_params, p.root, reroll).expect("compile");
+    let compiled = compile_tape_with_outputs(&p.tape, p.n_params, p.root, &p.outputs, reroll)
+        .expect("compile");
     eprintln!("emitted {} bytes", compiled.wasm.len());
 
     let params = if p.test_params.is_empty() {
@@ -109,16 +127,20 @@ fn main() {
     } else {
         p.test_params
     };
-    let (lp, grads) = run(
+    let (lp, grads, terms) = run(
         &compiled.wasm,
         compiled.n_params,
         &params,
+        compiled.n_outputs,
         compiled.scratch_len,
         &compiled.const_table,
     );
     println!("lp {lp:.15e}");
     for g in &grads {
         println!("grad {g:.15e}");
+    }
+    for v in &terms {
+        println!("ll {v:.15e}");
     }
 
     if let Some(out) = std::env::args().nth(2) {
@@ -127,6 +149,7 @@ fn main() {
         println!("n_params {}", compiled.n_params);
         println!("scratch_len {}", compiled.scratch_len);
         println!("layout_id {}", compiled.layout_id);
+        println!("n_outputs {}", compiled.n_outputs);
         for c in &compiled.const_table {
             println!("const {c:.17e}");
         }
