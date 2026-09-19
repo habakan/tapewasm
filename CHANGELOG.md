@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-09-19
+
+### Fixed
+
+- **The npm package is importable again.** `ts/package.json`'s `files` did not
+  name `calibrate.js`, so the tarball left it behind while `index.js` still
+  re-exported `calibrateReroll`, `compileTapeCalibrated`, `lastCalibration` and
+  the two thresholds from it. Any `import "tapewasm"` from 0.3.2 fails at that
+  line, whether or not a caller touches the calibrator — the package could not
+  be loaded at all. 0.3.2 is the only published version carrying the fault:
+  0.3.1, which added `calibrate.js`, never reached npm.
+
+  `make package` said the tarball was fine because it only read the file list —
+  both licences, exactly one wasm. It now packs for real, unpacks the tarball
+  somewhere else and imports it, which is what fails on a file `files` forgot.
+  Checked against the bug: with the entry removed again, the check names the
+  missing module and exits 1.
+
 ## [0.3.2] — 2026-09-19
 
 ### Added
@@ -306,7 +324,8 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/habakan/tapewasm/releases/tag/v0.3.3
 [0.3.2]: https://github.com/habakan/tapewasm/releases/tag/v0.3.2
 [0.3.1]: https://github.com/habakan/tapewasm/releases/tag/v0.3.1
 [0.3.0]: https://github.com/habakan/tapewasm/releases/tag/v0.3.0

@@ -117,13 +117,10 @@ package: wasm ## Dry-run packaging every crate + the npm tarball
 	done; \
 	rm -f "$$list"
 	@echo "both licences present in every .crate"
-# A script rather than a `node -e`: make 4.3 and make 3.81 disagree about a
-# backslash-continued line inside a recipe, and the older one is what macOS
-# ships, so the inline form passes locally and never runs on CI.
-	@pack=$$(mktemp); \
-	(cd ts && npm pack --dry-run --json) > "$$pack" \
-	  && node ts/tests/check_pack.mjs "$$pack"; \
-	status=$$?; rm -f "$$pack"; exit $$status
+# The npm half packs for real and imports what comes out: `files` names what
+# travels one entry at a time, and a module the entry point imports can be left
+# behind — which is how `tapewasm@0.3.2` shipped unimportable.
+	@node ts/tests/check_pack.mjs
 
 .PHONY: clean
 clean: ## Remove build output

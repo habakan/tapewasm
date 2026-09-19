@@ -1,6 +1,6 @@
 {
   "name": "tapewasm",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Compile an autodiff tape to a WebAssembly module and sample it with nuts-rs, in the browser.",
   "type": "module",
   "main": "./index.js",
@@ -13,7 +13,7 @@
     },
     "./pkg/*": "./pkg/*"
   },
-  "files": ["index.js", "index.d.ts", "pkg/", "LICENSE-APACHE", "LICENSE-MIT", "README.md"],
+  "files": ["index.js", "index.d.ts", "calibrate.js", "pkg/", "LICENSE-APACHE", "LICENSE-MIT", "README.md"],
   "scripts": {
     "build:wasm": "make -C .. wasm"
   },
