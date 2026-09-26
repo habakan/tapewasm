@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-09-26
+
 ### Fixed
 
 - **A `dot_c` or `sum_run` whose elements are not evenly spaced is recorded
