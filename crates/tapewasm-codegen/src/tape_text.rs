@@ -60,10 +60,10 @@
 //! are not the same thing. Instead the text names each element's own
 //! instruction, and this module looks up the node behind each one and checks
 //! that they land evenly spaced (an increasing, constant gap) before handing
-//! `base`/`stride` to the tape; an uneven run — most often two elements that
-//! turned out to be the same subexpression — is a parse error naming the gap
-//! it found, not a wrong module. `dot_c` pairs each named instruction with its
-//! own coefficient; `sum_run`'s `SEED` is the instruction its run is added to.
+//! `base`/`stride` to the tape. An uneven run — duplicate rows in the data make
+//! two elements one subexpression — is recorded as plain `mul_c`s and `add`s
+//! instead: a larger module, the same value. `dot_c` pairs each named instruction
+//! with its own coefficient; `sum_run`'s `SEED` is the instruction its run is added to.
 //!
 //! The format is not an artifact: a tape is written and consumed in one go,
 //! nothing outlives the call, and so nothing here is promised across versions.
@@ -130,37 +130,19 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
                 .parse()
                 .map_err(|_| bad(format!("`{}` is not a number", f[k])))
         };
-        // Named elements' nodes to the `(base, stride)` a run needs; uneven spacing
-        // usually means value numbering merged two of them (see the module doc).
-        let evenly_spaced = |nodes: &[u32]| -> Result<(u32, u32), TapeTextError> {
-            if nodes.len() == 1 {
-                return Ok((nodes[0], 1));
-            }
-            let mut stride = None;
-            for w in nodes.windows(2) {
-                let gap = w[1].checked_sub(w[0]).ok_or_else(|| {
-                    bad("the named instructions' nodes must come in increasing order".to_string())
-                })?;
-                if gap == 0 {
-                    return Err(bad(
-                        "two of the named instructions are the same node — value \
-                         numbering must have merged them into one subexpression"
-                            .to_string(),
-                    ));
-                }
-                match stride {
-                    None => stride = Some(gap),
-                    Some(s) if s == gap => {}
-                    Some(s) => {
-                        return Err(bad(format!(
-                            "the named instructions are not evenly spaced in the tape \
-                             (a gap of {gap} where the run so far was {s} apart) — value \
-                             numbering may have merged one of them with an earlier node"
-                        )))
-                    }
-                }
-            }
-            Ok((nodes[0], stride.unwrap()))
+        // Named elements' nodes to the `(base, stride)` a run needs, or None when
+        // value numbering merged or reordered them (see the module doc).
+        let evenly_spaced = |nodes: &[u32]| -> Option<(u32, u32)> {
+            let stride = if nodes.len() == 1 {
+                1
+            } else {
+                nodes[1].checked_sub(nodes[0])?
+            };
+            (stride > 0
+                && nodes
+                    .windows(2)
+                    .all(|w| w[1].checked_sub(w[0]) == Some(stride)))
+            .then_some((nodes[0], stride))
         };
 
         match f[0] {
@@ -244,8 +226,17 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
                             .map_err(|_| bad(format!("`{tok}` is not a number")))?,
                     );
                 }
-                let (base, stride) = evenly_spaced(&nodes)?;
-                tape.dot_c(base, stride, &coeffs)
+                match evenly_spaced(&nodes) {
+                    Some((base, stride)) => tape.dot_c(base, stride, &coeffs),
+                    None => {
+                        let terms: Vec<u32> = nodes
+                            .iter()
+                            .zip(&coeffs)
+                            .map(|(&n, &c)| tape.mul_c(n, c))
+                            .collect();
+                        terms[1..].iter().fold(terms[0], |acc, &t| tape.add(acc, t))
+                    }
+                }
             }
             "sum_run" => {
                 let seed = idx(1)?;
@@ -264,8 +255,10 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
                 let nodes = (0..len)
                     .map(|c| node_for(f[3 + c]))
                     .collect::<Result<Vec<_>, _>>()?;
-                let (base, stride) = evenly_spaced(&nodes)?;
-                tape.sum_run(seed, base, stride, len as u32)
+                match evenly_spaced(&nodes) {
+                    Some((base, stride)) => tape.sum_run(seed, base, stride, len as u32),
+                    None => nodes.iter().fold(seed, |acc, &n| tape.add(acc, n)),
+                }
             }
             other => return Err(bad(format!("unknown instruction `{other}`"))),
         };
@@ -376,43 +369,47 @@ mod tests {
         assert!(e.to_string().contains("at least one element"), "{e}");
     }
 
+    /// Value and gradient of `root` at the tape's own leaves.
+    fn value_and_grad(text: &str, n: u32) -> (f64, Vec<f64>) {
+        let mut p = parse(text).unwrap();
+        p.tape.backward(p.root);
+        (
+            p.tape.value(p.root),
+            (0..n).map(|i| p.tape.grad_at(i)).collect(),
+        )
+    }
+
     #[test]
-    fn an_unevenly_spaced_run_is_a_parse_error_naming_the_gap() {
-        // Instructions 0, 2, 5 — gaps of 2 then 3 — name nodes 0, 2, 5 since
-        // none of these leaves are shared, so the run itself is the uneven one.
-        let e = match parse(
+    fn an_unevenly_spaced_run_is_recorded_as_plain_adds() {
+        let (v, g) = value_and_grad(
             "n_params 6\nnew_var 1.0\nnew_var 2.0\nnew_var 3.0\nnew_var 4.0\nnew_var 5.0\n\
-             new_var 6.0\ndot_c 3 0 1.0 2 1.0 5 1.0\nroot 6",
-        ) {
-            Err(e) => e,
-            Ok(_) => panic!("an unevenly spaced dot_c parsed"),
-        };
-        assert!(e.to_string().contains("not evenly spaced"), "{e}");
+             new_var 6.0\ndot_c 3 0 1.0 2 2.0 5 3.0\nroot 6",
+            6,
+        );
+        assert_eq!(v, 1.0 + 6.0 + 18.0);
+        assert_eq!(g, vec![1.0, 0.0, 2.0, 0.0, 0.0, 3.0]);
     }
 
     #[test]
-    fn value_numbering_merging_two_named_instructions_is_a_parse_error() {
-        // `mul 0 1` twice is one node, so instructions 2 and 3 name it twice —
-        // the case this format has to reject rather than emit a wrong stride for.
-        let e = match parse(
+    fn a_run_over_a_merged_node_counts_it_twice() {
+        // `mul 0 1` twice is one node, as two identical data rows make it.
+        let (v, g) = value_and_grad(
             "n_params 2\nnew_var 0.5\nnew_var 2.0\nmul 0 1\nmul 0 1\n\
-             dot_c 2 2 1.0 3 1.0\nroot 2",
-        ) {
-            Err(e) => e,
-            Ok(_) => panic!("a dot_c over a merged node parsed"),
-        };
-        assert!(e.to_string().contains("same node"), "{e}");
+             sum_run 0 2 2 3\nroot 4",
+            2,
+        );
+        assert_eq!(v, 0.5 + 1.0 + 1.0);
+        assert_eq!(g, vec![1.0 + 2.0 * 2.0, 2.0 * 0.5]);
     }
 
     #[test]
-    fn a_decreasing_run_is_a_parse_error() {
-        let e = match parse(
+    fn a_decreasing_run_keeps_each_coefficient_with_its_element() {
+        let (v, g) = value_and_grad(
             "n_params 3\nnew_var 1.0\nnew_var 2.0\nnew_var 3.0\n\
-             dot_c 2 2 1.0 0 1.0\nroot 2",
-        ) {
-            Err(e) => e,
-            Ok(_) => panic!("a decreasing dot_c parsed"),
-        };
-        assert!(e.to_string().contains("increasing order"), "{e}");
+             dot_c 2 2 10.0 0 20.0\nroot 3",
+            3,
+        );
+        assert_eq!(v, 30.0 + 20.0);
+        assert_eq!(g, vec![20.0, 0.0, 10.0]);
     }
 }

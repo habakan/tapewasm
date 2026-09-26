@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `dot_c` or `sum_run` whose elements are not evenly spaced is recorded
+  instead of refused.** Duplicate rows in the data make two elements one
+  subexpression, so their nodes repeat or run backwards; the text format now
+  records those as plain `mul_c`s and `add`s — a larger module, the same value.
+  36 of posteriordb's PyMC posteriors, radon and kidiq among them, could not be
+  compiled at all before.
+
 ## [0.3.3] — 2026-09-19
 
 ### Fixed
