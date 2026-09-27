@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: tapewasm
+message: >-
+  If you use this software, please cite it as below.
+type: software
+authors:
+  - alias: habakan
+abstract: >-
+  Compiles a log density, written as an autodiff tape, to a WebAssembly
+  module that returns the value and every partial derivative in one call,
+  and samples it in the browser with nuts-rs (NUTS) or mean-field ADVI.
+  Knows nothing about models: Stan (stanwasm) and PyMC (pymcwasm) front
+  ends write the tape.
+keywords:
+  - bayesian-inference
+  - webassembly
+  - automatic-differentiation
+  - nuts
+  - rust
+  - probabilistic-programming
+license:
+  - Apache-2.0
+  - MIT
+repository-code: 'https://github.com/habakan/tapewasm'
+version: 0.3.4
+date-released: "2026-09-26"
