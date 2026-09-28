@@ -25,6 +25,9 @@ and in `ts/`; `make package` fails if either is missing from a tarball.
 Cargo does not accept `version.workspace` inside `[workspace.dependencies]`,
 which is why the two requirements are written out by hand.
 
+`CITATION.cff` carries the version and `date-released` too; Zenodo reads it when it
+archives the GitHub release, so a stale one gives the DOI the previous version's metadata.
+
 Then move `CHANGELOG.md`'s `[Unreleased]` section under a `## [X.Y.Z] — DATE`
 heading. The date has to be the day you actually tag: the GitHub release body
 is extracted from this section by heading match, and the `guard` job fails the
