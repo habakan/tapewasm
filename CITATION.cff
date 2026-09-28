@@ -4,7 +4,10 @@ message: >-
   If you use this software, please cite it as below.
 type: software
 authors:
-  - alias: habakan
+  - given-names: Kansuke
+    family-names: Habano
+    alias: habakan
+    orcid: 'https://orcid.org/0009-0009-3429-9227'
 abstract: >-
   Compiles a log density, written as an autodiff tape, to a WebAssembly
   module that returns the value and every partial derivative in one call,
