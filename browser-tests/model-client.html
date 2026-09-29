@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tapewasm model client</title>
+<button id="cancel" disabled>Cancel</button>
+<pre id="status">idle</pre>
+<script type="module">
+import { loadModel } from "/ts/browser.js";
+
+const $ = (id) => document.getElementById(id);
+const meta = await (await fetch("/fixtures/meta.json")).json();
+let model;
+try {
+  model = await loadModel({
+    wasmUrl: "/fixtures/model.wasm",
+    metadataUrl: "/fixtures/meta.json",
+  });
+} catch (error) {
+  $("status").textContent = String(error);
+  throw error;
+}
+
+window.sample = async (options = {}) => {
+  const fit = await model.sample({ warmup: meta.warmup, draws: meta.draws, chains: 2,
+    seed: meta.seed, ...options });
+  return {
+    parameterNames: fit.parameterNames,
+    space: fit.space,
+    chains: fit.chains.map((chain) => Array.from(chain)),
+    diverging: fit.diverging.map((chain) => Array.from(chain)),
+    nParams: fit.nParams,
+    nDraws: fit.nDraws,
+  };
+};
+
+window.runSample = async () => {
+  try {
+    const result = await window.sample();
+    window.result = { ok: true, ...result };
+    $("status").textContent = "complete";
+  } catch (error) {
+    window.result = { ok: false, error: String(error) };
+    $("status").textContent = String(error);
+  }
+};
+
+window.cancelSample = async () => {
+  const controller = new AbortController();
+  $("cancel").disabled = false;
+  $("cancel").onclick = () => controller.abort();
+  try {
+    await window.sample({
+      warmup: 1000,
+      draws: 100000,
+      chains: 2,
+      signal: controller.signal,
+      onProgress: ({ state }) => { $("status").textContent = state; },
+    });
+    window.cancelResult = { rejected: false };
+  } catch (error) {
+    window.cancelResult = { rejected: true, name: error.name };
+  }
+  $("cancel").disabled = true;
+  try {
+    model = await loadModel({ wasmUrl: "/fixtures/model.wasm", metadataUrl: "/fixtures/meta.json" });
+    const fit = await window.sample({ draws: 50, warmup: 100 });
+    window.reloadResult = { ok: true, nDraws: fit.nDraws };
+  } catch (error) {
+    window.reloadResult = { ok: false, error: String(error) };
+  }
+};
+</script>

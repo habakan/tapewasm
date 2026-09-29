@@ -16,9 +16,11 @@ const types = {
 createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const path = url.pathname === "/" ? "/page.html" : url.pathname;
-  const root = path.startsWith("/pkg/") ? resolve(repo, "ts") : here;
+  const root = path.startsWith("/ts/") || path.startsWith("/pkg/")
+    ? resolve(repo, "ts") : here;
+  const relative = path.startsWith("/ts/") ? path.slice(3) : path;
   try {
-    const body = await readFile(resolve(root, "." + path));
+    const body = await readFile(resolve(root, "." + relative));
     res.writeHead(200, { "content-type": types[extname(path)] ?? "application/octet-stream" });
     res.end(body);
   } catch {
