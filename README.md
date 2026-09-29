@@ -90,6 +90,37 @@ A module compiled beforehand is 5–35 KB for the models tried so far. It carrie
 its data with it: the numbers are constants on the tape, so a module answers for
 one model and one dataset.
 
+## Sampling a precompiled model
+
+Install `tapewasm` and serve the compiled module and its metadata with the page.
+The metadata records the parameter count, scratch buffer, layout ID, initial
+point, and optionally parameter names. `init` and `initialPoint` are accepted
+for the initial point.
+
+```js
+import { loadModel } from "tapewasm/browser";
+
+const model = await loadModel({
+  wasmUrl: "/models/model.wasm",
+  metadataUrl: "/models/model.json",
+});
+const controller = new AbortController();
+const fit = await model.sample({
+  warmup: 500,
+  draws: 1000,
+  chains: 4,
+  seed: 42,
+  signal: controller.signal,
+});
+// Each chain is draws-major Float64Array; warmup draws are already removed.
+console.log(fit.parameterNames, fit.chains[0]);
+model.dispose();
+```
+
+Sampling runs in a module Worker, so synchronous Wasm work does not block the
+page. Aborting terminates that Worker; call `loadModel` again to start another
+run.
+
 ## What is in here
 
 ```

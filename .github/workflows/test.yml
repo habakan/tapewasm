@@ -111,6 +111,7 @@ jobs:
         with:
           node-version: "22"
       - run: make wasm
+      - run: make wasm-sampler
       # The JS facade: a binding can ship in the wasm and be unreachable
       # through the package with every Rust test still green.
       - run: make smoke

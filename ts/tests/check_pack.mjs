@@ -35,9 +35,10 @@ try {
   for (const l of ["LICENSE-APACHE", "LICENSE-MIT"]) {
     if (!files.includes(l)) fail(`npm tarball ships no ${l}:\n${files.join("\n")}`);
   }
-  const wasm = files.filter((p) => p.endsWith(".wasm"));
-  if (wasm.length !== 1) {
-    fail(`expected exactly one .wasm in the npm tarball, got ${wasm.length}`);
+  const wasm = files.filter((p) => p.endsWith(".wasm")).sort();
+  if (wasm.length !== 2 || !wasm.includes("pkg/tapewasm_bg.wasm") ||
+      !wasm.includes("pkg-sampler/tapewasm_bg.wasm")) {
+    fail(`expected full and sampler-only .wasm bundles, got ${wasm.join(", ")}`);
   }
 
   // The tarball unpacks to `package/`, and importing it resolves every path the
@@ -45,8 +46,10 @@ try {
   const tgz = readdirSync(out).find((f) => f.endsWith(".tgz"));
   execFileSync("tar", ["xzf", resolve(out, tgz), "-C", out]);
   await import(pathToFileURL(resolve(out, "package", "index.js")).href);
+  await import(pathToFileURL(resolve(out, "package", "runtime.js")).href);
+  await import(pathToFileURL(resolve(out, "package", "browser.js")).href);
 
-  console.log(`npm tarball ok: ${files.length} files, both licences, ${wasm[0]}, imports`);
+  console.log(`npm tarball ok: ${files.length} files, both licences, ${wasm.join(" + ")}, imports`);
 } catch (e) {
   fail(String(e.message ?? e).split("\n").slice(0, 3).join("\n"));
 } finally {
