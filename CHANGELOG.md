@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`AotSampler::setMaxDepth`.** Caps each trajectory at `2^depth` leapfrog
+- **`AotSampler::setMaxDepth`.** Keeps each trajectory below `2^depth` leapfrog
   steps instead of nuts-rs's 2^10, as nutpie's and PyMC's `max_treedepth` do,
-  so a host that forwards that option no longer has to refuse it.
+  so a host that forwards that option no longer has to refuse it. A whole
+  number from 1 to 30; anything else is refused rather than wrapped.
 
 ## [0.3.4] — 2026-09-26
 

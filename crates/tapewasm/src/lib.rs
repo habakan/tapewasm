@@ -438,15 +438,18 @@ impl AotSampler {
         self.grad_based_estimate = Some(on);
     }
 
-    /// Cap each trajectory at `2^depth` leapfrog steps instead of nuts-rs's
+    /// Keep each trajectory below `2^depth` leapfrog steps instead of nuts-rs's
     /// 2^10. Lower bounds the gradients per draw at the risk of stopping before
     /// the trajectory turns, which the draws' `numSteps` then show as a flat top.
+    /// A number rather than a `u32`, which JS would wrap (-1) or truncate (2.7).
     #[wasm_bindgen(js_name = setMaxDepth)]
-    pub fn set_max_depth(&mut self, depth: u32) -> Result<(), JsError> {
-        if depth == 0 {
-            return Err(JsError::new("max_depth must be at least 1"));
+    pub fn set_max_depth(&mut self, depth: f64) -> Result<(), JsError> {
+        if !(depth.fract() == 0.0 && (1.0..=30.0).contains(&depth)) {
+            return Err(JsError::new(&format!(
+                "max_depth must be a whole number from 1 to 30, not {depth}"
+            )));
         }
-        self.max_depth = Some(depth);
+        self.max_depth = Some(depth as u32);
         Ok(())
     }
 
