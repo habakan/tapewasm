@@ -737,3 +737,39 @@ fn evaluate_writes_an_evenly_spaced_run_in_a_loop() {
         assert!(close(*a, want, 1e-12), "node {k}: {a} vs {want}");
     }
 }
+
+/// switch(x > 0, log x, 2x) summed over parameters of both signs: the module takes
+/// each branch as the tape does, and the NaN of the one not taken reaches neither the
+/// value nor a gradient, in the loop emitter as well as the straight-line one.
+#[test]
+fn a_switch_takes_its_branch_and_leaves_the_other_out() {
+    let params = [2.0, -3.0, 0.5, -0.25, 4.0, -1.0, 1.5, -2.5];
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let xs: Vec<u32> = params.iter().map(|&p| tape.new_var(p)).collect();
+    // A leaf before the first op would be taken for a ninth parameter.
+    let first = tape.mul_c(xs[0], 1.0);
+    let zero = tape.new_var(0.0);
+    let terms: Vec<u32> = xs
+        .iter()
+        .map(|&x| {
+            let c = tape.gt(x, zero);
+            let not_c = tape.rsub_c(c, 1.0);
+            let log = tape.log(x);
+            let twice = tape.mul_c(x, 2.0);
+            let taken = tape.pick(c, log);
+            let other = tape.pick(not_c, twice);
+            tape.add(taken, other)
+        })
+        .collect();
+    let sum = terms[1..].iter().fold(terms[0], |acc, &a| tape.add(acc, a));
+    let root = tape.add(sum, first);
+    let (want_v, want_g) = tape_oracle(&mut tape, root, &params);
+    assert!(want_v.is_finite() && want_g.iter().all(|g| g.is_finite()));
+    for mode in [Reroll::Never, Reroll::Always] {
+        let c = compile_tape(&tape, params.len(), root, mode).unwrap();
+        let (v, grads) =
+            run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+        assert_eq!(v, want_v, "{mode:?}");
+        assert_eq!(grads, want_g, "{mode:?}");
+    }
+}

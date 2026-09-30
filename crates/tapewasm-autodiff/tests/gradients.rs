@@ -252,3 +252,44 @@ fn a_sum_survives_a_forward_replay() {
     tape.forward_replay(&[1.0, 10.0, 100.0, 1000.0]);
     assert!(close(tape.value(root), 1111.0, 1e-12));
 }
+
+type Compare = fn(&mut Tape, u32, u32) -> u32;
+
+#[test]
+fn comparisons_are_zero_or_one_and_flat() {
+    let cases: [(Compare, [f64; 3]); 6] = [
+        (Tape::gt, [0.0, 0.0, 1.0]),
+        (Tape::ge, [0.0, 1.0, 1.0]),
+        (Tape::lt, [1.0, 0.0, 0.0]),
+        (Tape::le, [1.0, 1.0, 0.0]),
+        (Tape::eq, [0.0, 1.0, 0.0]),
+        (Tape::ne, [1.0, 0.0, 1.0]),
+    ];
+    for (cmp, want) in cases {
+        for (x, want) in [-1.0, 0.0, 1.0].into_iter().zip(want) {
+            let (v, g) = log_prob_grad(&[x, 0.0], |t, xs| cmp(t, xs[0], xs[1]));
+            assert_eq!(v, want, "at {x}");
+            assert_eq!(g, vec![0.0, 0.0], "gradient at {x}");
+        }
+    }
+}
+
+#[test]
+fn a_switch_is_two_picks_and_the_branch_not_taken_stays_out() {
+    // switch(x > 0, log x, 2x): below zero log x is NaN, and neither its value nor its
+    // slope may reach the result.
+    for (x, want_v, want_g) in [(2.0, 2f64.ln(), 0.5), (-3.0, -6.0, 2.0)] {
+        let (v, g) = log_prob_grad(&[x], |t, xs| {
+            let zero = t.new_var(0.0);
+            let c = t.gt(xs[0], zero);
+            let not_c = t.rsub_c(c, 1.0);
+            let log = t.log(xs[0]);
+            let twice = t.mul_c(xs[0], 2.0);
+            let taken = t.pick(c, log);
+            let other = t.pick(not_c, twice);
+            t.add(taken, other)
+        });
+        assert!(close(v, want_v, 1e-12), "value at {x}: {v}");
+        assert_eq!(g[0], want_g, "gradient at {x}");
+    }
+}

@@ -103,7 +103,17 @@ pub(crate) fn uses(op: Op) -> (bool, bool, bool) {
         // `arg2i` is a handle into the tape's extent table, not a slot, and a
         // run of coefficients is not one immediate.
         Op::DotC | Op::Sum => (true, false, false),
-        Op::Add | Op::Sub | Op::Mul | Op::Div => (true, true, false),
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Gt
+        | Op::Ge
+        | Op::Lt
+        | Op::Le
+        | Op::Eq
+        | Op::Ne
+        | Op::Pick => (true, true, false),
         Op::AddC | Op::SubC | Op::RsubC | Op::MulC | Op::DivC | Op::RdivC | Op::Pow => {
             (true, false, true)
         }
