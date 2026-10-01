@@ -39,8 +39,8 @@
 //! phi A      digamma A
 //! gt A B    ge A B    lt A B          1 where it holds, else 0; no gradient
 //! le A B    eq A B    ne A B
-//! pick C A                              A where C is non-zero, else 0, so a
-//!                                       Switch on C is `pick C A` + `pick (1-C) B`
+//! pick C A                              A where C is non-zero, else 0; with C a
+//!                                       comparison, Switch is `pick C A` + `pick (1-C) B`
 //! pow A C                               one operand and a constant
 //! add_c A C  sub_c A C  rsub_c A C      `rsub_c` is `C - A`
 //! mul_c A C  div_c A C  rdiv_c A C      `rdiv_c` is `C / A`

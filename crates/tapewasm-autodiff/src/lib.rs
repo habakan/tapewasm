@@ -61,9 +61,10 @@ pub enum Op {
     Le = 34,
     Eq = 35,
     Ne = 36,
-    /// `arg2i` where `arg1` is non-zero, else `0.0`. Chosen rather than multiplied, so
-    /// a NaN or infinity on the side not taken reaches neither the value nor the
-    /// gradient; a `Switch` is two picks added.
+    /// `arg2i` where `arg1` is non-zero, else `0.0`. Chosen rather than multiplied, so a
+    /// NaN or infinity on the side not taken stays out of the value. Its adjoint there is
+    /// 0, which still meets that side's partials: one infinite at the point gives a NaN
+    /// gradient, where PyTensor's rewrites give a finite one.
     Pick = 37,
 }
 

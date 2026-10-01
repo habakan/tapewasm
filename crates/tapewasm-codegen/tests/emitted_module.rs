@@ -773,3 +773,40 @@ fn a_switch_takes_its_branch_and_leaves_the_other_out() {
         assert_eq!(grads, want_g, "{mode:?}");
     }
 }
+
+/// Every comparison, emitted, gives what the tape does on ordered pairs, equal ones,
+/// signed zeros and NaN, and passes no gradient to either side.
+#[test]
+fn comparisons_match_the_tape_including_nan_and_signed_zero() {
+    type Compare = fn(&mut tapewasm_autodiff::Tape, u32, u32) -> u32;
+    let cmps: [Compare; 6] = [
+        tapewasm_autodiff::Tape::gt,
+        tapewasm_autodiff::Tape::ge,
+        tapewasm_autodiff::Tape::lt,
+        tapewasm_autodiff::Tape::le,
+        tapewasm_autodiff::Tape::eq,
+        tapewasm_autodiff::Tape::ne,
+    ];
+    let pairs = [
+        (1.0, 1.0),
+        (1.0, 2.0),
+        (2.0, 1.0),
+        (f64::NAN, 1.0),
+        (-0.0, 0.0),
+    ];
+    for cmp in cmps {
+        for (a, b) in pairs {
+            let params = [a, b];
+            let mut tape = tapewasm_autodiff::Tape::new();
+            let (x, y) = (tape.new_var(a), tape.new_var(b));
+            let c = cmp(&mut tape, x, y);
+            let root = tape.mul_c(c, 3.0);
+            let (want_v, want_g) = tape_oracle(&mut tape, root, &params);
+            let c = compile_tape(&tape, 2, root, Reroll::Never).unwrap();
+            let (v, g) =
+                run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+            assert_eq!((v, &g), (want_v, &want_g), "({a}, {b})");
+            assert_eq!(g, vec![0.0, 0.0]);
+        }
+    }
+}
