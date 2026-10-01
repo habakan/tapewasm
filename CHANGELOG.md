@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Comparisons and `pick`, for a `Switch` on a parameter.** `gt`, `ge`, `lt`,
+  `le`, `eq` and `ne` give `1` where they hold and `0` elsewhere, with no
+  gradient; `pick C A` is `A` where `C` is non-zero and `0` elsewhere, and so is
+  its gradient. With `c` a comparison, `Switch(c, a, b)` is `pick c a` +
+  `pick (1-c) b`: chosen rather than multiplied, so the NaN or infinity of the
+  branch not taken stays out of the value. Its gradient is right where that branch's
+  partials are finite; one infinite at the point (`sqrt` below zero) still gives a
+  NaN, as a reverse pass without PyTensor's switch rewrites does. A front end can
+  now emit a branch that depends on a parameter, and an exact `max`/`min`, instead
+  of folding it at the trace point.
 - **`AotSampler::setMaxDepth`.** Keeps each trajectory below `2^depth` leapfrog
   steps instead of nuts-rs's 2^10, as nutpie's and PyMC's `max_treedepth` do,
   so a host that forwards that option no longer has to refuse it. A whole

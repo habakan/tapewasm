@@ -2287,6 +2287,27 @@ fn emit_forward(
             aload(f, a1);
             f.instruction(&Instruction::F64Abs);
         }
+        Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne => {
+            aload(f, a1);
+            aload(f, a2);
+            f.instruction(&match op {
+                Op::Gt => Instruction::F64Gt,
+                Op::Ge => Instruction::F64Ge,
+                Op::Lt => Instruction::F64Lt,
+                Op::Le => Instruction::F64Le,
+                Op::Eq => Instruction::F64Eq,
+                _ => Instruction::F64Ne,
+            });
+            f.instruction(&Instruction::F64ConvertI32U);
+        }
+        Op::Pick => {
+            aload(f, a2);
+            f.instruction(&Instruction::F64Const(0.0.into()));
+            aload(f, a1);
+            f.instruction(&Instruction::F64Const(0.0.into()));
+            f.instruction(&Instruction::F64Ne);
+            f.instruction(&Instruction::Select);
+        }
         Op::Lgamma => {
             aload(f, a1);
             f.instruction(&Instruction::Call(m.lgamma.expect("lgamma import missing")));
@@ -2416,6 +2437,8 @@ fn emit_backward(f: &mut Function, tape: &Tape, k: u32, m: &MathImportIndex, b: 
         Op::Abs => {
             adj_incr_sign(f, da1, dk, pa1);
         }
+        Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne => {}
+        Op::Pick => adj_incr_where(f, da2, dk, pa1),
         Op::Lgamma => {
             adj_incr_fn1(f, da1, dk, pa1, m.digamma.unwrap());
         }
@@ -2852,6 +2875,20 @@ fn adj_incr_pow(f: &mut Function, da: Addr, dk: Addr, tv: Addr, exponent: f64, p
 }
 
 // d[da] += t[ta] != 0 ? d[dk] * copysign(1.0, t[ta]) : 0  (ABS backward)
+// d[da] += t[tc] != 0 ? d[dk] : 0, chosen so a non-finite d[dk] off the path stays out.
+fn adj_incr_where(f: &mut Function, da: Addr, dk: Addr, tc: Addr) {
+    astore_addr(f, da);
+    aload(f, da);
+    aload(f, dk);
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    aload(f, tc);
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    f.instruction(&Instruction::F64Ne);
+    f.instruction(&Instruction::Select);
+    f.instruction(&Instruction::F64Add);
+    astore_end(f, da);
+}
+
 fn adj_incr_sign(f: &mut Function, da: Addr, dk: Addr, ta: Addr) {
     astore_addr(f, da);
     aload(f, da);
