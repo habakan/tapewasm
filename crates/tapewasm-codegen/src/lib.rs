@@ -1645,6 +1645,7 @@ fn emit_block_backward(
     adj: u32,
     tmp1: u32,
     tmp2: u32,
+    guard: &[bool],
 ) {
     // Iteration-local values live in locals that do not survive to here: recompute
     // this iteration's, then clear the adjoints they accumulate into.
@@ -1703,11 +1704,12 @@ fn emit_block_backward(
         };
         let pout = sp.addr(r.out.base, r.out.stride);
         let dout = sp.addr(adj + r.out.base, r.out.stride);
-        emit_backward(
+        emit_backward_unless_zero(
             f,
             tape,
             k0,
             m,
+            guard[j as usize],
             Back {
                 dk: bl.adj(j).unwrap_or(dout),
                 da1,
@@ -1786,11 +1788,22 @@ fn build_body(
     let tmp1 = iv + 1 + widest;
     let tmp2 = tmp1 + 1;
 
+    // Nodes whose backward step is skipped at a zero adjoint, per block position;
+    // a block with one runs a repeat at a time, as a lane cannot branch alone.
+    let untaken = tape.untaken();
+    let guards: Vec<Vec<bool>> = blocks
+        .iter()
+        .map(|b| {
+            (0..b.len)
+                .map(|j| (0..b.reps).any(|r| untaken[(b.start + r * b.len + j) as usize]))
+                .collect()
+        })
+        .collect();
     // Which blocks run two repeats at a time.
     let wide: Vec<bool> = blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| widenable(tape, b, &block_rels[i]))
+        .map(|(i, b)| widenable(tape, b, &block_rels[i]) && !guards[i].contains(&true))
         .collect();
     // The v128 pool mirrors the f64 pool, then holds the loop-invariant adjoints.
     let any_wide = wide.iter().any(|w| *w);
@@ -2026,6 +2039,7 @@ fn build_body(
                     adj,
                     tmp1,
                     tmp2,
+                    &guards[bi],
                 );
             }
             if wide[bi] {
@@ -2074,6 +2088,7 @@ fn build_body(
                 adj,
                 tmp1,
                 tmp2,
+                &guards[bi],
             );
             f.instruction(&Instruction::LocalGet(iv));
             f.instruction(&Instruction::I32Const(1));
@@ -2102,11 +2117,12 @@ fn build_body(
                 emit_sum_backward(&mut f, tape, k, slots, lay, run, adj, sum_acc, iv, tmp1);
                 continue;
             }
-            emit_backward(
+            emit_backward_unless_zero(
                 &mut f,
                 tape,
                 k,
                 m,
+                untaken[k as usize],
                 Back {
                     dk: lay.at(adj + slots.at(k)),
                     da1: lay.at(adj + slots.at(tape.arg1_at(k))),
@@ -2355,6 +2371,27 @@ fn emit_forward(
         }
         Op::DotC | Op::Sum => unreachable!("a run is emitted from its own path"),
     }
+}
+
+/// `emit_backward`, inside `if d[k] != 0` when `skip_zero`: a pick's untaken side
+/// has a zero adjoint, which times an infinite partial would be NaN.
+fn emit_backward_unless_zero(
+    f: &mut Function,
+    tape: &Tape,
+    k: u32,
+    m: &MathImportIndex,
+    skip_zero: bool,
+    b: Back,
+) {
+    if !skip_zero {
+        return emit_backward(f, tape, k, m, b);
+    }
+    aload(f, b.dk);
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    f.instruction(&Instruction::F64Ne);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    emit_backward(f, tape, k, m, b);
+    f.instruction(&Instruction::End);
 }
 
 /// The six values one backward step touches, plus its f64 argument.

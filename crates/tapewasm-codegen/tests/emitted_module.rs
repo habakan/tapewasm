@@ -774,6 +774,49 @@ fn a_switch_takes_its_branch_and_leaves_the_other_out() {
     }
 }
 
+/// switch(x > 0, 3 sqrt x, 2x): below zero sqrt x and its slope are NaN, and the zero
+/// adjoint the pick leaves it must not carry that NaN back to x, looped or not.
+#[test]
+fn a_nan_slope_on_the_side_not_taken_stays_out_of_the_gradient() {
+    let params = [2.0, -3.0, 0.5, -0.25, 4.0, -1.0, 1.5, -2.5];
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let xs: Vec<u32> = params.iter().map(|&p| tape.new_var(p)).collect();
+    let first = tape.mul_c(xs[0], 1.0);
+    let zero = tape.new_var(0.0);
+    let terms: Vec<u32> = xs
+        .iter()
+        .map(|&x| {
+            let c = tape.gt(x, zero);
+            let not_c = tape.rsub_c(c, 1.0);
+            let root = tape.sqrt(x);
+            let scaled = tape.mul_c(root, 3.0);
+            let twice = tape.mul_c(x, 2.0);
+            let taken = tape.pick(c, scaled);
+            let other = tape.pick(not_c, twice);
+            tape.add(taken, other)
+        })
+        .collect();
+    let sum = terms[1..].iter().fold(terms[0], |acc, &a| tape.add(acc, a));
+    let root = tape.add(sum, first);
+    let (want_v, want_g) = tape_oracle(&mut tape, root, &params);
+    let slope = |x: f64| if x > 0.0 { 1.5 / x.sqrt() } else { 2.0 };
+    for (i, &x) in params.iter().enumerate() {
+        let w = slope(x) + if i == 0 { 1.0 } else { 0.0 };
+        assert!(
+            close(want_g[i], w, 1e-12),
+            "tape grad[{i}] {} vs {w}",
+            want_g[i]
+        );
+    }
+    for mode in [Reroll::Never, Reroll::Always, Reroll::Auto] {
+        let c = compile_tape(&tape, params.len(), root, mode).unwrap();
+        let (v, grads) =
+            run_aot_log_prob_grad(&c.wasm, c.n_params, &params, c.scratch_len, &c.const_table);
+        assert_eq!(v, want_v, "{mode:?}");
+        assert_eq!(grads, want_g, "{mode:?}");
+    }
+}
+
 /// Every comparison, emitted, gives what the tape does on ordered pairs, equal ones,
 /// signed zeros and NaN, and passes no gradient to either side.
 #[test]
