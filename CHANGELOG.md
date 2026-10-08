@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-10-09
+
 ### Fixed
 
 - **A NaN slope on the side a `pick` does not take stays out of the gradient.**
@@ -363,7 +365,8 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/habakan/tapewasm/releases/tag/v0.3.6
 [0.3.5]: https://github.com/habakan/tapewasm/releases/tag/v0.3.5
 [0.3.4]: https://github.com/habakan/tapewasm/releases/tag/v0.3.4
 [0.3.3]: https://github.com/habakan/tapewasm/releases/tag/v0.3.3
