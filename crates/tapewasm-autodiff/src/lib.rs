@@ -62,9 +62,8 @@ pub enum Op {
     Eq = 35,
     Ne = 36,
     /// `arg2i` where `arg1` is non-zero, else `0.0`. Chosen rather than multiplied, so a
-    /// NaN or infinity on the side not taken stays out of the value. Its adjoint there is
-    /// 0, which still meets that side's partials: one infinite at the point gives a NaN
-    /// gradient, where PyTensor's rewrites give a finite one.
+    /// NaN or infinity on the side not taken stays out of the value, and out of the
+    /// gradient: that side's nodes skip their backward step at a zero adjoint (`untaken`).
     Pick = 37,
 }
 
@@ -558,14 +557,70 @@ impl Tape {
         self.push(v, Op::RdivC, a, 0, c)
     }
 
+    /// The nodes every use of which is a value a `pick` may not take, directly or
+    /// through another such node. Where the pick does not take it their adjoint is
+    /// exactly zero, and its product with an infinite partial would be NaN: the
+    /// backward pass skips them then, as PyTensor's switch rewrites do.
+    pub fn untaken(&self) -> Vec<bool> {
+        let n = self.val.len();
+        let (mut used, mut only) = (vec![false; n], vec![true; n]);
+        let mut out = vec![false; n];
+        for i in (0..n).rev() {
+            out[i] = used[i] && only[i];
+            let op = self.op[i];
+            let (a1, a2i) = (self.arg1[i] as usize, self.arg2i[i] as usize);
+            let mut mark = |a: usize, shadow: bool| {
+                used[a] = true;
+                only[a] &= shadow;
+            };
+            match op {
+                Op::Leaf => {}
+                Op::Pick => {
+                    mark(a1, false);
+                    mark(a2i, true);
+                }
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Gt
+                | Op::Ge
+                | Op::Lt
+                | Op::Le
+                | Op::Eq
+                | Op::Ne => {
+                    mark(a1, out[i]);
+                    mark(a2i, out[i]);
+                }
+                Op::DotC | Op::Sum => {
+                    let e = self.extents[a2i];
+                    mark(a1, out[i]);
+                    for c in 0..e.len as usize {
+                        mark(e.base as usize + c * e.stride as usize, out[i]);
+                    }
+                }
+                _ => mark(a1, out[i]),
+            }
+        }
+        out
+    }
+
     // ---- backward pass ----
 
     pub fn backward(&mut self, root: u32) {
         self.grad[root as usize] = 1.0;
+        let untaken = if self.op.contains(&Op::Pick) {
+            self.untaken()
+        } else {
+            Vec::new()
+        };
         let mut i = self.val.len();
         while i > 0 {
             i -= 1;
             let g = self.grad[i];
+            if g == 0.0 && untaken.get(i) == Some(&true) {
+                continue;
+            }
             let op = self.op[i];
             let a1 = self.arg1[i] as usize;
             let a2i = self.arg2i[i] as usize;

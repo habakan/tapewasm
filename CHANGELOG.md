@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A NaN slope on the side a `pick` does not take stays out of the gradient.**
+  `switch(x > 0, sqrt x, x)` below zero gave a NaN gradient, the pick's zero
+  adjoint times `sqrt`'s infinite partial. The nodes used only on such a side now
+  skip their backward step when their adjoint is zero, as PyTensor's switch
+  rewrites do, and a block holding one runs a repeat at a time. A tape without a
+  `pick` compiles to the same bytes as before.
+
 ## [0.3.5] — 2026-10-01
 
 ### Added
