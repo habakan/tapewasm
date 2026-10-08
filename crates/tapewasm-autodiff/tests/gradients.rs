@@ -179,8 +179,8 @@ fn special_functions_known_points() {
     // lgamma(1) = 0, lgamma(2) = 0
     assert!(close(lgamma(1.0), 0.0, 1e-9));
     assert!(close(lgamma(2.0), 0.0, 1e-9));
-    // digamma(1) = -γ ≈ -0.5772156649
-    assert!(close(digamma(1.0), -0.577_215_664_9, 1e-6));
+    // digamma(1) = -γ
+    assert!(close(digamma(1.0), -std::f64::consts::EULER_GAMMA, 1e-6));
     // Phi(0) = 0.5
     assert!(close(phi_cdf(0.0), 0.5, 1e-7));
     // Phi(1.96) ≈ 0.975
