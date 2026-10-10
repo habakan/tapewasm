@@ -45,7 +45,7 @@ self.onmessage = async ({ data }) => {
       });
       const exports = instance.exports;
       if (value(exports, "tapewasm_abi_version") !== 1) throw new Error("model Wasm ABI version is unsupported");
-      if (value(exports, "tapewasm_layout_id") !== data.metadata.layoutId) {
+      if (value(exports, "tapewasm_layout_id") >>> 0 !== data.metadata.layoutId) {
         throw new Error("metadata.layoutId does not match model Wasm");
       }
       setAotExports(exports);
