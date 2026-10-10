@@ -87,6 +87,7 @@ smoke: wasm ## Exercise the JS facade in Node
 # with every Rust test still green.
 	node ts/tests/calibrate.mjs
 	node ts/tests/evaluate.mjs
+	node ts/tests/runtime-data.mjs
 
 .PHONY: browser-test
 browser-test: wasm wasm-sampler ## Run a compiled module in Chromium, Firefox and WebKit

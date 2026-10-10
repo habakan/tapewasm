@@ -48,6 +48,33 @@ const draws = sampler.sample(new Float64Array([0.1, 0.1]), 1000, 1000, 42n);
 
 `draws` is draws-major and `nParams` wide, warmup first.
 
+## Runtime data
+
+Use `new_data` for observations that should change without recompiling the
+model. These leaves follow all parameters, are not differentiated, and are
+read from a `Float64Array` passed to `sampler.setData()`:
+
+```js
+const built = compileTape(`
+n_params 1
+new_var 0.0
+new_data 0.0
+sub 0 1
+mul 2 2
+mul_c 3 -0.5
+root 4
+`);
+
+// Instantiate and bind `built` as above, then:
+const sampler = new AotSampler(built.nParams, built.scratchInit, built.layoutId, ["mu"]);
+sampler.setData(new Float64Array([1.2]));
+const logpAndGradient = sampler.logProbGrad(new Float64Array([0.8]));
+```
+
+`built.nData` is the required buffer length. Its size is fixed at compilation;
+the values can change between calls. A model with a different batch shape needs
+a separately compiled tape.
+
 `browser-tests/prepare.mjs` writes a linear regression this way and checks the
 result in Chromium, Firefox and WebKit.
 
@@ -87,8 +114,8 @@ The emitter and the sampler are separate, so a page can carry either or both.
 | build with | `make wasm` | `make wasm-sampler` |
 
 A module compiled beforehand is 5–35 KB for the models tried so far. It carries
-its data with it: the numbers are constants on the tape, so a module answers for
-one model and one dataset.
+its fixed values with it by default. `new_data` leaves instead create runtime
+inputs, so one module can answer for different values with the same shape.
 
 ## Sampling a precompiled model
 

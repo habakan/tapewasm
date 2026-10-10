@@ -7,7 +7,9 @@
 //! implementation.
 
 use tapewasm_codegen::shapes;
-use tapewasm_codegen::{compile_tape, compile_tape_with_outputs, Reroll, RE_ROLL_ABOVE};
+use tapewasm_codegen::{
+    compile_tape, compile_tape_with_data, compile_tape_with_outputs, Reroll, RE_ROLL_ABOVE,
+};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module, Store};
 
 fn lgamma(x: f64) -> f64 {
@@ -736,6 +738,81 @@ fn evaluate_writes_an_evenly_spaced_run_in_a_loop() {
         let want = tape.value(*k);
         assert!(close(*a, want, 1e-12), "node {k}: {a} vs {want}");
     }
+}
+
+#[test]
+fn runtime_data_changes_values_without_receiving_gradients() {
+    let mut tape = tapewasm_autodiff::Tape::new();
+    let theta = tape.new_var(1.5);
+    let data = tape.new_var(0.25);
+    let root = tape.mul(theta, data);
+    let c = compile_tape_with_data(&tape, 1, 1, root, &[root], Reroll::Never).unwrap();
+
+    let mut config = wasmi::Config::default();
+    config.wasm_simd(true);
+    let engine = Engine::new(&config);
+    let module = Module::new(&engine, c.wasm.as_slice()).unwrap();
+    let mut store = Store::new(&engine, HostState);
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    let mut linker: Linker<HostState> = Linker::new(&engine);
+    install_math(&mut linker, &mut store);
+    linker.define("tapewasm", "memory", memory).unwrap();
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+
+    let params_ptr = 0;
+    let output_ptr = 8;
+    let scratch_ptr = 16;
+    let data_ptr = scratch_ptr + (c.scratch_len * 8) as i32;
+    memory
+        .write(&mut store, params_ptr as usize, &2.0_f64.to_le_bytes())
+        .unwrap();
+    memory
+        .write(&mut store, data_ptr as usize, &7.0_f64.to_le_bytes())
+        .unwrap();
+
+    let dynamic = instance
+        .get_typed_func::<(i32, i32, i32, i32, i32), f64>(&store, "log_prob_grad_with_data")
+        .unwrap();
+    let lp = dynamic
+        .call(
+            &mut store,
+            (params_ptr, output_ptr, 1, scratch_ptr, data_ptr),
+        )
+        .unwrap();
+    assert_eq!(lp, 14.0);
+    let mut gradient = [0; 8];
+    memory
+        .read(&store, output_ptr as usize, &mut gradient)
+        .unwrap();
+    assert_eq!(f64::from_le_bytes(gradient), 7.0);
+
+    let evaluate = instance
+        .get_typed_func::<(i32, i32, i32, i32, i32), f64>(&store, "evaluate_with_data")
+        .unwrap();
+    assert_eq!(
+        evaluate
+            .call(
+                &mut store,
+                (params_ptr, output_ptr, 1, scratch_ptr, data_ptr),
+            )
+            .unwrap(),
+        14.0
+    );
+    let mut value = [0; 8];
+    memory
+        .read(&store, output_ptr as usize, &mut value)
+        .unwrap();
+    assert_eq!(f64::from_le_bytes(value), 14.0);
+
+    let legacy = instance
+        .get_typed_func::<(i32, i32, i32, i32), f64>(&store, "log_prob_grad")
+        .unwrap();
+    assert_eq!(
+        legacy
+            .call(&mut store, (params_ptr, output_ptr, 1, scratch_ptr))
+            .unwrap(),
+        0.5
+    );
 }
 
 /// switch(x > 0, log x, 2x) summed over parameters of both signs: the module takes

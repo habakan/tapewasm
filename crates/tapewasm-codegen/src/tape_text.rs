@@ -10,6 +10,7 @@
 //! test_params 0.5 1.2 0.1     # optional: a point a caller wants evaluated
 //! new_var 0.1                 # instruction 0
 //! new_var 0.9                 # instruction 1
+//! new_data 1.0                # optional runtime input, after all parameters
 //! mul 0 1                     # instruction 2
 //! add_c 2 4.0                 # instruction 3
 //! root 3
@@ -17,9 +18,9 @@
 //! ```
 //!
 //! Blank lines and `#` comments are skipped. `n_params` is required and names
-//! the leading run of `new_var`s that are the parameters; a `new_var` after any
-//! other instruction is a constant. `root` names the instruction whose value
-//! the module returns.
+//! the leading `new_var`s that are parameters. Optional `new_data` leaves come
+//! after them and are read from a runtime buffer; a `new_var` after an operation
+//! remains a constant. `root` names the instruction whose value the module returns.
 //!
 //! `outputs` names instructions the module's `evaluate` writes, in the order
 //! given — the per-observation terms of a pointwise log-likelihood, or a
@@ -83,6 +84,8 @@ pub enum TapeTextError {
     NoNParams,
     #[error("no `root` line")]
     NoRoot,
+    #[error("`n_params` is {declared}, but the tape opens with {found} parameter leaves")]
+    NParamsMismatch { declared: usize, found: usize },
 }
 
 /// A tape read back from text, with what [`compile_tape`](crate::compile_tape)
@@ -90,6 +93,7 @@ pub enum TapeTextError {
 pub struct Program {
     pub tape: Tape,
     pub n_params: usize,
+    pub n_data: usize,
     pub root: u32,
     /// What `evaluate` reports, in the order named. Empty when no `outputs`
     /// line appeared.
@@ -105,6 +109,10 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
     let mut test_params = Vec::new();
     let mut outputs: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = Vec::new();
+    let mut n_data = 0;
+    let mut saw_data = false;
+    let mut saw_op = false;
+    let mut n_param_leaves = 0;
 
     for (k, raw) in src.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
@@ -178,8 +186,28 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
             _ => {}
         }
 
+        if !matches!(f[0], "new_var" | "new_data") {
+            saw_op = true;
+        }
+
         let node = match f[0] {
-            "new_var" => tape.new_var(num(1)?),
+            "new_var" => {
+                if !saw_op {
+                    if saw_data {
+                        return Err(bad("parameter leaves must precede `new_data`".into()));
+                    }
+                    n_param_leaves += 1;
+                }
+                tape.new_var(num(1)?)
+            }
+            "new_data" => {
+                if saw_op {
+                    return Err(bad("`new_data` leaves must precede operations".into()));
+                }
+                saw_data = true;
+                n_data += 1;
+                tape.new_var(num(1)?)
+            }
             "add" => tape.add(idx(1)?, idx(2)?),
             "sub" => tape.sub(idx(1)?, idx(2)?),
             "mul" => tape.mul(idx(1)?, idx(2)?),
@@ -276,9 +304,17 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
         ids.push(node);
     }
 
+    let n_params = n_params.ok_or(TapeTextError::NoNParams)?;
+    if n_param_leaves != n_params {
+        return Err(TapeTextError::NParamsMismatch {
+            declared: n_params,
+            found: n_param_leaves,
+        });
+    }
     Ok(Program {
         tape,
-        n_params: n_params.ok_or(TapeTextError::NoNParams)?,
+        n_params,
+        n_data,
         root: root.ok_or(TapeTextError::NoRoot)?,
         outputs,
         test_params,
@@ -325,6 +361,32 @@ mod tests {
     fn a_tape_without_outputs_names_none() {
         let p = parse("n_params 1\nnew_var 3.0\nroot 0").unwrap();
         assert!(p.outputs.is_empty());
+    }
+
+    #[test]
+    fn runtime_data_leaves_follow_parameters() {
+        let p = parse("n_params 1\nnew_var 2.0\nnew_data 3.0\nmul 0 1\nroot 2").unwrap();
+        assert_eq!(p.n_params, 1);
+        assert_eq!(p.n_data, 1);
+        assert_eq!(p.tape.value(p.root), 6.0);
+    }
+
+    #[test]
+    fn parameters_cannot_follow_runtime_data() {
+        let err = match parse("n_params 2\nnew_var 1.0\nnew_data 2.0\nnew_var 3.0\nroot 0") {
+            Err(err) => err,
+            Ok(_) => panic!("a parameter after runtime data parsed"),
+        };
+        assert!(err.to_string().contains("must precede `new_data`"), "{err}");
+    }
+
+    #[test]
+    fn runtime_data_must_precede_operations() {
+        let err = match parse("n_params 1\nnew_var 1.0\nadd_c 0 1.0\nnew_data 2.0\nroot 1") {
+            Err(err) => err,
+            Ok(_) => panic!("runtime data after an operation parsed"),
+        };
+        assert!(err.to_string().contains("must precede operations"), "{err}");
     }
 
     #[test]

@@ -25,6 +25,10 @@
 //!     the forward pass alone: writes one f64 per named output at `out_ptr`
 //!     and returns the same root. Only emitted when a caller named outputs —
 //!     see [`compile_tape_with_outputs`].
+//!   log_prob_grad_with_data(params_ptr, grads_ptr, n_params, scratch_ptr,
+//!                           data_ptr) -> f64
+//!     reads the same parameter buffer plus `n_data` values at `data_ptr`.
+//!     Emitted only when the tape declares runtime data leaves.
 //!   (global "tapewasm_layout_id" i32)             — see [`Compiled::layout_id`]
 //!   (global "tapewasm_abi_version" i32)           — see [`ABI_VERSION`]
 //!   (global "tapewasm_n_outputs" i32)             — how many `evaluate` writes
@@ -84,7 +88,8 @@ pub enum CodegenError {
 /// Bump it whenever a change would make an older module unusable by a newer
 /// host, or the reverse. Never for a change a module of either version
 /// survives.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+pub const LEGACY_ABI_VERSION: u32 = 1;
 
 /// When to re-roll a vectorised statement into a wasm loop.
 ///
@@ -147,6 +152,7 @@ const FIRST_SLOT_LOCAL: u32 = 4;
 pub struct Compiled {
     pub wasm: Vec<u8>,
     pub n_params: usize,
+    pub n_data: usize,
     /// f64 slots the caller must pass as the module's scratch buffer.
     pub scratch_len: usize,
     /// Loop constants the caller stages at slot `scratch_len - const_table.len()`
@@ -200,13 +206,33 @@ pub fn compile_tape_with_outputs(
     outputs: &[u32],
     reroll: Reroll,
 ) -> Result<Compiled, CodegenError> {
+    compile_tape_with_data(tape, n_params, 0, root, outputs, reroll)
+}
+
+/// [`compile_tape_with_outputs`], with leading data leaves read at runtime.
+///
+/// The first `n_params` leaves are differentiated. The following `n_data`
+/// leaves are read from a separate buffer and never receive gradients.
+pub fn compile_tape_with_data(
+    tape: &Tape,
+    n_params: usize,
+    n_data: usize,
+    root: u32,
+    outputs: &[u32],
+    reroll: Reroll,
+) -> Result<Compiled, CodegenError> {
     if tape.is_empty() {
         return Err(CodegenError::EmptyTape);
     }
     let leaves = leaf_count(tape) as usize;
-    if leaves != n_params {
+    if leaves != n_params + n_data {
+        let expected = if n_data == 0 {
+            format!("n_params is {n_params}")
+        } else {
+            format!("n_params + n_data is {}", n_params + n_data)
+        };
         return Err(CodegenError::Internal(format!(
-            "tape opens with {leaves} leaves, but n_params is {n_params}"
+            "tape opens with {leaves} leaves, but {expected}"
         )));
     }
     // No emitter arm for these; an `unimplemented!` would trap the whole module.
@@ -230,10 +256,11 @@ pub fn compile_tape_with_outputs(
             )));
         }
     }
-    let (wasm, const_table, layout_id) = emit(tape, n_params, root, outputs, reroll);
+    let (wasm, const_table, layout_id) = emit(tape, n_params, n_data, root, outputs, reroll);
     Ok(Compiled {
         wasm,
         n_params,
+        n_data,
         scratch_len: 2 * tape.len() + const_table.len(),
         const_table,
         layout_id,
@@ -245,10 +272,17 @@ pub fn compile_tape_with_outputs(
 /// buffers it is handed: the recorded graph, the parameter count, and the
 /// constants staged past the adjoints. Deterministic, so recompiling the same
 /// model twice yields the same id.
-fn layout_id(tape: &Tape, n_params: usize, outputs: &[u32], const_table: &[f64]) -> u32 {
+fn layout_id(
+    tape: &Tape,
+    n_params: usize,
+    n_data: usize,
+    outputs: &[u32],
+    const_table: &[f64],
+) -> u32 {
     use std::hash::Hasher;
     let mut h = tapewasm_autodiff::VnHasher::default();
     h.write_u32(n_params as u32);
+    h.write_u32(n_data as u32);
     h.write_u32(tape.len() as u32);
     for k in 0..tape.len() as u32 {
         h.write_u32(tape.op_at(k) as u32);
@@ -272,6 +306,7 @@ fn layout_id(tape: &Tape, n_params: usize, outputs: &[u32], const_table: &[f64])
 fn emit(
     tape: &Tape,
     n_params: usize,
+    n_data: usize,
     root: u32,
     outputs: &[u32],
     reroll: Reroll,
@@ -295,12 +330,13 @@ fn emit(
     // Loop-index-dependent constants live past the adjoints, in block then node order.
     let const_base = 2 * n;
     let slots = Slots::plan(tape, &blocks);
-    let lay = Layout::for_tape(2 * n, !blocks.is_empty());
+    let lay = Layout::for_tape(2 * n, !blocks.is_empty(), FIRST_SLOT_LOCAL);
+    let data_lay = Layout::for_tape(2 * n, !blocks.is_empty(), FIRST_SLOT_LOCAL + 1);
     let runs = straight_runs(tape, &blocks, &slots, lay);
     let (const_table, _, _) = stage_tables(tape, &blocks, const_base, &slots, &runs);
     let needs = scan_imports(tape);
 
-    // ---- type section: 0 = log_prob_grad, 1 = (f64)->f64, 2 = (f64,f64)->f64
+    // ---- type section -----------------------------------------------------
     let mut types = TypeSection::new();
     types.ty().function(
         [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
@@ -310,6 +346,18 @@ fn emit(
     types
         .ty()
         .function([ValType::F64, ValType::F64], [ValType::F64]);
+    if n_data > 0 {
+        types.ty().function(
+            [
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            [ValType::F64],
+        );
+    }
 
     // ---- import section ----------------------------------------------------
     let mut imports = ImportSection::new();
@@ -396,9 +444,18 @@ fn emit(
     if !outputs.is_empty() {
         functions.function(0); // evaluate: type 0
     }
+    let data_log_prob_grad_idx =
+        log_prob_grad_idx + 1 + inline.len() as u32 + u32::from(!outputs.is_empty());
+    let data_evaluate_idx = data_log_prob_grad_idx + 1;
+    if n_data > 0 {
+        functions.function(3); // log_prob_grad_with_data
+        if !outputs.is_empty() {
+            functions.function(3); // evaluate_with_data
+        }
+    }
 
     // ---- global section ----------------------------------------------------
-    let id = layout_id(tape, n_params, outputs, &const_table);
+    let id = layout_id(tape, n_params, n_data, outputs, &const_table);
     let mut globals = GlobalSection::new();
     let immutable_i32 = |v: i32, globals: &mut GlobalSection| {
         globals.global(
@@ -411,8 +468,14 @@ fn emit(
         );
     };
     immutable_i32(id as i32, &mut globals);
-    immutable_i32(ABI_VERSION as i32, &mut globals);
+    let abi_version = if n_data > 0 {
+        ABI_VERSION
+    } else {
+        LEGACY_ABI_VERSION
+    };
+    immutable_i32(abi_version as i32, &mut globals);
     immutable_i32(outputs.len() as i32, &mut globals);
+    immutable_i32(n_data as i32, &mut globals);
 
     // ---- export section ----------------------------------------------------
     let mut exports = ExportSection::new();
@@ -420,15 +483,27 @@ fn emit(
     exports.export("tapewasm_layout_id", ExportKind::Global, 0);
     exports.export("tapewasm_abi_version", ExportKind::Global, 1);
     exports.export("tapewasm_n_outputs", ExportKind::Global, 2);
+    exports.export("tapewasm_n_data", ExportKind::Global, 3);
     if !outputs.is_empty() {
         exports.export("evaluate", ExportKind::Func, evaluate_idx);
+    }
+    if n_data > 0 {
+        exports.export(
+            "log_prob_grad_with_data",
+            ExportKind::Func,
+            data_log_prob_grad_idx,
+        );
+        if !outputs.is_empty() {
+            exports.export("evaluate_with_data", ExportKind::Func, data_evaluate_idx);
+        }
     }
 
     // ---- code section ------------------------------------------------------
     let mut codes = CodeSection::new();
 
     let lpg = build_body(
-        tape, root, None, n, &math_idx, &blocks, const_base, &slots, lay, &runs,
+        tape, root, None, n, n_params, n_data, false, &math_idx, &blocks, const_base, &slots, lay,
+        &runs,
     );
     codes.function(&lpg);
     for body in &inline {
@@ -440,6 +515,9 @@ fn emit(
             root,
             Some(outputs),
             n,
+            n_params,
+            n_data,
+            false,
             &math_idx,
             &blocks,
             const_base,
@@ -448,6 +526,31 @@ fn emit(
             &runs,
         );
         codes.function(&ev);
+    }
+    if n_data > 0 {
+        let lpg = build_body(
+            tape, root, None, n, n_params, n_data, true, &math_idx, &blocks, const_base, &slots,
+            data_lay, &runs,
+        );
+        codes.function(&lpg);
+        if !outputs.is_empty() {
+            let ev = build_body(
+                tape,
+                root,
+                Some(outputs),
+                n,
+                n_params,
+                n_data,
+                true,
+                &math_idx,
+                &blocks,
+                const_base,
+                &slots,
+                data_lay,
+                &runs,
+            );
+            codes.function(&ev);
+        }
     }
 
     // ---- assemble ----------------------------------------------------------
@@ -1578,6 +1681,9 @@ fn emit_block_forward(
     rels: &[PosRel],
     tmp1: u32,
     tmp2: u32,
+    n_params: usize,
+    n_data: usize,
+    runtime_data: bool,
     locals_only: bool,
 ) {
     for j in 0..b.len {
@@ -1624,7 +1730,7 @@ fn emit_block_forward(
         let cst = block_cst(tape, b, j, tbl, sp);
         let w = bl.prim(j).unwrap_or(sp.addr(r.out.base, r.out.stride));
         astore_addr(f, w);
-        emit_forward(f, tape, k0, m, a1, a2, cst);
+        emit_forward(f, tape, k0, n_params, n_data, runtime_data, m, a1, a2, cst);
         astore_end(f, w);
     }
 }
@@ -1645,11 +1751,29 @@ fn emit_block_backward(
     adj: u32,
     tmp1: u32,
     tmp2: u32,
+    n_params: usize,
+    n_data: usize,
+    runtime_data: bool,
     guard: &[bool],
 ) {
     // Iteration-local values live in locals that do not survive to here: recompute
     // this iteration's, then clear the adjoints they accumulate into.
-    emit_block_forward(f, tape, m, b, sp, bl, tbl, rels, tmp1, tmp2, true);
+    emit_block_forward(
+        f,
+        tape,
+        m,
+        b,
+        sp,
+        bl,
+        tbl,
+        rels,
+        tmp1,
+        tmp2,
+        n_params,
+        n_data,
+        runtime_data,
+        true,
+    );
     for j in 0..b.len {
         if let Some(a) = bl.adj(j) {
             astore_addr(f, a);
@@ -1735,6 +1859,9 @@ fn build_body(
     root: u32,
     outputs: Option<&[u32]>,
     n: u32,
+    n_params: usize,
+    n_data: usize,
+    runtime_data: bool,
     m: &MathImportIndex,
     blocks: &[reroll::Block],
     const_base: u32,
@@ -1745,6 +1872,7 @@ fn build_body(
     // Locals 0..4: params_ptr, grads_ptr (out_ptr in `evaluate`), n_params
     // (unused — the tape encodes it), scratch_ptr.
     const GRADS_PTR: u32 = 1;
+    let first_slot_local = if runtime_data { 5 } else { FIRST_SLOT_LOCAL };
     let adj = n; // adjoint slots follow the primals
 
     // The widest block sizes the locals pool, and every block reuses it.
@@ -1762,7 +1890,7 @@ fn build_body(
         Layout::Locals { .. } => lay.local_count(2 * n),
         Layout::Memory => 2 * widest_locals + has_run_loop as u32,
     };
-    let sum_acc = FIRST_SLOT_LOCAL + f64_locals - 1;
+    let sum_acc = first_slot_local + f64_locals - 1;
     let block_rels: Vec<Vec<PosRel>> = blocks
         .iter()
         .map(|b| slots.rels(tape, b).expect("checked by the plan"))
@@ -1782,8 +1910,8 @@ fn build_body(
     } else {
         1 + widest + reroll::MAX_TABLED as u32
     };
-    let locals_base = FIRST_SLOT_LOCAL;
-    let i32_base = FIRST_SLOT_LOCAL + f64_locals;
+    let locals_base = first_slot_local;
+    let i32_base = first_slot_local + f64_locals;
     let iv = i32_base;
     let tmp1 = iv + 1 + widest;
     let tmp2 = tmp1 + 1;
@@ -1876,7 +2004,7 @@ fn build_body(
             tape.arg2f_at(k)
         });
         astore_addr(f, w);
-        emit_forward(f, tape, k, m, a1, a2, cst);
+        emit_forward(f, tape, k, n_params, n_data, runtime_data, m, a1, a2, cst);
         astore_end(f, w);
     };
 
@@ -1923,6 +2051,9 @@ fn build_body(
                     &block_rels[bi],
                     tmp1,
                     tmp2,
+                    n_params,
+                    n_data,
+                    runtime_data,
                     false,
                 );
             }
@@ -1949,6 +2080,9 @@ fn build_body(
                     &block_rels[bi],
                     tmp1,
                     tmp2,
+                    n_params,
+                    n_data,
+                    runtime_data,
                     false,
                 );
             }
@@ -2039,6 +2173,9 @@ fn build_body(
                     adj,
                     tmp1,
                     tmp2,
+                    n_params,
+                    n_data,
+                    runtime_data,
                     &guards[bi],
                 );
             }
@@ -2088,6 +2225,9 @@ fn build_body(
                 adj,
                 tmp1,
                 tmp2,
+                n_params,
+                n_data,
+                runtime_data,
                 &guards[bi],
             );
             f.instruction(&Instruction::LocalGet(iv));
@@ -2138,7 +2278,7 @@ fn build_body(
 
     // ---- store gradients at grads_ptr + i*8. n_params is a runtime parameter, so
     // unroll over the leaf-prefix count observed during tracing instead. ---------
-    let n_params_observed = leaf_count(tape);
+    let n_params_observed = n_params as u32;
     for pi in 0..n_params_observed {
         f.instruction(&Instruction::LocalGet(GRADS_PTR));
         f.instruction(&Instruction::I32Const((pi * 8) as i32));
@@ -2195,23 +2335,14 @@ fn leaf_count(tape: &Tape) -> u32 {
     n
 }
 
-fn is_param_leaf(tape: &Tape, k: u32) -> bool {
-    if tape.op_at(k) != Op::Leaf {
-        return false;
-    }
-    // Leaves before the first non-leaf op are parameters; later ones are constants.
-    for j in 0..k {
-        if tape.op_at(j) != Op::Leaf {
-            return false;
-        }
-    }
-    true
-}
-
+#[allow(clippy::too_many_arguments)]
 fn emit_forward(
     f: &mut Function,
     tape: &Tape,
     k: u32,
+    n_params: usize,
+    n_data: usize,
+    runtime_data: bool,
     m: &MathImportIndex,
     a1: Addr,
     a2: Addr,
@@ -2219,11 +2350,21 @@ fn emit_forward(
 ) {
     let op = tape.op_at(k);
     const PARAMS_PTR: u32 = 0;
+    const DATA_PTR: u32 = 4;
     match op {
         Op::Leaf => {
-            if is_param_leaf(tape, k) {
+            if (k as usize) < n_params {
                 f.instruction(&Instruction::LocalGet(PARAMS_PTR));
                 f.instruction(&Instruction::I32Const((k * 8) as i32));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            } else if runtime_data && (k as usize) < n_params + n_data {
+                f.instruction(&Instruction::LocalGet(DATA_PTR));
+                f.instruction(&Instruction::I32Const(((k as usize - n_params) * 8) as i32));
                 f.instruction(&Instruction::I32Add);
                 f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
                     offset: 0,
@@ -2545,11 +2686,9 @@ enum Layout {
 }
 
 impl Layout {
-    fn for_tape(n_slots: u32, has_loops: bool) -> Self {
+    fn for_tape(n_slots: u32, has_loops: bool, first_local: u32) -> Self {
         if !has_loops && n_slots <= MAX_WASM_LOCALS {
-            Layout::Locals {
-                first_local: FIRST_SLOT_LOCAL,
-            }
+            Layout::Locals { first_local }
         } else {
             Layout::Memory
         }
