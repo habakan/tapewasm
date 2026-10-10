@@ -7,10 +7,13 @@
 // the sampler reads the id back to refuse a mismatched pair.
 
 let aotLogProbGrad = null;
+let aotLogProbGradWithData = null;
 let aotEvaluate = null;
+let aotEvaluateWithData = null;
 // How many values `evaluate` writes. 0 when the tape named none, and for a
 // module built before outputs existed, which exports neither.
 let aotNOutputs = 0;
+let aotNData = 0;
 // NaN means nothing is bound, or no id is exported; no u32 id collides with it.
 let aotLayoutId = NaN;
 // Likewise: a module from before the global existed reads as unknown, not as 0.
@@ -18,9 +21,13 @@ let aotAbiVersion = NaN;
 
 export function set_aot_exports(exports) {
   aotLogProbGrad = exports.log_prob_grad;
+  aotLogProbGradWithData = exports.log_prob_grad_with_data ?? null;
   aotEvaluate = exports.evaluate ?? null;
+  aotEvaluateWithData = exports.evaluate_with_data ?? null;
   const n = exports.tapewasm_n_outputs;
   aotNOutputs = n ? n.value >>> 0 : 0;
+  const d = exports.tapewasm_n_data;
+  aotNData = d ? d.value >>> 0 : 0;
   const g = exports.tapewasm_layout_id;
   aotLayoutId = g ? g.value >>> 0 : NaN;
   const v = exports.tapewasm_abi_version;
@@ -29,8 +36,11 @@ export function set_aot_exports(exports) {
 
 export function clear_aot_exports() {
   aotLogProbGrad = null;
+  aotLogProbGradWithData = null;
   aotEvaluate = null;
+  aotEvaluateWithData = null;
   aotNOutputs = 0;
+  aotNData = 0;
   aotLayoutId = NaN;
   aotAbiVersion = NaN;
 }
@@ -50,8 +60,19 @@ export function aot_logp(paramsPtr, gradsPtr, nParams, scratchPtr) {
   return aotLogProbGrad(paramsPtr, gradsPtr, nParams, scratchPtr);
 }
 
+export function aot_logp_with_data(paramsPtr, gradsPtr, nParams, scratchPtr, dataPtr) {
+  if (!aotLogProbGradWithData) {
+    throw new Error("the bound module exports no runtime-data log_prob_grad");
+  }
+  return aotLogProbGradWithData(paramsPtr, gradsPtr, nParams, scratchPtr, dataPtr);
+}
+
 export function aot_n_outputs() {
   return aotNOutputs;
+}
+
+export function aot_n_data() {
+  return aotNData;
 }
 
 export function aot_evaluate(paramsPtr, outPtr, nParams, scratchPtr) {
@@ -62,4 +83,11 @@ export function aot_evaluate(paramsPtr, outPtr, nParams, scratchPtr) {
     );
   }
   return aotEvaluate(paramsPtr, outPtr, nParams, scratchPtr);
+}
+
+export function aot_evaluate_with_data(paramsPtr, outPtr, nParams, scratchPtr, dataPtr) {
+  if (!aotEvaluateWithData) {
+    throw new Error("the bound module exports no runtime-data evaluate");
+  }
+  return aotEvaluateWithData(paramsPtr, outPtr, nParams, scratchPtr, dataPtr);
 }

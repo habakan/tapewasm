@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>runtime data</title>
+<pre id="out">running…</pre>
+<script type="module">
+import init, { AotSampler, compileTape, setAotExports, sharedMemory } from "/pkg/tapewasm.js";
+
+async function run() {
+  await init({ module_or_path: "/pkg/tapewasm_bg.wasm" });
+  const built = compileTape(`
+n_params 1
+new_var 0.0
+new_data 0.0
+sub 0 1
+mul 2 2
+mul_c 3 -0.5
+root 4
+outputs 4
+`);
+  const { instance } = await WebAssembly.instantiate(built.wasm, {
+    tapewasm: { memory: sharedMemory() },
+    Math,
+  });
+  setAotExports(instance.exports);
+  const sampler = new AotSampler(built.nParams, built.scratchInit, built.layoutId, ["mu"]);
+  const missingData = (() => {
+    try {
+      sampler.logProbGrad(new Float64Array([0.8]));
+      return null;
+    } catch (error) {
+      return String(error);
+    }
+  })();
+  sampler.setData(new Float64Array([1.2]));
+  const first = Array.from(sampler.logProbGrad(new Float64Array([0.8])));
+  const output = Array.from(sampler.evaluate(new Float64Array([0.8])));
+  sampler.setData(new Float64Array([-0.2]));
+  const second = Array.from(sampler.logProbGrad(new Float64Array([0.8])));
+  sampler.setData(new Float64Array([0.1, 0.2]));
+  let wrongLength = null;
+  try {
+    sampler.logProbGrad(new Float64Array([0.8]));
+  } catch (error) {
+    wrongLength = String(error);
+  }
+  return { nData: built.nData, samplerNData: sampler.nData, missingData, first, output, second, wrongLength };
+}
+
+run().then((result) => { window.result = result; }, (error) => { window.result = { error: String(error) }; })
+  .finally(() => { document.getElementById("out").textContent = JSON.stringify(window.result); });
+</script>

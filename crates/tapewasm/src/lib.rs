@@ -161,6 +161,15 @@ extern "C" {
     #[wasm_bindgen(js_name = aot_logp)]
     fn aot_logp(params_ptr: u32, grads_ptr: u32, n_params: u32, scratch_ptr: u32) -> f64;
 
+    #[wasm_bindgen(js_name = aot_logp_with_data)]
+    fn aot_logp_with_data(
+        params_ptr: u32,
+        grads_ptr: u32,
+        n_params: u32,
+        scratch_ptr: u32,
+        data_ptr: u32,
+    ) -> f64;
+
     /// The bound module's forward-only entry point. Throws when it exports none.
     #[wasm_bindgen(js_name = aot_evaluate, catch)]
     fn aot_evaluate(
@@ -170,9 +179,21 @@ extern "C" {
         scratch_ptr: u32,
     ) -> Result<f64, JsValue>;
 
+    #[wasm_bindgen(js_name = aot_evaluate_with_data, catch)]
+    fn aot_evaluate_with_data(
+        params_ptr: u32,
+        out_ptr: u32,
+        n_params: u32,
+        scratch_ptr: u32,
+        data_ptr: u32,
+    ) -> Result<f64, JsValue>;
+
     /// How many values the bound module's `evaluate` writes; 0 when it has none.
     #[wasm_bindgen(js_name = aot_n_outputs)]
     fn aot_n_outputs() -> u32;
+
+    #[wasm_bindgen(js_name = aot_n_data)]
+    fn aot_n_data() -> u32;
 
     #[wasm_bindgen(js_name = set_aot_exports)]
     fn js_set_aot_exports(exports: JsValue);
@@ -212,7 +233,8 @@ extern "C" {
 /// Kept here rather than read from `tapewasm-codegen`, which the sampler-only
 /// build does not depend on. `abi_version_agrees` asserts the two are the same
 /// number wherever both are present.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+pub const LEGACY_ABI_VERSION: u32 = 1;
 
 /// Refuse a binding that belongs to a different compilation.
 ///
@@ -231,7 +253,13 @@ pub fn check_aot_binding(want: u32) -> Result<(), JsError> {
         ));
     }
     let abi = aot_abi_version();
-    if abi.is_nan() || abi as u32 != ABI_VERSION {
+    let n_data = aot_n_data();
+    let compatible = if n_data > 0 {
+        !abi.is_nan() && abi as u32 == ABI_VERSION
+    } else {
+        !abi.is_nan() && matches!(abi as u32, LEGACY_ABI_VERSION | ABI_VERSION)
+    };
+    if !compatible {
         // Only reachable with a module and a runtime from different releases,
         // which a page deploys together — so name both numbers and stop.
         let found = if abi.is_nan() {
@@ -241,7 +269,8 @@ pub fn check_aot_binding(want: u32) -> Result<(), JsError> {
         };
         return Err(JsError::new(&format!(
             "the bound AOT module names {found}, and this tapewasm runs module \
-             ABI {ABI_VERSION}. A precompiled module and the runtime that \
+             ABI {ABI_VERSION} (or legacy ABI {LEGACY_ABI_VERSION} without \
+             runtime data). A precompiled module and the runtime that \
              samples it ship together, so recompile the module with this \
              version, or serve the runtime it was built with.",
         )));
@@ -288,6 +317,7 @@ pub struct AotLogp {
     n_params: usize,
     /// Primal and adjoint storage the AOT module works in, two f64 per node.
     scratch_buf: Vec<f64>,
+    data: Vec<f64>,
 }
 
 impl AotLogp {
@@ -297,6 +327,7 @@ impl AotLogp {
         Self {
             n_params,
             scratch_buf,
+            data: Vec::new(),
         }
     }
 }
@@ -329,7 +360,17 @@ impl CpuLogpFunc for AotLogp {
         let params_ptr = position.as_ptr() as u32;
         let grads_ptr = gradient.as_mut_ptr() as u32;
         let scratch_ptr = self.scratch_buf.as_mut_ptr() as u32;
-        let lp = aot_logp(params_ptr, grads_ptr, self.n_params as u32, scratch_ptr);
+        let lp = if self.data.is_empty() {
+            aot_logp(params_ptr, grads_ptr, self.n_params as u32, scratch_ptr)
+        } else {
+            aot_logp_with_data(
+                params_ptr,
+                grads_ptr,
+                self.n_params as u32,
+                scratch_ptr,
+                self.data.as_ptr() as u32,
+            )
+        };
         if lp.is_finite() {
             Ok(lp)
         } else {
@@ -364,6 +405,7 @@ pub struct AotSampler {
     /// method stays a shared borrow and a snapshot callback can still call it
     /// while `advi` runs.
     evaluator: RefCell<Option<AotLogp>>,
+    data: Vec<f64>,
 }
 
 #[wasm_bindgen]
@@ -408,12 +450,39 @@ impl AotSampler {
             grad_based_estimate: None,
             max_depth: None,
             evaluator: RefCell::new(None),
+            data: Vec::new(),
         })
     }
 
     #[wasm_bindgen(getter, js_name = nParams)]
     pub fn n_params(&self) -> usize {
         self.n_params
+    }
+
+    #[wasm_bindgen(getter, js_name = nData)]
+    pub fn n_data(&self) -> usize {
+        aot_n_data() as usize
+    }
+
+    #[wasm_bindgen(js_name = setData)]
+    pub fn set_data(&mut self, data: &[f64]) {
+        self.data.clear();
+        self.data.extend_from_slice(data);
+        if let Some(evaluator) = self.evaluator.get_mut().as_mut() {
+            evaluator.data.clear();
+            evaluator.data.extend_from_slice(data);
+        }
+    }
+
+    fn check_data(&self) -> Result<(), JsError> {
+        let n_data = aot_n_data() as usize;
+        if self.data.len() != n_data {
+            return Err(JsError::new(&format!(
+                "runtime data has {} values, but the bound module expects {n_data}; call setData() with exactly nData values",
+                self.data.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Aim warmup's step-size adaptation at this acceptance rate instead of
@@ -474,6 +543,7 @@ impl AotSampler {
         AotLogp {
             n_params: self.n_params,
             scratch_buf: self.scratch_init.clone(),
+            data: self.data.clone(),
         }
     }
 
@@ -497,6 +567,7 @@ impl AotSampler {
             )));
         }
         check_aot_binding(self.layout_id)?;
+        self.check_data()?;
         let n_outputs = aot_n_outputs() as usize;
         if n_outputs == 0 {
             return Err(JsError::new(
@@ -509,13 +580,23 @@ impl AotSampler {
         let logp_fn = held.get_or_insert_with(|| self.logp_fn());
         // The module reads every parameter before it writes any output, and the
         // three buffers already live in the memory it imports. It returns the root.
-        aot_evaluate(
-            params.as_ptr() as u32,
-            out.as_mut_ptr() as u32,
-            self.n_params as u32,
-            logp_fn.scratch_buf.as_mut_ptr() as u32,
-        )
-        .map_err(|_| {
+        let evaluated = if logp_fn.data.is_empty() {
+            aot_evaluate(
+                params.as_ptr() as u32,
+                out.as_mut_ptr() as u32,
+                self.n_params as u32,
+                logp_fn.scratch_buf.as_mut_ptr() as u32,
+            )
+        } else {
+            aot_evaluate_with_data(
+                params.as_ptr() as u32,
+                out.as_mut_ptr() as u32,
+                self.n_params as u32,
+                logp_fn.scratch_buf.as_mut_ptr() as u32,
+                logp_fn.data.as_ptr() as u32,
+            )
+        };
+        evaluated.map_err(|_| {
             JsError::new("the bound module exports no evaluate, though it names outputs")
         })?;
         Ok(out)
@@ -536,6 +617,7 @@ impl AotSampler {
             )));
         }
         check_aot_binding(self.layout_id)?;
+        self.check_data()?;
         let mut out = vec![0.0_f64; self.n_params + 1];
         let mut held = self.evaluator.borrow_mut();
         let logp_fn = held.get_or_insert_with(|| self.logp_fn());
@@ -589,6 +671,7 @@ impl AotSampler {
         }
         no_warmup_check(num_warmup)?;
         check_aot_binding(self.layout_id)?;
+        self.check_data()?;
 
         let mut grad = vec![0.0_f64; n];
         let lp = self
@@ -685,6 +768,7 @@ impl AotSampler {
             return Err(JsError::new("learning_rate must be positive"));
         }
         check_aot_binding(self.layout_id)?;
+        self.check_data()?;
 
         const BETA1: f64 = 0.9;
         const BETA2: f64 = 0.999;
@@ -917,6 +1001,7 @@ fn fill_standard_normal<R: Rng>(rng: &mut R, out: &mut [f64]) {
 pub struct CompiledTape {
     wasm: Vec<u8>,
     n_params: usize,
+    n_data: usize,
     scratch_init: Vec<f64>,
     layout_id: u32,
     n_outputs: usize,
@@ -935,6 +1020,11 @@ impl CompiledTape {
     #[wasm_bindgen(getter, js_name = nParams)]
     pub fn n_params(&self) -> usize {
         self.n_params
+    }
+
+    #[wasm_bindgen(getter, js_name = nData)]
+    pub fn n_data(&self) -> usize {
+        self.n_data
     }
 
     #[wasm_bindgen(getter, js_name = scratchInit)]
@@ -1002,9 +1092,10 @@ pub fn compile_tape(tape: &str, reroll: Option<String>) -> Result<CompiledTape, 
         },
     };
     let program = tapewasm_codegen::tape_text::parse(tape).map_err(jserr)?;
-    let compiled = tapewasm_codegen::compile_tape_with_outputs(
+    let compiled = tapewasm_codegen::compile_tape_with_data(
         &program.tape,
         program.n_params,
+        program.n_data,
         program.root,
         &program.outputs,
         reroll,
@@ -1018,6 +1109,7 @@ pub fn compile_tape(tape: &str, reroll: Option<String>) -> Result<CompiledTape, 
     Ok(CompiledTape {
         wasm: compiled.wasm,
         n_params: compiled.n_params,
+        n_data: compiled.n_data,
         scratch_init,
         layout_id: compiled.layout_id,
         n_outputs: compiled.n_outputs,
