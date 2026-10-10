@@ -2335,6 +2335,7 @@ fn leaf_count(tape: &Tape) -> u32 {
     n
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_forward(
     f: &mut Function,
     tape: &Tape,
