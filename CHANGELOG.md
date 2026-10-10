@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`new_data` leaves, for data that changes without recompiling.** They follow
+  the parameters, take no gradient, and are read from the `Float64Array` given
+  to `AotSampler::setData`, `nData` long. A tape without one compiles to the
+  same ABI as before.
+
 ## [0.3.6] — 2026-10-09
 
 ### Fixed
