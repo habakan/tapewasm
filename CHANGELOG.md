@@ -9,10 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Worker-backed client for precompiled models.** `loadModel()` from
+  `tapewasm/browser` validates model metadata, loads a sampler-only runtime and
+  samples in a module Worker. It returns named chains with warmup removed and
+  divergence statistics; an `AbortSignal` terminates the Worker.
 - **`new_data` leaves, for data that changes without recompiling.** They follow
   the parameters, take no gradient, and are read from the `Float64Array` given
   to `AotSampler::setData`, `nData` long. A tape without one compiles to the
-  same ABI as before.
+  same ABI as before; `loadModel` does not accept a module with one yet.
 
 ## [0.3.6] — 2026-10-09
 
