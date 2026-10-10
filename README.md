@@ -148,6 +148,9 @@ Sampling runs in a module Worker, so synchronous Wasm work does not block the
 page. Aborting terminates that Worker; call `loadModel` again to start another
 run.
 
+A model with [runtime data](#runtime-data) records `nData` in its metadata and
+takes the values on each run: `model.sample({ data: new Float64Array([1.2]) })`.
+
 ## What is in here
 
 ```

@@ -73,3 +73,31 @@ test("invalid metadata rejects with a field-specific error", async ({ page }) =>
   });
   expect(error).toContain("nParams");
 });
+
+test("one loaded model samples against different runtime data", async ({ page }) => {
+  await page.goto("/model-client.html");
+  const result = await page.evaluate(async () => {
+    const { loadModel } = await import("/ts/browser.js");
+    const model = await loadModel({
+      wasmUrl: "/fixtures/data_model.wasm",
+      metadataUrl: "/fixtures/data_meta.json",
+    });
+    const mean = async (data: number[]) => {
+      const fit = await model.sample({ warmup: 300, draws: 1000, chains: 2, seed: 7, data });
+      const values = fit.chains.flatMap((chain) => Array.from(chain));
+      return values.reduce((sum, value) => sum + value / values.length, 0);
+    };
+    const missing = await model.sample().then(() => null, (error) => String(error));
+    const means = [await mean([1.2]), await mean([-3])];
+    model.dispose();
+    const mismatch = await fetch("/fixtures/data_meta.json").then((r) => r.json())
+      .then((meta) => URL.createObjectURL(new Blob([JSON.stringify({ ...meta, nData: 2 })])))
+      .then((metadataUrl) => loadModel({ wasmUrl: "/fixtures/data_model.wasm", metadataUrl }))
+      .then(() => null, (error) => String(error));
+    return { missing, means, mismatch };
+  });
+  expect(result.missing).toContain("data must be 1");
+  expect(result.means[0]).toBeCloseTo(1.2, 0);
+  expect(result.means[1]).toBeCloseTo(-3, 0);
+  expect(result.mismatch).toContain("nData");
+});

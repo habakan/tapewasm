@@ -8,6 +8,7 @@ export interface SampleOptions {
   draws?: number;
   chains?: number;
   seed?: number | bigint;
+  data?: ArrayLike<number>;
   signal?: AbortSignal;
   onProgress?: (progress: SamplingProgress) => void;
 }

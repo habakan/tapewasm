@@ -44,7 +44,12 @@ self.onmessage = async ({ data }) => {
         tapewasm: { memory: sharedMemory() }, Math: math,
       });
       const exports = instance.exports;
-      if (value(exports, "tapewasm_abi_version") !== 1) throw new Error("model Wasm ABI version is unsupported");
+      if (![1, 2].includes(value(exports, "tapewasm_abi_version"))) {
+        throw new Error("model Wasm ABI version is unsupported");
+      }
+      if ((value(exports, "tapewasm_n_data") ?? 0) >>> 0 !== data.metadata.nData) {
+        throw new Error("metadata.nData does not match model Wasm");
+      }
       if (value(exports, "tapewasm_layout_id") >>> 0 !== data.metadata.layoutId) {
         throw new Error("metadata.layoutId does not match model Wasm");
       }
@@ -57,6 +62,7 @@ self.onmessage = async ({ data }) => {
       const { metadata, exports } = self.model;
       const sampler = new AotSampler(metadata.nParams, new Float64Array(metadata.scratchInit),
         metadata.layoutId, metadata.paramNames ?? []);
+      if (data.data) sampler.setData(data.data);
       const chains = [];
       const diverging = [];
       try {
