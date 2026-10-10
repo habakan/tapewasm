@@ -25,5 +25,5 @@ license:
   - Apache-2.0
   - MIT
 repository-code: 'https://github.com/habakan/tapewasm'
-version: 0.3.6
-date-released: "2026-10-09"
+version: 0.3.7
+date-released: "2026-10-10"
