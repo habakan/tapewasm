@@ -89,7 +89,7 @@ smoke: wasm ## Exercise the JS facade in Node
 	node ts/tests/evaluate.mjs
 
 .PHONY: browser-test
-browser-test: wasm ## Run a compiled module in Chromium, Firefox and WebKit
+browser-test: wasm wasm-sampler ## Run a compiled module in Chromium, Firefox and WebKit
 	cd browser-tests && npm test
 
 .PHONY: bench
@@ -97,7 +97,7 @@ bench: wasm ## Time a gradient per engine, straight-line against re-rolled (not 
 	cd browser-tests && node bench.mjs
 
 .PHONY: package
-package: wasm ## Dry-run packaging every crate + the npm tarball
+package: wasm wasm-sampler ## Dry-run packaging every crate + the npm tarball
 	cargo package --workspace --no-verify
 # Both licence texts have to travel with the artifact — the offer is either one,
 # so shipping half of it is not the offer — and `cargo package` and `npm pack`

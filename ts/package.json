@@ -11,9 +11,18 @@
       "types": "./index.d.ts",
       "default": "./index.js"
     },
+    "./runtime": {
+      "types": "./runtime.d.ts",
+      "default": "./runtime.js"
+    },
+    "./browser": {
+      "types": "./browser.d.ts",
+      "default": "./browser.js"
+    },
+    "./browser-worker.js": "./browser-worker.js",
     "./pkg/*": "./pkg/*"
   },
-  "files": ["index.js", "index.d.ts", "calibrate.js", "pkg/", "LICENSE-APACHE", "LICENSE-MIT", "README.md"],
+  "files": ["index.js", "index.d.ts", "calibrate.js", "runtime.js", "runtime.d.ts", "browser.js", "browser.d.ts", "browser-worker.js", "pkg/", "pkg-sampler/", "LICENSE-APACHE", "LICENSE-MIT", "README.md"],
   "scripts": {
     "build:wasm": "make -C .. wasm"
   },

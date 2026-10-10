@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Worker-backed client for precompiled models.** `loadModel()` from
+  `tapewasm/browser` validates model metadata, loads a sampler-only runtime and
+  samples in a module Worker. It returns named chains with warmup removed and
+  divergence statistics; an `AbortSignal` terminates the Worker.
+
 ## [0.3.6] — 2026-10-09
 
 ### Fixed
