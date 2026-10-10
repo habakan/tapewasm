@@ -53,6 +53,31 @@ pub enum Op {
     /// value needs an incomplete beta, but its slope in `t` is just the
     /// density over the tail it names, so the node carries only that.
     StudentTLccdf = 30,
+    /// `1.0` where `arg1 > arg2i`, else `0.0`. The comparisons are flat: no gradient
+    /// reaches either side, as PyTensor's own give none.
+    Gt = 31,
+    Ge = 32,
+    Lt = 33,
+    Le = 34,
+    Eq = 35,
+    Ne = 36,
+    /// `arg2i` where `arg1` is non-zero, else `0.0`. Chosen rather than multiplied, so a
+    /// NaN or infinity on the side not taken stays out of the value, and out of the
+    /// gradient: that side's nodes skip their backward step at a zero adjoint (`untaken`).
+    Pick = 37,
+}
+
+/// What each comparison opcode tests. `None` for every other opcode.
+pub fn holds(op: Op, a: f64, b: f64) -> Option<bool> {
+    Some(match op {
+        Op::Gt => a > b,
+        Op::Ge => a >= b,
+        Op::Lt => a < b,
+        Op::Le => a <= b,
+        Op::Eq => a == b,
+        Op::Ne => a != b,
+        _ => return None,
+    })
 }
 
 /// The shape of a contraction, held beside the node rather than in it: the
@@ -204,6 +229,16 @@ impl Tape {
                 Op::RdivC => a2f / self.val[a1],
                 Op::Phi => phi_cdf(self.val[a1]),
                 Op::StudentTLccdf => student_t_lccdf(self.val[a1], a2f),
+                Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne => f64::from(u8::from(
+                    holds(op, self.val[a1], self.val[a2i]) == Some(true),
+                )),
+                Op::Pick => {
+                    if self.val[a1] != 0.0 {
+                        self.val[a2i]
+                    } else {
+                        0.0
+                    }
+                }
                 Op::Erf => erf(self.val[a1]),
                 Op::Erfc => 1.0 - erf(self.val[a1]),
                 Op::Tan => self.val[a1].tan(),
@@ -349,6 +384,47 @@ impl Tape {
         self.push(v, Op::Pow, a, 0, n)
     }
 
+    fn compare(&mut self, op: Op, a: u32, b: u32) -> u32 {
+        let v = holds(op, self.val[a as usize], self.val[b as usize]) == Some(true);
+        self.push(f64::from(u8::from(v)), op, a, b, 0.0)
+    }
+
+    /// `1.0` where `a > b`, else `0.0`, with no gradient; the other five likewise.
+    pub fn gt(&mut self, a: u32, b: u32) -> u32 {
+        self.compare(Op::Gt, a, b)
+    }
+
+    pub fn ge(&mut self, a: u32, b: u32) -> u32 {
+        self.compare(Op::Ge, a, b)
+    }
+
+    pub fn lt(&mut self, a: u32, b: u32) -> u32 {
+        self.compare(Op::Lt, a, b)
+    }
+
+    pub fn le(&mut self, a: u32, b: u32) -> u32 {
+        self.compare(Op::Le, a, b)
+    }
+
+    pub fn eq(&mut self, a: u32, b: u32) -> u32 {
+        self.compare(Op::Eq, a, b)
+    }
+
+    pub fn ne(&mut self, a: u32, b: u32) -> u32 {
+        self.compare(Op::Ne, a, b)
+    }
+
+    /// `b` where `cond` is non-zero, else `0.0`; the gradient reaches `b` only when it
+    /// is taken.
+    pub fn pick(&mut self, cond: u32, b: u32) -> u32 {
+        let v = if self.val[cond as usize] != 0.0 {
+            self.val[b as usize]
+        } else {
+            0.0
+        };
+        self.push(v, Op::Pick, cond, b, 0.0)
+    }
+
     pub fn abs(&mut self, a: u32) -> u32 {
         let v = self.val[a as usize].abs();
         self.push(v, Op::Abs, a, 0, 0.0)
@@ -481,14 +557,70 @@ impl Tape {
         self.push(v, Op::RdivC, a, 0, c)
     }
 
+    /// The nodes every use of which is a value a `pick` may not take, directly or
+    /// through another such node. Where the pick does not take it their adjoint is
+    /// exactly zero, and its product with an infinite partial would be NaN: the
+    /// backward pass skips them then, as PyTensor's switch rewrites do.
+    pub fn untaken(&self) -> Vec<bool> {
+        let n = self.val.len();
+        let (mut used, mut only) = (vec![false; n], vec![true; n]);
+        let mut out = vec![false; n];
+        for i in (0..n).rev() {
+            out[i] = used[i] && only[i];
+            let op = self.op[i];
+            let (a1, a2i) = (self.arg1[i] as usize, self.arg2i[i] as usize);
+            let mut mark = |a: usize, shadow: bool| {
+                used[a] = true;
+                only[a] &= shadow;
+            };
+            match op {
+                Op::Leaf => {}
+                Op::Pick => {
+                    mark(a1, false);
+                    mark(a2i, true);
+                }
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Gt
+                | Op::Ge
+                | Op::Lt
+                | Op::Le
+                | Op::Eq
+                | Op::Ne => {
+                    mark(a1, out[i]);
+                    mark(a2i, out[i]);
+                }
+                Op::DotC | Op::Sum => {
+                    let e = self.extents[a2i];
+                    mark(a1, out[i]);
+                    for c in 0..e.len as usize {
+                        mark(e.base as usize + c * e.stride as usize, out[i]);
+                    }
+                }
+                _ => mark(a1, out[i]),
+            }
+        }
+        out
+    }
+
     // ---- backward pass ----
 
     pub fn backward(&mut self, root: u32) {
         self.grad[root as usize] = 1.0;
+        let untaken = if self.op.contains(&Op::Pick) {
+            self.untaken()
+        } else {
+            Vec::new()
+        };
         let mut i = self.val.len();
         while i > 0 {
             i -= 1;
             let g = self.grad[i];
+            if g == 0.0 && untaken.get(i) == Some(&true) {
+                continue;
+            }
             let op = self.op[i];
             let a1 = self.arg1[i] as usize;
             let a2i = self.arg2i[i] as usize;
@@ -545,6 +677,12 @@ impl Tape {
                     let va = self.val[a1];
                     if va != 0.0 {
                         self.grad[a1] += g * a2f * va.powf(a2f - 1.0);
+                    }
+                }
+                Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne => {}
+                Op::Pick => {
+                    if self.val[a1] != 0.0 {
+                        self.grad[a2i] += g;
                     }
                 }
                 Op::Abs => {

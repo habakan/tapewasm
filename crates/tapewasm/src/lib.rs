@@ -358,6 +358,7 @@ pub struct AotSampler {
     param_names: Vec<String>,
     target_accept: Option<f64>,
     grad_based_estimate: Option<bool>,
+    max_depth: Option<u32>,
     /// `logProbGrad`'s evaluator, kept so a run of calls copies `scratch_init`
     /// once rather than once each. A cell rather than `&mut self`, so the
     /// method stays a shared borrow and a snapshot callback can still call it
@@ -405,6 +406,7 @@ impl AotSampler {
             param_names,
             target_accept: None,
             grad_based_estimate: None,
+            max_depth: None,
             evaluator: RefCell::new(None),
         })
     }
@@ -436,6 +438,21 @@ impl AotSampler {
         self.grad_based_estimate = Some(on);
     }
 
+    /// Keep each trajectory below `2^depth` leapfrog steps instead of nuts-rs's
+    /// 2^10. Lower bounds the gradients per draw at the risk of stopping before
+    /// the trajectory turns, which the draws' `numSteps` then show as a flat top.
+    /// A number rather than a `u32`, which JS would wrap (-1) or truncate (2.7).
+    #[wasm_bindgen(js_name = setMaxDepth)]
+    pub fn set_max_depth(&mut self, depth: f64) -> Result<(), JsError> {
+        if !(depth.fract() == 0.0 && (1.0..=30.0).contains(&depth)) {
+            return Err(JsError::new(&format!(
+                "max_depth must be a whole number from 1 to 30, not {depth}"
+            )));
+        }
+        self.max_depth = Some(depth as u32);
+        Ok(())
+    }
+
     fn settings(&self, num_warmup: u32, num_draws: u32) -> DiagNutsSettings {
         let mut settings = nuts_settings(num_warmup, num_draws);
         if let Some(target) = self.target_accept {
@@ -446,6 +463,9 @@ impl AotSampler {
                 .adapt_options
                 .mass_matrix_options
                 .use_grad_based_estimate = on;
+        }
+        if let Some(depth) = self.max_depth {
+            settings.maxdepth = depth as u64;
         }
         settings
     }

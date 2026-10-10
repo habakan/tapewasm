@@ -14,6 +14,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   samples in a module Worker. It returns named chains with warmup removed and
   divergence statistics; an `AbortSignal` terminates the Worker.
 
+## [0.3.6] — 2026-10-09
+
+### Fixed
+
+- **A NaN slope on the side a `pick` does not take stays out of the gradient.**
+  `switch(x > 0, sqrt x, x)` below zero gave a NaN gradient, the pick's zero
+  adjoint times `sqrt`'s infinite partial. The nodes used only on such a side now
+  skip their backward step when their adjoint is zero, as PyTensor's switch
+  rewrites do, and a block holding one runs a repeat at a time. A tape without a
+  `pick` compiles to the same bytes as before.
+
+## [0.3.5] — 2026-10-01
+
+### Added
+
+- **Comparisons and `pick`, for a `Switch` on a parameter.** `gt`, `ge`, `lt`,
+  `le`, `eq` and `ne` give `1` where they hold and `0` elsewhere, with no
+  gradient; `pick C A` is `A` where `C` is non-zero and `0` elsewhere, and so is
+  its gradient. With `c` a comparison, `Switch(c, a, b)` is `pick c a` +
+  `pick (1-c) b`: chosen rather than multiplied, so the NaN or infinity of the
+  branch not taken stays out of the value. Its gradient is right where that branch's
+  partials are finite; one infinite at the point (`sqrt` below zero) still gives a
+  NaN, as a reverse pass without PyTensor's switch rewrites does. A front end can
+  now emit a branch that depends on a parameter, and an exact `max`/`min`, instead
+  of folding it at the trace point.
+- **`AotSampler::setMaxDepth`.** Keeps each trajectory below `2^depth` leapfrog
+  steps instead of nuts-rs's 2^10, as nutpie's and PyMC's `max_treedepth` do,
+  so a host that forwards that option no longer has to refuse it. A whole
+  number from 1 to 30; anything else is refused rather than wrapped.
+
 ## [0.3.4] — 2026-09-26
 
 ### Fixed
@@ -342,7 +372,10 @@ What changed in the move, for anyone porting a host:
 - `tapewasm_codegen::shapes` builds the tapes the tests and examples run on, so
   neither needs a model language.
 
-[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/habakan/tapewasm/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/habakan/tapewasm/releases/tag/v0.3.6
+[0.3.5]: https://github.com/habakan/tapewasm/releases/tag/v0.3.5
+[0.3.4]: https://github.com/habakan/tapewasm/releases/tag/v0.3.4
 [0.3.3]: https://github.com/habakan/tapewasm/releases/tag/v0.3.3
 [0.3.2]: https://github.com/habakan/tapewasm/releases/tag/v0.3.2
 [0.3.1]: https://github.com/habakan/tapewasm/releases/tag/v0.3.1

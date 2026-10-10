@@ -214,6 +214,27 @@ const gradDraws = gradBased.sample(
 if (gradDraws.every((v, i) => v === flat[i])) {
   throw new Error("setGradBasedEstimate(true) drew exactly what the default did");
 }
+// A depth cap keeps every draw's trajectory below 2^depth leapfrog steps, which the
+// default run here exceeds, so the cap is what holds it.
+if (!withStats.numSteps.some((k) => k >= 4)) {
+  throw new Error("the default run never took 4 steps, so setMaxDepth(2) is not exercised");
+}
+const shallow = new AotSampler(
+  meta.nParams, new Float64Array(meta.scratchInit), meta.layoutId, meta.paramNames,
+);
+shallow.setMaxDepth(2);
+const capped = shallow.sampleWithStats(
+  new Float64Array(meta.init), meta.warmup, meta.draws, BigInt(meta.seed), 0,
+);
+if (!capped.numSteps.every((k) => k < 4)) {
+  throw new Error(`setMaxDepth(2) took ${Math.max(...capped.numSteps)} steps in a draw`);
+}
+for (const bad of [0, -1, 2.7, 31, NaN]) {
+  let rejected = false;
+  try { shallow.setMaxDepth(bad); } catch { rejected = true; }
+  if (!rejected) throw new Error(`setMaxDepth(${bad}) was accepted`);
+}
+shallow.free();
 console.log(
   `settings: mean step ${meanStep(withStats).toPrecision(3)} at 0.8, ` +
   `${meanStep(tight).toPrecision(3)} at 0.95`,

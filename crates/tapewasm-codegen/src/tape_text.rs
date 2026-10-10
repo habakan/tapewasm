@@ -37,6 +37,10 @@
 //! asin A     acos A     atan A
 //! sqrt A     abs A      lgamma A
 //! phi A      digamma A
+//! gt A B    ge A B    lt A B          1 where it holds, else 0; no gradient
+//! le A B    eq A B    ne A B
+//! pick C A                              A where C is non-zero, else 0; with C a
+//!                                       comparison, Switch is `pick C A` + `pick (1-C) B`
 //! pow A C                               one operand and a constant
 //! add_c A C  sub_c A C  rsub_c A C      `rsub_c` is `C - A`
 //! mul_c A C  div_c A C  rdiv_c A C      `rdiv_c` is `C / A`
@@ -187,6 +191,13 @@ pub fn parse(src: &str) -> Result<Program, TapeTextError> {
             "cos" => tape.cos(idx(1)?),
             "sqrt" => tape.sqrt(idx(1)?),
             "abs" => tape.abs(idx(1)?),
+            "gt" => tape.gt(idx(1)?, idx(2)?),
+            "ge" => tape.ge(idx(1)?, idx(2)?),
+            "lt" => tape.lt(idx(1)?, idx(2)?),
+            "le" => tape.le(idx(1)?, idx(2)?),
+            "eq" => tape.eq(idx(1)?, idx(2)?),
+            "ne" => tape.ne(idx(1)?, idx(2)?),
+            "pick" => tape.pick(idx(1)?, idx(2)?),
             "tan" => tape.tan(idx(1)?),
             "asin" => tape.asin(idx(1)?),
             "acos" => tape.acos(idx(1)?),
