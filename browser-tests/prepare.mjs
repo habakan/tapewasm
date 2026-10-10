@@ -303,3 +303,23 @@ const adviResult = adviSampler.advi(
 console.log(
   `advi fixture: ${adviBuilt.wasm.length} byte module, mu ${Array.from(adviResult.mu).map((v) => v.toFixed(4))}`,
 );
+
+// A runtime-data fixture for `loadModel`: mu ~ N(d, 1), with d set per run.
+const dataBuilt = compileTape(`
+n_params 1
+new_var 0.0
+new_data 0.0
+sub 0 1
+mul 2 2
+mul_c 3 -0.5
+root 4
+`);
+await writeFile(resolve(fixtures, "data_model.wasm"), dataBuilt.wasm);
+await writeFile(resolve(fixtures, "data_meta.json"), JSON.stringify({
+  nParams: dataBuilt.nParams,
+  nData: dataBuilt.nData,
+  scratchInit: Array.from(dataBuilt.scratchInit),
+  paramNames: ["mu"],
+  init: [0.0],
+  layoutId: dataBuilt.layoutId,
+}));

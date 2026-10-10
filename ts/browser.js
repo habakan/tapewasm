@@ -19,11 +19,13 @@ function validateMetadata(metadata) {
     throw new Error("metadata.scratchInit values must be finite numbers");
   }
   if (!Number.isInteger(metadata.layoutId)) throw new Error("metadata.layoutId must be an integer");
+  const nData = metadata.nData ?? 0;
+  if (!Number.isInteger(nData) || nData < 0) throw new Error("metadata.nData must be a non-negative integer");
   if (metadata.paramNames !== undefined &&
       (!Array.isArray(metadata.paramNames) || metadata.paramNames.length !== metadata.nParams)) {
     throw new Error("metadata.paramNames length must match nParams");
   }
-  return { ...metadata, init };
+  return { ...metadata, init, nData };
 }
 
 export async function loadModel({ wasmUrl, metadataUrl, workerUrl = new URL("./browser-worker.js", import.meta.url) }) {
@@ -80,7 +82,7 @@ export async function loadModel({ wasmUrl, metadataUrl, workerUrl = new URL("./b
   }
 
   return {
-    async sample({ warmup = 500, draws = 500, chains = 4, seed = 0, signal, onProgress } = {}) {
+    async sample({ warmup = 500, draws = 500, chains = 4, seed = 0, data, signal, onProgress } = {}) {
       if (disposed) throw new Error("model client is disposed");
       if (busy) throw new Error("a sampling run is already active");
       for (const [name, value] of Object.entries({ warmup, draws, chains })) {
@@ -91,6 +93,10 @@ export async function loadModel({ wasmUrl, metadataUrl, workerUrl = new URL("./b
       if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
       if (!(typeof seed === "bigint" || (Number.isSafeInteger(seed) && seed >= 0))) {
         throw new RangeError("seed must be a non-negative safe integer or bigint");
+      }
+      if (metadata.nData === 0 && data !== undefined) throw new TypeError("this model takes no runtime data");
+      if (metadata.nData > 0 && (data?.length !== metadata.nData || !Array.from(data).every(Number.isFinite))) {
+        throw new RangeError(`data must be ${metadata.nData} finite numbers`);
       }
       busy = true;
       const id = ++nextId;
@@ -114,7 +120,8 @@ export async function loadModel({ wasmUrl, metadataUrl, workerUrl = new URL("./b
             reject(error);
           },
         });
-        worker.postMessage({ type: "sample", id, warmup, draws, chains, seed });
+        worker.postMessage({ type: "sample", id, warmup, draws, chains, seed,
+          data: data === undefined ? undefined : Float64Array.from(data) });
       });
     },
     dispose() {
